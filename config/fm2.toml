@@ -1,0 +1,59 @@
+# XenonRecomp config for Forza Motorsport 2 (4D5307EA), European default.xex
+# sha256 9726066f0c546c4e51340ed02a32ae44a89d4175de82a2d55aaaf5451d9b120a.
+# Paths are relative to this file.
+[main]
+file_path = "../game/default.xex"
+out_directory_path = "../out/ppc"
+switch_table_file_path = "fm2_switch_tables.toml"
+
+# Optimizations stay off until the recompilation boots.
+skip_lr = false
+skip_msr = false
+ctr_as_local = false
+xer_as_local = false
+reserved_as_local = false
+cr_as_local = false
+non_argument_as_local = false
+non_volatile_as_local = false
+
+# Register save/restore helpers (tools/findhelpers.py; one match each).
+restgprlr_14_address = 0x824131C0
+savegprlr_14_address = 0x82413170
+restfpr_14_address = 0x824144DC
+savefpr_14_address = 0x82414490
+restvmx_14_address = 0x824148C8
+savevmx_14_address = 0x82414630
+restvmx_64_address = 0x8241495C
+savevmx_64_address = 0x824146C4
+
+# Leaf functions without .pdata entries whose jump tables XenonAnalyse's size
+# guess cut off. Each runs to the next .pdata function (minus padding/EH data).
+functions = [
+    { address = 0x821DDD60, size = 0xE8 },
+    { address = 0x821DEC80, size = 0xC0 },
+    { address = 0x82293DE0, size = 0x7C },
+    { address = 0x8235D168, size = 0x378 },
+    { address = 0x8236A108, size = 0x354 },
+    { address = 0x824FC2C8, size = 0x5C },
+    { address = 0x8255B788, size = 0x9C },
+    { address = 0x8265D380, size = 0x250 },
+    { address = 0x8266E4C8, size = 0xF8 },
+    { address = 0x82675AF8, size = 0xD8 },
+    { address = 0x826A9A60, size = 0x348 },
+    { address = 0x826C3458, size = 0x114 },
+    { address = 0x826CEEC0, size = 0xDC },
+    { address = 0x826EBB50, size = 0x16C },
+    { address = 0x826FE228, size = 0x1F8 },
+    { address = 0x82747778, size = 0x108 },
+    { address = 0x82776740, size = 0x5C4 },
+
+]
+
+invalid_instructions = [
+    { data = 0x00000000, size = 4 }, # Padding
+    # Exception data (handler + scope table) placed before functions with
+    # ExceptionFlag set in .pdata.
+    { data = 0x827575F0, size = 8 }, # C++ frame handler (346 functions)
+    { data = 0x8294ECB8, size = 8 }, # C-specific handler (54 functions)
+    { data = 0x8275DE80, size = 8 },
+]
