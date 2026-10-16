@@ -13,6 +13,7 @@
 
 #include "kernel/imports.h"
 #include "kernel/thread.h"
+#include "gpu/regs.h"
 #include "render/presenter.h"
 
 namespace
@@ -51,6 +52,10 @@ struct Gpu
     std::atomic<uint32_t> waitingRef{ 0 }, waitingInfo{ 0 };
     std::atomic<uint32_t> interruptsRaised{ 0 };
     std::atomic<uint64_t> draws{ 0 };
+    // Physical addresses of VdSwap's blocks not yet reached by the command
+    // processor; reaching one ends the frame for the renderer.
+    std::mutex swapMutex;
+    std::deque<std::pair<uint32_t, uint64_t>> pendingSwaps;
     // Predicated tiling: type-3 packets with the predicate bit run only
     // when (binSelect & binMask) != 0. D3D replays each frame per tile and
     // predicates its once-per-frame packets (swap callbacks, fences).
@@ -188,8 +193,21 @@ uint32_t ExecutePacket(uint32_t ptr)
         WriteRegister(header & 0x7FF, LoadBE32(ptr + 4));
         WriteRegister((header >> 11) & 0x7FF, LoadBE32(ptr + 8));
         return 3;
-    case 2: // type 2: nop
+    case 2: // type 2: nop (VdSwap fills its block with these)
+    {
+        std::lock_guard lock(g_gpu.swapMutex);
+        for (size_t i = 0; i < g_gpu.pendingSwaps.size(); i++)
+        {
+            if (g_gpu.pendingSwaps[i].first == (ptr & 0x1FFFFFFF))
+            {
+                const uint64_t frame = g_gpu.pendingSwaps[i].second;
+                g_gpu.pendingSwaps.erase(g_gpu.pendingSwaps.begin(), g_gpu.pendingSwaps.begin() + i + 1);
+                FrameOnSwap(frame);
+                break;
+            }
+        }
         return 1;
+    }
     default:
         break;
     }
@@ -315,9 +333,53 @@ uint32_t ExecutePacket(uint32_t ptr)
     case 0x51: // SET_BIN_SELECT (64-bit)
         g_gpu.binSelect = (uint64_t(arg(0)) << 32) | arg(1);
         break;
-    case 0x22: // DRAW_INDX
-    case 0x36: // DRAW_INDX_2
+    case 0x2D: // SET_CONSTANT: offset/type, values
+    case 0x55: // SET_CONSTANT2
+    {
+        uint32_t index;
+        if (opcode == 0x55)
+            index = arg(0) & 0xFFFF;
+        else
+        {
+            static const uint32_t bases[] = { gpureg::AluConstants, gpureg::FetchConstants, gpureg::BoolConstants, gpureg::LoopConstants, 0x2000 };
+            const uint32_t type = (arg(0) >> 16) & 0xFF;
+            index = (arg(0) & 0x7FF) + (type < 5 ? bases[type] : 0);
+        }
+        for (uint32_t i = 1; i < count; i++)
+            WriteRegister(index + i - 1, arg(i));
+        break;
+    }
+    case 0x2F: // LOAD_ALU_CONSTANT: address, offset/type, size (dwords)
+    {
+        static const uint32_t bases[] = { gpureg::AluConstants, gpureg::FetchConstants, gpureg::BoolConstants, gpureg::LoopConstants, 0x2000 };
+        const uint32_t source = GpuPhysToGuest(arg(0) & 0x3FFFFFFF);
+        const uint32_t type = (arg(1) >> 16) & 0xFF;
+        const uint32_t index = (arg(1) & 0x7FF) + (type < 5 ? bases[type] : 0);
+        const uint32_t size = arg(2) & 0xFFF;
+        for (uint32_t i = 0; i < size; i++)
+            WriteRegister(index + i, LoadBE32(source + i * 4));
+        break;
+    }
+    case 0x27: // IM_LOAD: type|address, start/size
+    {
+        const uint32_t address = GpuPhysToGuest(arg(0) & ~3u);
+        const uint32_t dwords = arg(1) & 0xFFFF;
+        FrameOnShaderLoad(ShaderType(arg(0) & 3), GuestPtr<uint32_t>(address), dwords, address);
+        break;
+    }
+    case 0x2B: // IM_LOAD_IMMEDIATE: type, start/size, microcode
+    {
+        const uint32_t dwords = std::min(arg(1) & 0xFFFF, count - 2);
+        FrameOnShaderLoad(ShaderType(arg(0) & 3), GuestPtr<uint32_t>(data + 8), dwords, data + 8);
+        break;
+    }
+    case 0x22: // DRAW_INDX: viz query, initiator, [index base, index size]
         g_gpu.draws++;
+        FrameOnDraw(arg(1));
+        break;
+    case 0x36: // DRAW_INDX_2: initiator, [inline indices]
+        g_gpu.draws++;
+        FrameOnDraw(arg(0));
         break;
     case 0x46: // EVENT_WRITE
     case 0x48: // ME_INIT
@@ -582,7 +644,12 @@ GUEST_EXPORT(VdSwap)
     for (uint32_t i = 0; i < 64; i++)
         StoreBE32(buffer + i * 4, 0x80000000);
     const uint64_t n = ++g_gpu.swaps;
-    PresenterSubmitFrame(n);
+    {
+        std::lock_guard lock(g_gpu.swapMutex);
+        g_gpu.pendingSwaps.push_back({ buffer & 0x1FFFFFFF, n });
+        if (g_gpu.pendingSwaps.size() > 16)
+            g_gpu.pendingSwaps.pop_front();
+    }
     if (n == 1 || (n & (n - 1)) == 0 || n % 60 == 0)
         Log("gpu: VdSwap #%llu", (unsigned long long)n);
     Return(ctx, 0);

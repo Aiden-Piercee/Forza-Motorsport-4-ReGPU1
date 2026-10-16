@@ -32,3 +32,7 @@ target_compile_definitions(fm2 PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_
 target_compile_options(fm2 PRIVATE -gline-tables-only)
 target_link_options(fm2 PRIVATE /STACK:0x1000000 /DEBUG)
 target_link_libraries(fm2 PRIVATE dbghelp)
+
+# Xenos shader disassembler for captured microcode.
+add_executable(xenos_dis tools/xenos_dis.cpp src/gpu/ucode.cpp)
+target_include_directories(xenos_dis PRIVATE src)

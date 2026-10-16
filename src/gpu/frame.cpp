@@ -1,0 +1,162 @@
+// Frame capture from the command stream. Collects, per frame, the shaders
+// loaded and the textures bound at draw time. At frame end a worker decodes
+// the frame's textures and lays them out for the window: the first view of
+// real game content, until translated shaders draw the frame itself.
+#include <algorithm>
+#include <condition_variable>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <mutex>
+#include <set>
+#include <thread>
+#include <unordered_set>
+
+#include "gpu/regs.h"
+#include "gpu/texture.h"
+#include "kernel/runtime.h"
+#include "log.h"
+#include "png.h"
+#include "render/presenter.h"
+
+namespace
+{
+uint64_t Fnv1a(const uint32_t* data, uint32_t dwords)
+{
+    uint64_t h = 0xCBF29CE484222325ull;
+    const auto* bytes = reinterpret_cast<const uint8_t*>(data);
+    for (uint32_t i = 0; i < dwords * 4; i++)
+        h = (h ^ bytes[i]) * 0x100000001B3ull;
+    return h;
+}
+
+std::unordered_set<uint64_t> g_shaders;
+const bool g_dumpShaders = getenv("FM2_DUMP_SHADERS") != nullptr;
+
+struct TextureKey
+{
+    uint32_t address, format, width, height;
+    bool operator<(const TextureKey& o) const
+    {
+        return std::tie(address, format, width, height) < std::tie(o.address, o.format, o.width, o.height);
+    }
+};
+
+std::map<TextureKey, TextureFetch> g_frameTextures; // command processor thread only
+uint32_t g_frameDraws = 0;
+
+// Hand-off to the compositor thread.
+std::mutex g_mutex;
+std::condition_variable g_cv;
+std::vector<TextureFetch> g_pending;
+bool g_hasPending = false;
+
+constexpr uint32_t kCanvasW = 1280, kCanvasH = 720;
+
+void Blit(std::vector<uint8_t>& canvas, const std::vector<uint8_t>& image, uint32_t w, uint32_t h, uint32_t x0, uint32_t y0,
+    uint32_t cellW, uint32_t cellH)
+{
+    // Fit the image in the cell, nearest-neighbour, over a checkerboard so
+    // alpha is visible.
+    const float scale = std::min(float(cellW) / w, float(cellH) / h);
+    const uint32_t dw = std::max(1u, uint32_t(w * scale)), dh = std::max(1u, uint32_t(h * scale));
+    for (uint32_t y = 0; y < dh && y0 + y < kCanvasH; y++)
+    {
+        for (uint32_t x = 0; x < dw && x0 + x < kCanvasW; x++)
+        {
+            const uint8_t* s = &image[(size_t(std::min(h - 1, uint32_t(y / scale))) * w + std::min(w - 1, uint32_t(x / scale))) * 4];
+            uint8_t* d = &canvas[(size_t(y0 + y) * kCanvasW + x0 + x) * 4];
+            const uint8_t bg = (((x >> 3) + (y >> 3)) & 1) ? 90 : 60;
+            for (int c = 0; c < 3; c++)
+                d[c] = uint8_t((s[c] * s[3] + bg * (255 - s[3])) / 255);
+            d[3] = 255;
+        }
+    }
+}
+
+void CompositorLoop()
+{
+    for (;;)
+    {
+        std::vector<TextureFetch> textures;
+        {
+            std::unique_lock lock(g_mutex);
+            g_cv.wait(lock, [] { return g_hasPending; });
+            textures.swap(g_pending);
+            g_hasPending = false;
+        }
+        // Largest first; up to 12 cells.
+        std::sort(textures.begin(), textures.end(), [](const TextureFetch& a, const TextureFetch& b) {
+            return a.Width() * a.Height() > b.Width() * b.Height();
+        });
+        if (textures.size() > 12)
+            textures.resize(12);
+        std::vector<uint8_t> canvas(size_t(kCanvasW) * kCanvasH * 4, 20);
+        const uint32_t cols = 4, rows = 3, cellW = kCanvasW / cols, cellH = kCanvasH / rows;
+        std::vector<uint8_t> image;
+        for (size_t i = 0; i < textures.size(); i++)
+        {
+            if (DecodeTexture(textures[i], image))
+                Blit(canvas, image, textures[i].Width(), textures[i].Height(), uint32_t(i % cols) * cellW + 2,
+                    uint32_t(i / cols) * cellH + 2, cellW - 4, cellH - 4);
+        }
+        static const uint64_t dumpFrame = getenv("FM2_DUMP_FRAME") ? strtoull(getenv("FM2_DUMP_FRAME"), nullptr, 10) : 0;
+        static uint64_t composed = 0;
+        if (++composed == dumpFrame)
+        {
+            WritePng("frame.png", kCanvasW, kCanvasH, canvas);
+            Log("gpu: wrote frame.png");
+        }
+        PresenterSubmitImage(kCanvasW, kCanvasH, std::move(canvas));
+    }
+}
+}
+
+void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwords, uint32_t guestAddress)
+{
+    if (!dwords || dwords > 0x10000)
+        return;
+    const uint64_t hash = Fnv1a(microcodeBE, dwords) ^ uint64_t(type);
+    if (!g_shaders.insert(hash).second)
+        return;
+    if (g_shaders.size() % 50 == 1)
+        Log("gpu: %zu distinct shaders seen", g_shaders.size());
+    if (g_dumpShaders)
+    {
+        const auto dir = UserDir() / "shaders";
+        std::filesystem::create_directories(dir);
+        char name[64];
+        snprintf(name, sizeof(name), "%s_%016llx.bin", type == ShaderType::Vertex ? "vs" : "ps", (unsigned long long)hash);
+        std::ofstream(dir / name, std::ios::binary).write(reinterpret_cast<const char*>(microcodeBE), dwords * 4);
+    }
+}
+
+void FrameOnDraw(uint32_t initiator)
+{
+    g_frameDraws++;
+    for (uint32_t slot = 0; slot < 32; slot++)
+    {
+        const TextureFetch f = ReadTextureFetch(slot);
+        if (f.Type() != 2 || f.Dimension() != 1 || !TextureFormatSupported(f.Format()) || f.Width() < 16 || f.Height() < 16)
+            continue;
+        g_frameTextures.emplace(TextureKey{ f.Address(), f.Format(), f.Width(), f.Height() }, f);
+    }
+}
+
+void FrameOnSwap(uint64_t frame)
+{
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(CompositorLoop).detach(); });
+    {
+        std::lock_guard lock(g_mutex);
+        g_pending.clear();
+        for (auto& [key, fetch] : g_frameTextures)
+            g_pending.push_back(fetch);
+        g_hasPending = true;
+    }
+    g_cv.notify_one();
+    if (frame % 600 == 0)
+        Log("gpu: frame %llu: %u draws, %zu textures bound", (unsigned long long)frame, g_frameDraws, g_frameTextures.size());
+    g_frameTextures.clear();
+    g_frameDraws = 0;
+}

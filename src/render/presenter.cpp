@@ -41,6 +41,8 @@ struct Presenter
     std::mutex mutex;
     std::condition_variable cv;
     uint64_t pendingFrame = 0;
+    std::vector<uint8_t> image; // latest submitted RGBA8, kWidth x kHeight
+    ComPtr<ID3D12Resource> upload[kBuffers];
     uint64_t presentedFrame = 0;
     std::atomic<bool> ready{ false };
 };
@@ -116,6 +118,32 @@ void CreateWindowAndDevice()
     g_p.list->Close();
     Check(g_p.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_p.fence)), "CreateFence");
     g_p.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = UINT64(kWidth) * kHeight * 4;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    for (UINT i = 0; i < kBuffers; i++)
+        Check(g_p.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                  IID_PPV_ARGS(&g_p.upload[i])),
+            "CreateCommittedResource(upload)");
+}
+
+void Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+{
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = resource;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = before;
+    b.Transition.StateAfter = after;
+    g_p.list->ResourceBarrier(1, &b);
 }
 
 void DrawFrame(uint64_t frame)
@@ -128,23 +156,45 @@ void DrawFrame(uint64_t frame)
     }
     g_p.allocators[i]->Reset();
     g_p.list->Reset(g_p.allocators[i].Get(), nullptr);
+    ID3D12Resource* backBuffer = g_p.backBuffers[i].Get();
 
-    D3D12_RESOURCE_BARRIER b{};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = g_p.backBuffers[i].Get();
-    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    g_p.list->ResourceBarrier(1, &b);
+    bool copied = false;
+    {
+        std::lock_guard lock(g_p.mutex);
+        if (g_p.image.size() == size_t(kWidth) * kHeight * 4)
+        {
+            void* mapped = nullptr;
+            g_p.upload[i]->Map(0, nullptr, &mapped);
+            memcpy(mapped, g_p.image.data(), g_p.image.size());
+            g_p.upload[i]->Unmap(0, nullptr);
+            copied = true;
+        }
+    }
 
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_p.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    rtv.ptr += SIZE_T(i) * g_p.rtvStride;
-    const float pulse = 0.15f + 0.1f * float((frame % 120) < 60 ? frame % 60 : 60 - frame % 60) / 60.0f;
-    const float color[4] = { 0.05f, pulse, 0.12f, 1.0f };
-    g_p.list->ClearRenderTargetView(rtv, color, 0, nullptr);
+    if (copied)
+    {
+        Transition(backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = backBuffer;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = g_p.upload[i].Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, kWidth, kHeight, 1, kWidth * 4 };
+        g_p.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        Transition(backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+    }
+    else
+    {
+        Transition(backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_p.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += SIZE_T(i) * g_p.rtvStride;
+        const float pulse = 0.15f + 0.1f * float((frame % 120) < 60 ? frame % 60 : 60 - frame % 60) / 60.0f;
+        const float color[4] = { 0.05f, pulse, 0.12f, 1.0f };
+        g_p.list->ClearRenderTargetView(rtv, color, 0, nullptr);
+        Transition(backBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    }
 
-    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
-    g_p.list->ResourceBarrier(1, &b);
     g_p.list->Close();
     ID3D12CommandList* lists[] = { g_p.list.Get() };
     g_p.queue->ExecuteCommandLists(1, lists);
@@ -200,4 +250,16 @@ void PresenterSubmitFrame(uint64_t frame)
 bool PresenterHasFocus()
 {
     return !g_p.window || GetForegroundWindow() == g_p.window;
+}
+
+void PresenterSubmitImage(uint32_t width, uint32_t height, std::vector<uint8_t> rgba)
+{
+    if (width != kWidth || height != kHeight)
+        return;
+    {
+        std::lock_guard lock(g_p.mutex);
+        g_p.image = std::move(rgba);
+        g_p.pendingFrame++;
+    }
+    g_p.cv.notify_one();
 }

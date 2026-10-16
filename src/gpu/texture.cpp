@@ -1,0 +1,305 @@
+// Xenos texture decoding on the CPU: untiling, endian swaps, swizzle and the
+// formats the frontend uses. The renderer will decode on the GPU later;
+// this is the reference implementation and the first-pixels path.
+#include "gpu/texture.h"
+
+#include <algorithm>
+
+#include "gpu/regs.h"
+
+namespace
+{
+enum Format : uint32_t
+{
+    k_8 = 2,
+    k_1_5_5_5 = 3,
+    k_5_6_5 = 4,
+    k_8_8_8_8 = 6,
+    k_8_8 = 10,
+    k_4_4_4_4 = 15,
+    k_DXT1 = 18,
+    k_DXT2_3 = 19,
+    k_DXT4_5 = 20,
+};
+
+struct FormatInfo
+{
+    uint32_t blockSize;  // texels per side of a block (1 or 4)
+    uint32_t log2Bytes;  // bytes per block
+};
+
+bool Info(uint32_t format, FormatInfo& out)
+{
+    switch (format)
+    {
+    case k_8: out = { 1, 0 }; return true;
+    case k_1_5_5_5:
+    case k_5_6_5:
+    case k_8_8:
+    case k_4_4_4_4: out = { 1, 1 }; return true;
+    case k_8_8_8_8: out = { 1, 2 }; return true;
+    case k_DXT1: out = { 4, 3 }; return true;
+    case k_DXT2_3:
+    case k_DXT4_5: out = { 4, 4 }; return true;
+    default: return false;
+    }
+}
+
+// Xenos 2D tiling (as documented by Xenia's texture_util).
+int32_t TiledOffset2DOuter(uint32_t y, uint32_t width, uint32_t log2Bpp)
+{
+    const uint32_t macro = ((y >> 5) * (width >> 5)) << (log2Bpp + 7);
+    const uint32_t micro = ((y & 6) << 2) << log2Bpp;
+    return int32_t(macro + ((micro & ~0xFu) << 1) + (micro & 0xF) + ((y & 8) << (3 + log2Bpp)) + ((y & 1) << 4));
+}
+
+int32_t TiledOffset2DInner(uint32_t x, uint32_t y, uint32_t log2Bpp, int32_t baseOffset)
+{
+    const uint32_t macro = (x >> 5) << (log2Bpp + 7);
+    const uint32_t micro = (x & 7) << log2Bpp;
+    const uint32_t offset = uint32_t(baseOffset) + (macro + ((micro & ~0xFu) << 1) + (micro & 0xF));
+    return int32_t(((offset & ~0x1FFu) << 3) + ((offset & 0x1C0) << 2) + (offset & 0x3F) + ((y & 16) << 7) +
+        (((((y & 8) >> 2) + (x >> 3)) & 3) << 6));
+}
+
+void Swap(uint8_t* p, uint32_t bytes, uint32_t endian)
+{
+    switch (endian)
+    {
+    case 1: // 8 in 16
+        for (uint32_t i = 0; i + 1 < bytes; i += 2)
+            std::swap(p[i], p[i + 1]);
+        break;
+    case 2: // 8 in 32
+        for (uint32_t i = 0; i + 3 < bytes; i += 4)
+        {
+            std::swap(p[i], p[i + 3]);
+            std::swap(p[i + 1], p[i + 2]);
+        }
+        break;
+    case 3: // 16 in 32
+        for (uint32_t i = 0; i + 3 < bytes; i += 4)
+        {
+            std::swap(p[i], p[i + 2]);
+            std::swap(p[i + 1], p[i + 3]);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+void Rgb565(uint16_t c, uint8_t* out)
+{
+    out[0] = uint8_t(((c >> 11) & 31) * 255 / 31);
+    out[1] = uint8_t(((c >> 5) & 63) * 255 / 63);
+    out[2] = uint8_t((c & 31) * 255 / 31);
+    out[3] = 255;
+}
+
+// BC1 colour block (8 bytes, little-endian after the endian swap).
+void DecodeColorBlock(const uint8_t* b, uint8_t out[16][4], bool bc1)
+{
+    const uint16_t c0 = uint16_t(b[0] | (b[1] << 8)), c1 = uint16_t(b[2] | (b[3] << 8));
+    uint8_t palette[4][4];
+    Rgb565(c0, palette[0]);
+    Rgb565(c1, palette[1]);
+    for (int k = 0; k < 3; k++)
+    {
+        if (c0 > c1 || !bc1)
+        {
+            palette[2][k] = uint8_t((2 * palette[0][k] + palette[1][k]) / 3);
+            palette[3][k] = uint8_t((palette[0][k] + 2 * palette[1][k]) / 3);
+        }
+        else
+        {
+            palette[2][k] = uint8_t((palette[0][k] + palette[1][k]) / 2);
+            palette[3][k] = 0;
+        }
+    }
+    palette[2][3] = 255;
+    palette[3][3] = (c0 > c1 || !bc1) ? 255 : 0;
+    const uint32_t bits = uint32_t(b[4]) | (uint32_t(b[5]) << 8) | (uint32_t(b[6]) << 16) | (uint32_t(b[7]) << 24);
+    for (int i = 0; i < 16; i++)
+        memcpy(out[i], palette[(bits >> (i * 2)) & 3], 4);
+}
+
+void DecodeBlock(uint32_t format, const uint8_t* b, uint8_t out[16][4])
+{
+    if (format == k_DXT1)
+    {
+        DecodeColorBlock(b, out, true);
+        return;
+    }
+    DecodeColorBlock(b + 8, out, false);
+    if (format == k_DXT2_3)
+    {
+        for (int i = 0; i < 16; i++)
+            out[i][3] = uint8_t(((b[i / 2] >> ((i & 1) * 4)) & 15) * 17);
+        return;
+    }
+    // DXT4/5 interpolated alpha.
+    uint8_t a[8];
+    a[0] = b[0];
+    a[1] = b[1];
+    if (a[0] > a[1])
+        for (int i = 1; i < 7; i++)
+            a[i + 1] = uint8_t(((7 - i) * a[0] + i * a[1]) / 7);
+    else
+    {
+        for (int i = 1; i < 5; i++)
+            a[i + 1] = uint8_t(((5 - i) * a[0] + i * a[1]) / 5);
+        a[6] = 0;
+        a[7] = 255;
+    }
+    uint64_t bits = 0;
+    for (int i = 0; i < 6; i++)
+        bits |= uint64_t(b[2 + i]) << (8 * i);
+    for (int i = 0; i < 16; i++)
+        out[i][3] = a[(bits >> (3 * i)) & 7];
+}
+
+void DecodeTexel(uint32_t format, const uint8_t* t, uint8_t* out)
+{
+    switch (format)
+    {
+    case k_8:
+        out[0] = out[1] = out[2] = t[0];
+        out[3] = 255;
+        break;
+    case k_8_8:
+        out[0] = t[0];
+        out[1] = t[1];
+        out[2] = 0;
+        out[3] = 255;
+        break;
+    case k_5_6_5:
+        Rgb565(uint16_t(t[0] | (t[1] << 8)), out);
+        break;
+    case k_1_5_5_5:
+    {
+        const uint16_t c = uint16_t(t[0] | (t[1] << 8));
+        out[0] = uint8_t(((c >> 10) & 31) * 255 / 31);
+        out[1] = uint8_t(((c >> 5) & 31) * 255 / 31);
+        out[2] = uint8_t((c & 31) * 255 / 31);
+        out[3] = (c & 0x8000) ? 255 : 0;
+        break;
+    }
+    case k_4_4_4_4:
+    {
+        const uint16_t c = uint16_t(t[0] | (t[1] << 8));
+        out[0] = uint8_t(((c >> 8) & 15) * 17);
+        out[1] = uint8_t(((c >> 4) & 15) * 17);
+        out[2] = uint8_t((c & 15) * 17);
+        out[3] = uint8_t(((c >> 12) & 15) * 17);
+        break;
+    }
+    case k_8_8_8_8:
+        // Memory order after the swap is A R G B in a little-endian word.
+        out[0] = t[2];
+        out[1] = t[1];
+        out[2] = t[0];
+        out[3] = t[3];
+        break;
+    default:
+        memset(out, 255, 4);
+        break;
+    }
+}
+}
+
+TextureFetch ReadTextureFetch(uint32_t slot)
+{
+    TextureFetch f;
+    for (int i = 0; i < 6; i++)
+        f.dwords[i] = gpureg::Get(gpureg::FetchConstants + slot * 6 + i);
+    return f;
+}
+
+bool TextureFormatSupported(uint32_t format)
+{
+    FormatInfo info;
+    return Info(format, info);
+}
+
+const char* TextureFormatName(uint32_t format)
+{
+    switch (format)
+    {
+    case k_8: return "8";
+    case k_1_5_5_5: return "1555";
+    case k_5_6_5: return "565";
+    case k_8_8_8_8: return "8888";
+    case k_8_8: return "88";
+    case k_4_4_4_4: return "4444";
+    case k_DXT1: return "DXT1";
+    case k_DXT2_3: return "DXT3";
+    case k_DXT4_5: return "DXT5";
+    default: return "?";
+    }
+}
+
+bool DecodeTexture(const TextureFetch& fetch, std::vector<uint8_t>& rgba)
+{
+    FormatInfo info;
+    if (fetch.Type() != 2 || !Info(fetch.Format(), info))
+        return false;
+    const uint32_t width = fetch.Width(), height = fetch.Height();
+    if (width > 4096 || height > 4096)
+        return false;
+    const uint32_t blocksX = (width + info.blockSize - 1) / info.blockSize;
+    const uint32_t blocksY = (height + info.blockSize - 1) / info.blockSize;
+    const uint32_t blockBytes = 1u << info.log2Bytes;
+    // Rows are padded to the pitch, and tiled surfaces to 32 blocks.
+    uint32_t pitchBlocks = std::max(fetch.Pitch() / info.blockSize, blocksX);
+    if (fetch.Tiled())
+        pitchBlocks = (pitchBlocks + 31) & ~31u;
+    const uint8_t* source = GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address()));
+
+    rgba.assign(size_t(width) * height * 4, 0);
+    uint8_t block[32];
+    uint8_t texels[16][4];
+    for (uint32_t by = 0; by < blocksY; by++)
+    {
+        const int32_t rowOffset = fetch.Tiled() ? TiledOffset2DOuter(by, pitchBlocks, info.log2Bytes) : 0;
+        for (uint32_t bx = 0; bx < blocksX; bx++)
+        {
+            size_t offset;
+            if (fetch.Tiled())
+                offset = size_t(TiledOffset2DInner(bx, by, info.log2Bytes, rowOffset) >> info.log2Bytes) * blockBytes;
+            else
+                offset = (size_t(by) * pitchBlocks + bx) * blockBytes;
+            memcpy(block, source + offset, blockBytes);
+            Swap(block, blockBytes, fetch.Endian());
+            if (info.blockSize == 4)
+            {
+                DecodeBlock(fetch.Format(), block, texels);
+                for (uint32_t i = 0; i < 16; i++)
+                {
+                    const uint32_t x = bx * 4 + (i & 3), y = by * 4 + (i >> 2);
+                    if (x < width && y < height)
+                        memcpy(&rgba[(size_t(y) * width + x) * 4], texels[i], 4);
+                }
+            }
+            else
+                DecodeTexel(fetch.Format(), block, &rgba[(size_t(by) * width + bx) * 4]);
+        }
+    }
+
+    // Swizzle: per output channel, 0-3 select X/Y/Z/W, 4 = 0, 5 = 1.
+    const uint32_t swizzle = fetch.Swizzle();
+    if (swizzle != 0x688) // XYZW
+    {
+        for (size_t i = 0; i < rgba.size(); i += 4)
+        {
+            uint8_t in[4];
+            memcpy(in, &rgba[i], 4);
+            for (int c = 0; c < 4; c++)
+            {
+                const uint32_t s = (swizzle >> (c * 3)) & 7;
+                rgba[i + c] = s < 4 ? in[s] : (s == 5 ? 255 : 0);
+            }
+        }
+    }
+    return true;
+}

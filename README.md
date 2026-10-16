@@ -12,7 +12,12 @@ Phase 1 (recompile and boot) is done. The game boots on our kernel layer,
 plays its intro sequence, passes the title screen (Start) and reaches the
 main menu, presenting at a steady 60 Hz with the menu videos and showcase car
 loaded. A window with a D3D12 swap chain presents every frame (a placeholder
-clear for now; `FM2_HEADLESS=1` runs without it). Phase 2 is under way: the
+clear for now; `FM2_HEADLESS=1` runs without it).
+
+Renderer progress: the command stream is tracked (constants, shader loads,
+draws), Xenos textures decode correctly (tiling, endianness, DXT1/3/5,
+8888, 565, 8-bit), and the window shows the textures each frame draws with.
+Shader microcode decodes and disassembles; translation to HLSL is next. Phase 2 is under way: the
 renderer will be driven by the PM4 command stream (see the scope, section 4a).
 
 Stand-ins until their phase: XMA decoding writes silence, audio output is
@@ -50,6 +55,11 @@ code (`out/ppc`, ~131 MB) is generated from your own copy and never committed.
 | `FM2_TRACE_IMPORTS=<seconds>` | Log kernel/XAM calls made after that time (`FM2_TRACE_LIMIT` per name, default 5) |
 | `FM2_TRACE_FILES=1` | Log file opens and misses |
 | `FM2_AUTOSTART=1` | Tap Start + A every 3 s |
+| `FM2_DUMP_SHADERS=1` | Save every distinct shader's microcode to `Documentsm2\shaders` |
+| `FM2_DUMP_FRAME=<n>` | Write the n-th composed frame to `frame.png` |
+| `FM2_HEADLESS=1` | No window |
+
+`build/rel/xenos_dis.exe <shaders...>` disassembles captured Xenos microcode.
 
 `tools/callgraph.py` indexes the generated code (`build`, `callers sub_X`,
 `at <address>`); `build/tools/dis.exe <xex> <address> <count>` disassembles.
