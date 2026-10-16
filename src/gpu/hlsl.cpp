@@ -378,7 +378,10 @@ struct Emitter
             const char* neg = a.src[2].negate ? "-" : "";
             if (a.scalarOp <= 43)
                 return set(std::string("Mul9(") + neg + ca + ", " + neg + tb + ")");
-            return set(std::string("(") + neg + ca + ")" + op + "(" + neg + tb + ")");
+            static const int negMode = getenv("FM2_SC_NEG") ? atoi(getenv("FM2_SC_NEG")) : 0; // 0 both, 1 constant, 2 temp
+            const char* negC = negMode == 2 ? "" : neg;
+            const char* negT = negMode == 1 ? "" : neg;
+            return set(std::string("(") + negC + ca + ")" + op + "(" + negT + tb + ")");
         }
         case 48: return set("sin(" + A + ")");
         case 49: return set("cos(" + A + ")");

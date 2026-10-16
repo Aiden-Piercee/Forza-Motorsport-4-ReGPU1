@@ -477,9 +477,9 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
     const UINT index = UINT(map.size() - 1);
     if (depth)
     {
-        td.Format = DXGI_FORMAT_R24G8_TYPELESS; // typeless: depth resolves read it
+        td.Format = DXGI_FORMAT_R32G8X24_TYPELESS; // float depth (the title uses D24FS8, reverse-Z); typeless for resolves
         td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-        cv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        cv.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
         cv.DepthStencil.Depth = 1.0f;
         Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv,
                   IID_PPV_ARGS(&s.resource)),
@@ -488,7 +488,7 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
         s.view = g_r.dsvHeap->GetCPUDescriptorHandleForHeapStart();
         s.view.ptr += SIZE_T(index) * g_r.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc{};
-        dsvDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        dsvDesc.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
         dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
         g_r.device->CreateDepthStencilView(s.resource.Get(), &dsvDesc, s.view);
     }
@@ -579,13 +579,18 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
 {
     FrameResources& f = Frame();
     const uint8_t* src = GuestPtr<uint8_t>(guest);
+    // Small buffers are often rewritten between draws (UI quads), so hash all
+    // of them; large ones (static geometry) are sampled.
     uint64_t sample = bytes;
-    for (uint32_t i = 0; i < 16 && bytes >= 8; i++)
-    {
-        uint64_t v;
-        memcpy(&v, src + (uint64_t(bytes - 8) * i / 15), 8);
-        sample = (sample ^ v) * 0x100000001B3ull;
-    }
+    if (bytes <= 16384)
+        sample = ContentHash(src, bytes);
+    else
+        for (uint32_t i = 0; i < 16 && bytes >= 8; i++)
+        {
+            uint64_t v;
+            memcpy(&v, src + (uint64_t(bytes - 8) * i / 15), 8);
+            sample = (sample ^ v) * 0x100000001B3ull;
+        }
     const uint64_t key = uint64_t(guest) << 32 | bytes;
     if (auto it = f.uploads.find(key); it != f.uploads.end() && it->second.second == sample)
         return it->second.first;
@@ -800,7 +805,7 @@ D3D12_BLEND_OP BlendOp(uint32_t op)
     }
 }
 
-ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly)
+ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable)
 {
     const uint32_t blend = gpureg::Get(RB_BLENDCONTROL0), depth = gpureg::Get(RB_DEPTHCONTROL);
     const uint32_t mask = depthOnly ? 0 : gpureg::Get(RB_COLOR_MASK) & 0xF;
@@ -809,8 +814,8 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     // Alpha-to-mask (RB_COLORCONTROL bit 4): cut-out foliage and fences.
     const bool alphaToMask = (gpureg::Get(RB_COLORCONTROL) >> 4) & 1;
     char key[112];
-    snprintf(key, sizeof(key), "%016llx%016llx%08x%08x%x%06x%x%d", (unsigned long long)g_r.vsHash, (unsigned long long)g_r.psHash, blend, depth, mask,
-        stencil, mode, alphaToMask);
+    snprintf(key, sizeof(key), "%016llx%016llx%08x%08x%x%06x%x%d%d", (unsigned long long)g_r.vsHash, (unsigned long long)g_r.psHash, blend, depth, mask,
+        stencil, mode, alphaToMask, cullable);
     auto it = g_r.pipelines.find(key);
     if (it != g_r.pipelines.end())
         return it->second.Get();
@@ -860,14 +865,16 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
         ds.BackFace = (depth >> 7) & 1 ? faceOps(20) : ds.FrontFace;
     }
     // Culling: bit 0 front, bit 1 back; bit 2 set means clockwise faces are front.
-    pd.RasterizerState.FrontCounterClockwise = (mode & 4) == 0;
-    // Culling stays off: the translated geometry (rectangle corners, strips) does
-    // not keep the guest winding reliably yet. Two-sided stencil still needs the facing.
-    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    static const bool flip = getenv("FM2_CULL_FLIP") != nullptr;
+    pd.RasterizerState.FrontCounterClockwise = ((mode & 4) == 0) != flip;
+    // Only real triangle primitives keep the guest winding; generated geometry
+    // (rectangle corners, point sprites) is never culled.
+    pd.RasterizerState.CullMode = !cullable ? D3D12_CULL_MODE_NONE
+        : (mode & 3) == 1 ? D3D12_CULL_MODE_FRONT : (mode & 3) == 2 ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = kColorFormat;
-    pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    pd.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     pd.SampleDesc.Count = 1;
     ComPtr<ID3D12PipelineState> pso;
     if (FAILED(g_r.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso))))
@@ -1384,7 +1391,7 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
 
     const UINT slot = f.descriptorBase + f.descriptorsUsed++;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = depth ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : kColorFormat;
+    srv.Format = depth ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : kColorFormat;
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
@@ -1605,7 +1612,7 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     BeginFrameIfNeeded();
     SelectSurfaces(false);
-    ID3D12PipelineState* pso = GetPipeline(vs, ps, edramMode == 5);
+    ID3D12PipelineState* pso = GetPipeline(vs, ps, edramMode == 5, (initiator & 0x3F) != 8 && (initiator & 0x3F) != 1);
     if (!pso)
     {
         TraceSkip("pipeline", initiator);
@@ -1828,6 +1835,9 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 (t.dwords[0] >> 2) & 0xFF, t.Dimension());
             tex += e;
         }
+        Log("    indices (initiator %08X dma %08X offset %u): %u %u %u %u %u %u ... %u", initiator, dmaBase, gpureg::Get(VGT_INDX_OFFSET),
+            list.size() > 0 ? list[0] : 0, list.size() > 1 ? list[1] : 0, list.size() > 2 ? list[2] : 0, list.size() > 3 ? list[3] : 0,
+            list.size() > 4 ? list[4] : 0, list.size() > 5 ? list[5] : 0, list.empty() ? 0 : list.back());
         Log("draw vs %016llx ps %016llx prim %u n %zu blend %08X mask %X scissor %ld,%ld-%ld,%ld%s", (unsigned long long)g_r.vsHash,
             (unsigned long long)g_r.psHash, initiator & 0x3F, list.size(), gpureg::Get(RB_BLENDCONTROL0), gpureg::Get(RB_COLOR_MASK) & 15,
             scissor.left, scissor.top, scissor.right, scissor.bottom, tex.c_str());
@@ -1842,6 +1852,21 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 if (c[0] != 0 || c[1] != 0 || c[2] != 0 || c[3] != 0)
                     Log("    vc%u = %g %g %g %g", i, c[0], c[1], c[2], c[3]);
             }
+        for (uint32_t k : vs.info.vertexFetchConstants)
+        {
+            const uint32_t d0 = gpureg::Get(gpureg::FetchConstants + k * 2), d1 = gpureg::Get(gpureg::FetchConstants + k * 2 + 1);
+            const uint32_t* v = GuestPtr<uint32_t>(GpuPhysToGuest(d0 & 0xFFFFFFFC));
+            Log("    vf%u: %08X size %u endian %u: %08X %08X %08X %08X %08X %08X %08X %08X", k, d0 & 0xFFFFFFFC, ((d1 >> 2) & 0xFFFFFF) * 4, d1 & 3,
+                v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+            std::string nz;
+            for (uint32_t i = 0; i * 8 + 5 < ((d1 >> 2) & 0xFFFFFF) && i < 24; i++)
+            {
+                char t[16];
+                snprintf(t, sizeof(t), " %08X", v[i * 8 + 5]);
+                nz += t;
+            }
+            Log("    vf%u normal z per vertex:%s", k, nz.c_str());
+        }
         Log("    surface %08X color %08X depth %08X depthctl %08X colorctl %08X mode %X", gpureg::Get(0x2000), gpureg::Get(0x2001), gpureg::Get(0x2002),
             gpureg::Get(RB_DEPTHCONTROL), gpureg::Get(RB_COLORCONTROL), gpureg::Get(PA_SU_SC_MODE_CNTL));
         for (uint32_t c : { 5u, 6u, 7u, 14u, 22u, 254u, 255u })
