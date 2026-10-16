@@ -14,6 +14,8 @@
 #include "render/presenter.h"
 
 #include <windows.h>
+#include <Xinput.h>
+#pragma comment(lib, "xinput.lib")
 
 namespace
 {
@@ -303,46 +305,101 @@ GUEST_EXPORT(XamShowKeyboardUI)
     FinishUi(ctx, ctx.r10.u32);
 }
 
-// Input (controllers arrive in phase 4) -----------------------------------------------
+// Input ----------------------------------------------------------------------------------
 
-// Stand-in until real input (phase 4): user 0 is a gamepad driven by the
-// keyboard. FM2_AUTOSTART taps START every 3 s for unattended runs.
+// Guest users 0-3 are host XInput pads 0-3. User 0 also takes the keyboard
+// (merged with pad 0 if one is connected), so the game is playable without
+// a controller:
+//   W / S        throttle / brake (right / left trigger)
+//   A / D        steer (left stick)
+//   arrow keys   d-pad (menus)      I/J/K/L   right stick (camera)
+//   Enter        A (select)         Backspace B (back)
+//   Space        X (handbrake)      Y         Y
+//   Q / E        left / right shoulder (gear down / up)
+//   Tab          Back (view)        Escape    Start (pause)
+// FM2_AUTOSTART taps START + A every 3 s for unattended test runs.
 namespace
 {
-uint16_t PadButtons()
+struct PadState
 {
-    struct Key
+    uint16_t buttons = 0;
+    uint8_t leftTrigger = 0, rightTrigger = 0;
+    int16_t lx = 0, ly = 0, rx = 0, ry = 0;
+};
+
+bool Key(int vk)
+{
+    return GetAsyncKeyState(vk) & 0x8000;
+}
+
+void AddKeyboard(PadState& s)
+{
+    if (!PresenterHasFocus())
+        return;
+    struct Map
     {
         int vk;
         uint16_t button;
     };
-    static const Key keys[] = {
-        { VK_UP, 0x0001 }, { VK_DOWN, 0x0002 }, { VK_LEFT, 0x0004 }, { VK_RIGHT, 0x0008 },
-        { VK_RETURN, 0x0010 }, { VK_ESCAPE, 0x0020 }, { VK_SPACE, 0x1000 }, { VK_BACK, 0x2000 },
-        { 'X', 0x4000 }, { 'Y', 0x8000 },
+    static const Map buttons[] = {
+        { VK_UP, XINPUT_GAMEPAD_DPAD_UP }, { VK_DOWN, XINPUT_GAMEPAD_DPAD_DOWN }, { VK_LEFT, XINPUT_GAMEPAD_DPAD_LEFT },
+        { VK_RIGHT, XINPUT_GAMEPAD_DPAD_RIGHT }, { VK_ESCAPE, XINPUT_GAMEPAD_START }, { VK_TAB, XINPUT_GAMEPAD_BACK },
+        { 'Q', XINPUT_GAMEPAD_LEFT_SHOULDER }, { 'E', XINPUT_GAMEPAD_RIGHT_SHOULDER }, { VK_RETURN, XINPUT_GAMEPAD_A },
+        { VK_BACK, XINPUT_GAMEPAD_B }, { VK_SPACE, XINPUT_GAMEPAD_X }, { 'Y', XINPUT_GAMEPAD_Y },
     };
-    uint16_t buttons = 0;
-    for (const Key& k : keys)
+    for (const Map& m : buttons)
+        if (Key(m.vk))
+            s.buttons |= m.button;
+    if (Key('W'))
+        s.rightTrigger = 255;
+    if (Key('S'))
+        s.leftTrigger = 255;
+    if (Key('A') != Key('D'))
+        s.lx = Key('A') ? -32767 : 32767;
+    if (Key('J') != Key('L'))
+        s.rx = Key('J') ? -32767 : 32767;
+    if (Key('I') != Key('K'))
+        s.ry = Key('K') ? -32767 : 32767;
+}
+
+// Returns false if nothing is connected for this user.
+bool ReadPad(uint32_t user, PadState& s)
+{
+    bool connected = false;
+    XINPUT_STATE x{};
+    if (user < XUSER_MAX_COUNT && XInputGetState(user, &x) == ERROR_SUCCESS)
     {
-        if (PresenterHasFocus() && (GetAsyncKeyState(k.vk) & 0x8000))
-            buttons |= k.button;
+        connected = true;
+        s.buttons = x.Gamepad.wButtons; // same bit layout as the 360
+        s.leftTrigger = x.Gamepad.bLeftTrigger;
+        s.rightTrigger = x.Gamepad.bRightTrigger;
+        s.lx = x.Gamepad.sThumbLX;
+        s.ly = x.Gamepad.sThumbLY;
+        s.rx = x.Gamepad.sThumbRX;
+        s.ry = x.Gamepad.sThumbRY;
     }
-    static const bool autoStart = getenv("FM2_AUTOSTART") != nullptr;
-    static const auto start = Clock::now();
-    if (autoStart)
+    if (user == 0)
     {
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
-        if (ms % 3000 > 2800)
-            buttons |= 0x0010 | 0x1000; // START + A
+        connected = true;
+        AddKeyboard(s);
+        static const bool autoStart = getenv("FM2_AUTOSTART") != nullptr;
+        static const auto start = Clock::now();
+        if (autoStart)
+        {
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
+            if (ms % 3000 > 2800)
+                s.buttons |= XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_A;
+        }
     }
-    return buttons;
+    return connected;
 }
 }
 
 GUEST_EXPORT(XamInputGetCapabilities)
 {
     // (user, flags, XINPUT_CAPABILITIES*)
-    if (ctx.r3.u32 != 0)
+    PadState s;
+    if (!ReadPad(ctx.r3.u32, s))
     {
         Return(ctx, X_ERROR_DEVICE_NOT_CONNECTED);
         return;
@@ -356,23 +413,44 @@ GUEST_EXPORT(XamInputGetCapabilities)
 
 GUEST_EXPORT(XamInputGetState)
 {
-    // (user, flags, XINPUT_STATE*): packet number, then buttons, triggers, sticks.
-    if (ctx.r3.u32 != 0)
+    // (user, flags, XINPUT_STATE*): packet, buttons, triggers, sticks (big-endian).
+    PadState s;
+    if (!ReadPad(ctx.r3.u32, s))
     {
         Return(ctx, X_ERROR_DEVICE_NOT_CONNECTED);
         return;
     }
     static std::atomic<uint32_t> packet{ 0 };
     const uint32_t state = ctx.r5.u32;
-    memset(GuestPtr(state), 0, 0x10);
     StoreBE32(state, ++packet);
-    *GuestPtr<uint16_t>(state + 4) = __builtin_bswap16(PadButtons());
+    *GuestPtr<uint16_t>(state + 4) = __builtin_bswap16(s.buttons);
+    *GuestPtr<uint8_t>(state + 6) = s.leftTrigger;
+    *GuestPtr<uint8_t>(state + 7) = s.rightTrigger;
+    *GuestPtr<uint16_t>(state + 8) = __builtin_bswap16(uint16_t(s.lx));
+    *GuestPtr<uint16_t>(state + 10) = __builtin_bswap16(uint16_t(s.ly));
+    *GuestPtr<uint16_t>(state + 12) = __builtin_bswap16(uint16_t(s.rx));
+    *GuestPtr<uint16_t>(state + 14) = __builtin_bswap16(uint16_t(s.ry));
     Return(ctx, X_ERROR_SUCCESS);
 }
 
 GUEST_EXPORT(XamInputSetState)
 {
-    Return(ctx, ctx.r3.u32 == 0 ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED);
+    // (user, flags, XINPUT_VIBRATION*): left and right motor speeds, big-endian.
+    const uint32_t user = ctx.r3.u32;
+    PadState s;
+    if (!ReadPad(user, s))
+    {
+        Return(ctx, X_ERROR_DEVICE_NOT_CONNECTED);
+        return;
+    }
+    if (ctx.r5.u32 && user < XUSER_MAX_COUNT)
+    {
+        XINPUT_VIBRATION v{};
+        v.wLeftMotorSpeed = __builtin_bswap16(*GuestPtr<uint16_t>(ctx.r5.u32));
+        v.wRightMotorSpeed = __builtin_bswap16(*GuestPtr<uint16_t>(ctx.r5.u32 + 2));
+        XInputSetState(user, &v); // ignored when no pad is connected
+    }
+    Return(ctx, X_ERROR_SUCCESS);
 }
 
 // Content packages (saves) --------------------------------------------------------------
