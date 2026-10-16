@@ -58,7 +58,7 @@ code (`out/ppc`, ~131 MB) is generated from your own copy and never committed.
 | `FM2_TRACE_IMPORTS=<seconds>` | Log kernel/XAM calls made after that time (`FM2_TRACE_LIMIT` per name, default 5) |
 | `FM2_TRACE_FILES=1` | Log file opens and misses |
 | `FM2_AUTOSTART=1` | Tap Start + A every 3 s |
-| `FM2_DUMP_SHADERS=1` | Save every distinct shader's microcode to `Documentsm2\shaders` |
+| `FM2_DUMP_SHADERS=1` | Save every distinct shader's microcode to `Documents/fm2/shaders` |
 | `FM2_DUMP_FRAME=<n>` | Write the n-th rendered frame to `frame.png` |
 | `FM2_TRACE_DRAWS=<n>` | Log every draw, skip, resolve, PM4 packet and texture upload of frame n |
 | `FM2_DUMP_TEXTURE=<hex address>` | Write that texture, decoded, to `texture.png` |
