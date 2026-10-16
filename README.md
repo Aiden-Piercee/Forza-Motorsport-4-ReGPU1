@@ -9,11 +9,12 @@ data is included; you need your own disc image. See
 ## Status
 
 Phase 1 (recompile and boot) is done. The game boots on our kernel layer,
-plays its intro sequence, loads its configuration and car/UI assets, and
-reaches the front-end loading screen (~1.4 s after launch). Nothing is drawn
-yet: a command-processor stand-in retires the GPU work. At the loading
-screen, presenting stops in D3D's flip handshake with the (fake) GPU; that is
-next, together with the phase 2 renderer.
+plays its intro sequence, loads its assets and sits at the title screen
+flipping at a steady 60 Hz (most flips are vsync-only, so VdSwap is called
+only when the front buffer changes). Pressing Start moves on, then crashes
+in game code (a virtual call on an object whose vtable is null), which is
+the next thing to chase. Nothing is drawn yet: a command-processor stand-in
+retires the GPU work.
 
 Stand-ins until their phase: XMA decoding writes silence, audio output is
 discarded, user 0 is a keyboard-driven gamepad (Enter = Start, Space = A,

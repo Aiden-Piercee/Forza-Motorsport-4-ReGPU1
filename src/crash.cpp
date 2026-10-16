@@ -117,9 +117,8 @@ std::atomic<int> g_watchHits{ 0 };
 
 LONG WINAPI OnWatchHit(EXCEPTION_POINTERS* info)
 {
-    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(info->ContextRecord->Dr6 & 1))
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(info->ContextRecord->Dr6 & 7))
         return EXCEPTION_CONTINUE_SEARCH;
-    info->ContextRecord->Dr6 = 0;
     if (g_watchHits++ < 40)
     {
         CONTEXT context = *info->ContextRecord;
@@ -140,8 +139,10 @@ LONG WINAPI OnWatchHit(EXCEPTION_POINTERS* info)
             out += where;
         }
         GuestThread* t = CurrentGuestThread();
-        Log("watchpoint: thread %u wrote %02X: %s", t ? t->id : 0, *reinterpret_cast<uint8_t*>(info->ContextRecord->Dr0), out.c_str());
+        Log("watchpoint: thread %u wrote %02X (dr6 %llX): %s", t ? t->id : 0, *reinterpret_cast<uint8_t*>(info->ContextRecord->Dr0),
+            info->ContextRecord->Dr6, out.c_str());
     }
+    info->ContextRecord->Dr6 = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 }
@@ -168,6 +169,22 @@ void ArmWatchpoint(void* threadHandle)
     GetThreadContext(threadHandle, &c);
     c.Dr0 = address;
     c.Dr7 = (c.Dr7 & ~0xF0003ull) | 1 | (1ull << 16); // L0, write, 1 byte
+    const uint32_t guest = uint32_t(address - uint64_t(g_base));
+    if (guest >= 0xA0000000)
+    {
+        // Physical memory is mapped three times; watch every alias.
+        const uint32_t offset = guest & 0x1FFFFFFF;
+        uint64_t* regs[] = { &c.Dr1, &c.Dr2 };
+        int n = 0;
+        for (uint32_t view : { 0xA0000000u, 0xC0000000u, 0xE0000000u })
+        {
+            if (view + offset == guest || n == 2)
+                continue;
+            *regs[n] = uint64_t(g_base + view + offset);
+            c.Dr7 |= (1ull << (2 + n * 2)) | (1ull << (20 + n * 4));
+            n++;
+        }
+    }
     SetThreadContext(threadHandle, &c);
     ResumeThread(threadHandle);
 }

@@ -4,6 +4,7 @@
 // draw. Vblank interrupts run at 60 Hz. Phase 2 replaces drawing with a
 // native renderer hooked at the D3D level.
 #include <atomic>
+#include <deque>
 #include <chrono>
 #include <thread>
 
@@ -64,8 +65,27 @@ void RaiseInterrupt(uint32_t source, uint32_t cpu)
     g_gpu.interruptCv.notify_one();
 }
 
-// Interrupt callbacks run on a guest thread of their own, like the
-// console's DPC.
+thread_local PPCContext* t_cpContext = nullptr;
+
+void DispatchInterrupt(PPCContext& ctx, uint32_t source, uint32_t cpu)
+{
+    const uint32_t callback = g_gpu.interruptCallback;
+    if (!callback)
+        return;
+    // The handler acknowledges by clearing the bit of the CPU it runs on,
+    // read from the PCR; it runs with that CPU's interrupts disabled.
+    *GuestPtr<uint8_t>(CurrentGuestThread()->pcr + kpcr::CurrentCpu) = uint8_t(cpu);
+    InterruptLockAcquire(int(cpu));
+    ctx.msr &= ~0x8000ull;
+    ctx.r3.u64 = source;
+    ctx.r4.u64 = g_gpu.interruptData;
+    GuestCall(ctx, callback);
+    ctx.msr |= 0x8000;
+    InterruptLockRelease();
+}
+
+// Vblank callbacks run on a guest thread of their own, like the console's
+// DPC; command-stream interrupts run on the command processor thread.
 void InterruptLoop(PPCContext& ctx)
 {
     for (;;)
@@ -76,33 +96,8 @@ void InterruptLoop(PPCContext& ctx)
             g_gpu.interruptCv.wait(lock, [] { return !g_gpu.pendingInterrupts.empty(); });
             sources.swap(g_gpu.pendingInterrupts);
         }
-        const uint32_t callback = g_gpu.interruptCallback;
-        if (!callback)
-            continue;
         for (auto [source, cpu] : sources)
-        {
-            // The handler acknowledges by clearing the bit of the CPU it
-            // runs on, read from the PCR.
-            *GuestPtr<uint8_t>(CurrentGuestThread()->pcr + kpcr::CurrentCpu) = uint8_t(cpu);
-            ctx.r3.u64 = source;
-            ctx.r4.u64 = g_gpu.interruptData;
-            if (g_trace && source == 1)
-                Log("gpu: interrupt 1 on cpu %u", cpu);
-            // Runs with interrupts disabled, excluding guest code that has
-            // them disabled too.
-            InterruptLockAcquire(int(cpu));
-            ctx.msr &= ~0x8000ull;
-            GuestCall(ctx, callback);
-            ctx.msr |= 0x8000;
-            InterruptLockRelease();
-            if (g_trace && source == 1)
-                Log("gpu: interrupt 1 done");
-            if (source == 1)
-            {
-                g_gpu.interruptsHandled++;
-                g_gpu.interruptsHandled.notify_all();
-            }
-        }
+            DispatchInterrupt(ctx, source, cpu);
     }
 }
 
@@ -274,12 +269,11 @@ uint32_t ExecutePacket(uint32_t ptr)
         {
             if ((arg(0) >> cpu) & 1)
             {
-                // Synchronous, like the hardware: the handler runs before
-                // the command processor reads on.
-                const uint32_t target = ++g_gpu.interruptsRaised;
-                RaiseInterrupt(1, cpu);
-                for (uint32_t done = g_gpu.interruptsHandled; done < target; done = g_gpu.interruptsHandled)
-                    g_gpu.interruptsHandled.wait(done);
+                // Synchronous, like the hardware: the handler runs on this
+                // thread before the command processor reads on.
+                g_gpu.interruptsRaised++;
+                DispatchInterrupt(*t_cpContext, 1, cpu);
+                g_gpu.interruptsHandled++;
             }
         }
         break;
@@ -303,9 +297,9 @@ void ExecuteBuffer(uint32_t address, uint32_t dwords)
         done += ExecutePacket(address + done * 4);
 }
 
-void CommandProcessorLoop()
+void CommandProcessorLoop(PPCContext& ctx)
 {
-    SetThreadDescription(GetCurrentThread(), L"gpu command processor");
+    t_cpContext = &ctx;
     for (;;)
     {
         const uint32_t base = g_gpu.ringBase, size = g_gpu.ringDwords;
@@ -322,6 +316,7 @@ void CommandProcessorLoop()
         }
         while (g_gpu.rptr != wptr)
         {
+
             // A packet may wrap past the end of the ring: run it from a
             // contiguous copy.
             const uint32_t header = LoadBE32(base + g_gpu.rptr * 4);
@@ -374,7 +369,6 @@ void GpuInit()
     SetReg(0x194C, 0x000002D0); // D1MODE_V_COUNTER
     SetReg(0x1961, 0x050002D0); // D1MODE_VIEWPORT_SIZE 1280x720
     SetReg(0x0F01, 0x0000200E); // RB_BC_CONTROL
-    std::thread(CommandProcessorLoop).detach();
     std::thread(VblankLoop).detach();
 }
 
@@ -382,7 +376,8 @@ void GpuStartInterruptThread()
 {
     if (g_gpu.interruptThread)
         return;
-    g_gpu.interruptThread = CreateHostGuestThread("gpu interrupts", InterruptLoop);
+    g_gpu.interruptThread = CreateHostGuestThread("gpu vblank irq", InterruptLoop);
+    CreateHostGuestThread("gpu command processor", CommandProcessorLoop);
 }
 
 uint64_t GpuSwapCount() { return g_gpu.swaps; }
@@ -546,7 +541,7 @@ GUEST_EXPORT(VdSwap)
     for (uint32_t i = 0; i < 64; i++)
         StoreBE32(buffer + i * 4, 0x80000000);
     const uint64_t n = ++g_gpu.swaps;
-    if (n == 1 || (n & (n - 1)) == 0 || n % 600 == 0)
+    if (n == 1 || (n & (n - 1)) == 0 || n % 60 == 0)
         Log("gpu: VdSwap #%llu", (unsigned long long)n);
     Return(ctx, 0);
 }
