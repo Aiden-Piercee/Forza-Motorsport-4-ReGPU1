@@ -366,7 +366,11 @@ GUEST_EXPORT(NtReadFile)
 
     uint32_t status = X_STATUS_SUCCESS;
     if (!ok && GetLastError() != ERROR_HANDLE_EOF)
+    {
+        Log("io: read failed (error %lu): %s offset %llu length %u buffer %08X", GetLastError(), file->path.string().c_str(),
+            (unsigned long long)offset, length, buffer);
         status = X_STATUS_UNSUCCESSFUL;
+    }
     else if (read == 0 && length != 0)
         status = X_STATUS_END_OF_FILE;
     SetIoStatus(iosb, status, read);
