@@ -29,6 +29,17 @@ int main(int argc, char** argv)
     auto main = CreateGuestThread(g_title.entryPoint, 0, 0, g_title.stackSize, false, "main");
     char watchdogMs[16] = {};
     const DWORD watchdog = GetEnvironmentVariableA("FM2_WATCHDOG", watchdogMs, 16) ? (atoi(watchdogMs) > 1 ? std::max(50, atoi(watchdogMs)) : 3000) : INFINITE;
+    if (getenv("FM2_WATCHW"))
+    {
+        std::thread([] {
+            void ArmWatchpointAll();
+            for (;;)
+            {
+                Sleep(500);
+                ArmWatchpointAll();
+            }
+        }).detach();
+    }
     while (WaitForSingleObject(main->thread->hostHandle, watchdog) == WAIT_TIMEOUT)
     {
         Log("watchdog:");

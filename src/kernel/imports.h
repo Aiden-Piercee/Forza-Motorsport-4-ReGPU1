@@ -9,7 +9,10 @@
 #include "log.h"
 #include "memory.h"
 
-#define GUEST_EXPORT(name) PPC_FUNC(__imp__##name)
+// Every import goes through TraceImport (FM2_TRACE_IMPORTS=<seconds>: log
+// calls made after that time, a few per name).
+void TraceImport(const char* name, PPCContext& ctx);
+#define GUEST_EXPORT(name)                                         static void Impl_##name(PPCContext& __restrict ctx, uint8_t* base);     PPC_FUNC(__imp__##name)                                        {                                                                  TraceImport(#name, ctx);                                       Impl_##name(ctx, base);                                    }                                                              static void Impl_##name(PPCContext& __restrict ctx, uint8_t* base)
 
 inline uint32_t StackArg(PPCContext& ctx, int index) // index 8 = 9th argument
 {

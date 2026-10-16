@@ -93,6 +93,9 @@ GUEST_EXPORT(ExCreateThread)
     const uint32_t handleOut = ctx.r3.u32, stackSize = ctx.r4.u32, idOut = ctx.r5.u32;
     const uint32_t xapiStartup = ctx.r6.u32, start = ctx.r7.u32, param = ctx.r8.u32, flags = ctx.r9.u32;
     auto t = CreateGuestThread(start, param, xapiStartup, stackSize, flags & 1, nullptr);
+    // Bits 24-29: hardware threads the title wants it on (see KeSetAffinityThread).
+    if (const uint32_t affinity = (flags >> 24) & 0x3F)
+        *GuestPtr<uint8_t>(t->thread->pcr + kpcr::CurrentCpu) = uint8_t(__builtin_ctz(affinity));
     StoreIfNonNull(handleOut, t->handle);
     StoreIfNonNull(idOut, t->thread->id);
     Return(ctx, X_STATUS_SUCCESS);
@@ -144,8 +147,21 @@ GUEST_EXPORT(NtSuspendThread)
 
 GUEST_EXPORT(KeSetAffinityThread)
 {
-    // (thread, affinity, previous*) - host scheduling decides.
-    StoreIfNonNull(ctx.r5.u32, 0x3F);
+    // (thread, affinity, previous*). Host scheduling decides where threads
+    // run, but titles read their hardware thread from the PCR (XAudio's
+    // mixer splits work per CPU and waits on one flag per CPU), so the PCR
+    // reports the lowest CPU in the mask.
+    auto object = ThreadObjectFromKthread(ctx.r3.u32);
+    const uint32_t affinity = ctx.r4.u32 & 0x3F;
+    if (object && affinity)
+    {
+        GuestThread& t = *object->thread;
+        auto* cpu = GuestPtr<uint8_t>(t.pcr + kpcr::CurrentCpu);
+        StoreIfNonNull(ctx.r5.u32, 1u << *cpu);
+        *cpu = uint8_t(__builtin_ctz(affinity));
+    }
+    else
+        StoreIfNonNull(ctx.r5.u32, 0x3F);
     Return(ctx, X_STATUS_SUCCESS);
 }
 
@@ -244,35 +260,55 @@ GUEST_EXPORT(KeRaiseIrqlToDpcLevel)
 
 GUEST_EXPORT(KfLowerIrql) {}
 
-// Interlocked SLists (SLIST_HEADER: Next u32, Depth u16, Sequence u16) ------
+// Interlocked SLists. SLIST_HEADER is one big-endian 64-bit word:
+// Next (32) | Depth (16) | Sequence (16). The title pushes inline with
+// ldarx/stdcx, so pops must be 64-bit compare-and-swaps on the same word.
 
 namespace
 {
-std::mutex g_slistMutex;
+std::atomic<uint64_t>& SListHeader(uint32_t head)
+{
+    return *reinterpret_cast<std::atomic<uint64_t>*>(GuestPtr(head));
+}
 }
 
 GUEST_EXPORT(InterlockedPopEntrySList)
 {
-    std::lock_guard lock(g_slistMutex);
-    const uint32_t head = ctx.r3.u32;
-    const uint32_t first = LoadBE32(head);
-    if (first)
+    auto& header = SListHeader(ctx.r3.u32);
+    uint64_t raw = header.load();
+    for (;;)
     {
-        StoreBE32(head, LoadBE32(first));
-        auto* depth = GuestPtr<uint16_t>(head + 4);
-        *depth = __builtin_bswap16(__builtin_bswap16(*depth) - 1);
+        const uint64_t value = __builtin_bswap64(raw);
+        const uint32_t first = uint32_t(value >> 32);
+        if (!first)
+        {
+            Return(ctx, 0);
+            return;
+        }
+        const uint16_t depth = uint16_t(value >> 16), sequence = uint16_t(value);
+        const uint64_t next = (uint64_t(LoadBE32(first)) << 32) | (uint64_t(uint16_t(depth - 1)) << 16) | uint16_t(sequence + 1);
+        if (header.compare_exchange_weak(raw, __builtin_bswap64(next)))
+        {
+            Return(ctx, first);
+            return;
+        }
     }
-    Return(ctx, first);
 }
 
 GUEST_EXPORT(InterlockedFlushSList)
 {
-    std::lock_guard lock(g_slistMutex);
-    const uint32_t head = ctx.r3.u32;
-    const uint32_t first = LoadBE32(head);
-    StoreBE32(head, 0);
-    *GuestPtr<uint16_t>(head + 4) = 0;
-    Return(ctx, first);
+    auto& header = SListHeader(ctx.r3.u32);
+    uint64_t raw = header.load();
+    for (;;)
+    {
+        const uint64_t value = __builtin_bswap64(raw);
+        const uint64_t empty = uint16_t(value + 1);
+        if (header.compare_exchange_weak(raw, __builtin_bswap64(empty)))
+        {
+            Return(ctx, uint32_t(value >> 32));
+            return;
+        }
+    }
 }
 
 // TLS ------------------------------------------------------------------------
@@ -475,6 +511,7 @@ GUEST_EXPORT(NtCreateEvent)
 
 GUEST_EXPORT(NtSetEvent)
 {
+    TraceObject("NtSetEvent", ctx.r3.u32, ctx);
     auto object = GetHandle(ctx.r3.u32);
     if (!object)
     {
@@ -606,6 +643,7 @@ GUEST_EXPORT(NtCancelTimer)
 
 GUEST_EXPORT(NtWaitForSingleObjectEx)
 {
+    TraceObject("NtWaitForSingleObjectEx", ctx.r3.u32, ctx);
     // (handle, mode, alertable, timeout*)
     auto object = ObjectFromHandleOrPseudo(ctx.r3.u32);
     if (!object)

@@ -204,6 +204,16 @@ void ExitCurrentGuestThread(uint32_t code)
 uint32_t InterruptLockOwner();
 std::string HostStack(void* threadHandle, int maxFrames);
 
+void ArmWatchpoint(void* threadHandle);
+
+void ArmWatchpointAll()
+{
+    std::lock_guard lock(g_threadsMutex);
+    for (auto& [kthread, weak] : g_threadsByKthread)
+        if (auto object = weak.lock(); object && !object->exited && object->thread->hostHandle)
+            ArmWatchpoint(object->thread->hostHandle);
+}
+
 void LogGuestThreads()
 {
     Log("  interrupt lock owner: thread %u", InterruptLockOwner());
@@ -252,33 +262,52 @@ void GuestCall(PPCContext& ctx, uint32_t address)
 
 namespace
 {
-std::recursive_mutex g_interruptLock;
-std::atomic<uint32_t> g_interruptLockOwner{ 0 };
+// One lock per hardware thread: clearing MSR[EE] masks interrupts only on
+// the CPU the thread runs on (its PCR's CPU number), and an interrupt
+// aimed at CPU n takes lock n.
+std::recursive_mutex g_interruptLocks[6];
+std::atomic<uint32_t> g_interruptLockOwner[6];
 thread_local int t_interruptDepth = 0;
+thread_local int t_interruptCpu = 0;
 
-void Lock()
+void Lock(int cpu)
 {
-    g_interruptLock.lock();
+    g_interruptLocks[cpu].lock();
     if (t_interruptDepth++ == 0)
-        g_interruptLockOwner = CurrentGuestThreadId();
+    {
+        t_interruptCpu = cpu;
+        g_interruptLockOwner[cpu] = CurrentGuestThreadId();
+    }
 }
 
 void Unlock()
 {
+    const int cpu = t_interruptCpu;
     if (--t_interruptDepth == 0)
-        g_interruptLockOwner = 0;
-    g_interruptLock.unlock();
+        g_interruptLockOwner[cpu] = 0;
+    g_interruptLocks[cpu].unlock();
+}
+
+int CpuOf(PPCContext& ctx)
+{
+    return *GuestPtr<uint8_t>(ctx.r13.u32 + kpcr::CurrentCpu) % 6;
 }
 }
 
-void InterruptLockAcquire() { Lock(); }
+void InterruptLockAcquire(int cpu) { Lock(cpu % 6); }
 void InterruptLockRelease() { Unlock(); }
-uint32_t InterruptLockOwner() { return g_interruptLockOwner; }
+uint32_t InterruptLockOwner()
+{
+    uint32_t owners = 0;
+    for (auto& o : g_interruptLockOwner)
+        owners = owners ? owners : o.load();
+    return owners;
+}
 
 void PPCMsrChanged(PPCContext& ctx, uint64_t oldMsr)
 {
     if (oldMsr & 0x8000)
-        Lock();   // interrupts now disabled
+        Lock(t_interruptDepth ? t_interruptCpu : CpuOf(ctx)); // interrupts now disabled
     else if (t_interruptDepth > 0)
         Unlock(); // re-enabled
 }

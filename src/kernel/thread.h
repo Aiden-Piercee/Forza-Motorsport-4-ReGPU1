@@ -96,9 +96,10 @@ void GuestCall(PPCContext& ctx, uint32_t address);
 // Initialises ctx for running guest code on thread (r1, r13, fpscr).
 void InitGuestContext(PPCContext& ctx, GuestThread& thread);
 
-// Held while a guest thread has MSR[EE] clear and while an interrupt
-// callback runs: what "interrupts disabled" guarantees on the console.
-void InterruptLockAcquire();
+// Per-CPU locks held while a guest thread has MSR[EE] clear and while an
+// interrupt callback for that CPU runs: what "interrupts disabled"
+// guarantees on the console.
+void InterruptLockAcquire(int cpu);
 void InterruptLockRelease();
 
 uint32_t TlsAllocSlot();

@@ -13,7 +13,7 @@ with open(sys.argv[2], "w", newline="\n") as out:
     out.write("// title calls; each logs its first call and returns 0.\n")
     out.write('#include "kernel/imports.h"\n\n')
     for n in names:
-        out.write(f"__attribute__((weak)) GUEST_EXPORT({n})\n{{\n")
+        out.write(f"__attribute__((weak)) PPC_FUNC(__imp__{n})\n{{\n")
         out.write(f'    LOG_ONCE("unimplemented import {n} (lr %08llX)", ctx.lr);\n')
         out.write("    Return(ctx, 0);\n}\n\n")
 print(len(names), "stubs")

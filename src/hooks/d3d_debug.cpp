@@ -28,8 +28,23 @@ PPC_FUNC(sub_82371D60)
     g_waiting--;
 }
 
+void D3DDebugLogFlips(uint32_t dev)
+{
+    std::string q;
+    for (int i = 0; i < 8; i++)
+    {
+        char e[32];
+        snprintf(e, sizeof(e), " [%08X@%u]", LoadBE32(dev + 16196 + i * 8), LoadBE32(dev + 16200 + i * 8));
+        q += e;
+    }
+    Log("  d3d: vblanks %u flips done %u queue %u..%u%s", LoadBE32(dev + 16172), LoadBE32(dev + 16192), LoadBE32(dev + 16324),
+        LoadBE32(dev + 16328), q.c_str());
+}
+
 void D3DDebugLog()
 {
+    if (const uint32_t dev = LoadBE32(LoadBE32(0x820009CC)))
+        D3DDebugLogFlips(dev);
     if (!g_waiting || !g_waitDevice)
         return;
     const uint32_t block = LoadBE32(g_waitDevice + 0x2A10);

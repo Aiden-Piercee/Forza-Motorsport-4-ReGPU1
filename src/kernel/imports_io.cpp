@@ -256,6 +256,8 @@ uint32_t OpenFile(uint32_t handleOut, uint32_t access, uint32_t attributes, uint
     {
         if (disposition == 1 || disposition == 4)
         {
+            if (getenv("FM2_TRACE_FILES"))
+                Log("vfs: not found %s (%s)", guest.c_str(), host.string().c_str());
             SetIoStatus(iosb, X_STATUS_OBJECT_NAME_NOT_FOUND, 5);
             return X_STATUS_OBJECT_NAME_NOT_FOUND;
         }
@@ -303,6 +305,9 @@ uint32_t OpenFile(uint32_t handleOut, uint32_t access, uint32_t attributes, uint
     }
 
     StoreBE32(handleOut, CreateHandle(file));
+    static const bool trace = getenv("FM2_TRACE_FILES") != nullptr;
+    if (trace)
+        Log("vfs: open %s -> %08X", guest.c_str(), file->handle);
     SetIoStatus(iosb, X_STATUS_SUCCESS, information);
     return X_STATUS_SUCCESS;
 }

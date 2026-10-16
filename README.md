@@ -8,11 +8,16 @@ data is included; you need your own disc image. See
 
 ## Status
 
-Phase 1 (recompile and boot): the game boots on our kernel layer, starts its
-threads, initialises Direct3D and presents its first frames (VdSwap) about
-0.45 s after launch. Nothing is drawn yet: a command-processor stand-in
-retires the GPU work so the D3D side keeps running. After ~87 frames the game
-stops presenting while it waits on audio (XMA decoding is still a stub).
+Phase 1 (recompile and boot) is done. The game boots on our kernel layer,
+plays its intro sequence, loads its configuration and car/UI assets, and
+reaches the front-end loading screen (~1.4 s after launch). Nothing is drawn
+yet: a command-processor stand-in retires the GPU work. At the loading
+screen, presenting stops in D3D's flip handshake with the (fake) GPU; that is
+next, together with the phase 2 renderer.
+
+Stand-ins until their phase: XMA decoding writes silence, audio output is
+discarded, user 0 is a keyboard-driven gamepad (Enter = Start, Space = A,
+Backspace = B, arrows = D-pad).
 
 ## Building
 
@@ -41,6 +46,10 @@ code (`out/ppc`, ~131 MB) is generated from your own copy and never committed.
 | `FM2_TRACE_OBJ=<hex>` | Log KeSetEvent/KeResetEvent/KeWait on one guest object |
 | `FM2_TRACE_SWAP=1` | Log D3D presents and swaps |
 | `FM2_WATCH=<hex>` | Log every change of one guest word |
+| `FM2_WATCHW=<hex>` or `<ptr>,<offset>` | Hardware write watchpoint on a guest byte; logs the writing guest functions |
+| `FM2_TRACE_IMPORTS=<seconds>` | Log kernel/XAM calls made after that time (`FM2_TRACE_LIMIT` per name, default 5) |
+| `FM2_TRACE_FILES=1` | Log file opens and misses |
+| `FM2_AUTOSTART=1` | Tap Start + A every 3 s |
 
 `tools/callgraph.py` indexes the generated code (`build`, `callers sub_X`,
 `at <address>`); `build/tools/dis.exe <xex> <address> <count>` disassembles.
@@ -52,5 +61,5 @@ code (`out/ppc`, ~131 MB) is generated from your own copy and never committed.
 | `config/` | XenonRecomp config and jump tables for FM2 |
 | `patches/` | Our XenonRecomp changes: FM2's extra VMX/PPC instructions, non-trapping divides, MSR[EE] hook |
 | `src/` | Runtime: guest memory, loader, kernel/XAM imports, threads, GPU and audio stand-ins |
-| `src/hooks/` | Overrides of recompiled functions (`sub_X`), currently D3D instrumentation |
+| `src/hooks/` | Overrides of recompiled functions (`sub_X`): XAPI fibers on host fibers, D3D instrumentation |
 | `tools/` | Disc extraction, XEX dump/disassembler, analysis scripts |

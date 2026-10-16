@@ -1,6 +1,8 @@
 // XAM: users, profiles, system UI, content packages, input, notifications.
 // The port runs headless: one signed-in local profile, every system dialog
 // answered with its default.
+#include <atomic>
+#include <chrono>
 #include <deque>
 #include <filesystem>
 
@@ -9,6 +11,8 @@
 #include "kernel/thread.h"
 #include "kernel/vfs.h"
 #include "loader.h"
+
+#include <windows.h>
 
 namespace
 {
@@ -294,9 +298,75 @@ GUEST_EXPORT(XamShowKeyboardUI)
 
 // Input (controllers arrive in phase 4) -----------------------------------------------
 
-GUEST_EXPORT(XamInputGetCapabilities) { Return(ctx, X_ERROR_DEVICE_NOT_CONNECTED); }
-GUEST_EXPORT(XamInputGetState) { Return(ctx, X_ERROR_DEVICE_NOT_CONNECTED); }
-GUEST_EXPORT(XamInputSetState) { Return(ctx, X_ERROR_DEVICE_NOT_CONNECTED); }
+// Stand-in until real input (phase 4): user 0 is a gamepad driven by the
+// keyboard. FM2_AUTOSTART taps START every 3 s for unattended runs.
+namespace
+{
+uint16_t PadButtons()
+{
+    struct Key
+    {
+        int vk;
+        uint16_t button;
+    };
+    static const Key keys[] = {
+        { VK_UP, 0x0001 }, { VK_DOWN, 0x0002 }, { VK_LEFT, 0x0004 }, { VK_RIGHT, 0x0008 },
+        { VK_RETURN, 0x0010 }, { VK_ESCAPE, 0x0020 }, { VK_SPACE, 0x1000 }, { VK_BACK, 0x2000 },
+        { 'X', 0x4000 }, { 'Y', 0x8000 },
+    };
+    uint16_t buttons = 0;
+    for (const Key& k : keys)
+    {
+        if (GetAsyncKeyState(k.vk) & 0x8000)
+            buttons |= k.button;
+    }
+    static const bool autoStart = getenv("FM2_AUTOSTART") != nullptr;
+    static const auto start = Clock::now();
+    if (autoStart)
+    {
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
+        if (ms % 3000 > 2800)
+            buttons |= 0x0010 | 0x1000; // START + A
+    }
+    return buttons;
+}
+}
+
+GUEST_EXPORT(XamInputGetCapabilities)
+{
+    // (user, flags, XINPUT_CAPABILITIES*)
+    if (ctx.r3.u32 != 0)
+    {
+        Return(ctx, X_ERROR_DEVICE_NOT_CONNECTED);
+        return;
+    }
+    const uint32_t caps = ctx.r5.u32;
+    memset(GuestPtr(caps), 0, 0x14);
+    *GuestPtr<uint8_t>(caps + 0) = 1; // XINPUT_DEVTYPE_GAMEPAD
+    *GuestPtr<uint8_t>(caps + 1) = 1; // XINPUT_DEVSUBTYPE_GAMEPAD
+    Return(ctx, X_ERROR_SUCCESS);
+}
+
+GUEST_EXPORT(XamInputGetState)
+{
+    // (user, flags, XINPUT_STATE*): packet number, then buttons, triggers, sticks.
+    if (ctx.r3.u32 != 0)
+    {
+        Return(ctx, X_ERROR_DEVICE_NOT_CONNECTED);
+        return;
+    }
+    static std::atomic<uint32_t> packet{ 0 };
+    const uint32_t state = ctx.r5.u32;
+    memset(GuestPtr(state), 0, 0x10);
+    StoreBE32(state, ++packet);
+    *GuestPtr<uint16_t>(state + 4) = __builtin_bswap16(PadButtons());
+    Return(ctx, X_ERROR_SUCCESS);
+}
+
+GUEST_EXPORT(XamInputSetState)
+{
+    Return(ctx, ctx.r3.u32 == 0 ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED);
+}
 
 // Content packages (saves) --------------------------------------------------------------
 
@@ -402,7 +472,40 @@ GUEST_EXPORT(XamTaskCloseHandle) { CloseHandle(ctx.r3.u32); Return(ctx, X_STATUS
 
 // Live, sessions, voice: offline ------------------------------------------------------
 
-GUEST_EXPORT(XMsgInProcessCall) { Return(ctx, X_ERROR_FUNCTION_FAILED); }
+// XMsg to system apps. 0xFA is XMP, the music player: report it idle
+// (no custom soundtrack) at full volume. Arguments arrive as a struct of
+// big-endian dwords at r5.
+GUEST_EXPORT(XMsgInProcessCall)
+{
+    const uint32_t app = ctx.r3.u32, message = ctx.r4.u32, args = ctx.r5.u32;
+    if (app != 0xFA)
+    {
+        LOG_ONCE("XMsgInProcessCall to app %X (message %08X) not supported", app, message);
+        Return(ctx, 0x80004005); // E_FAIL
+        return;
+    }
+    switch (message)
+    {
+    case 0x00070009: // get status (client, status*)
+        StoreIfNonNull(LoadBE32(args + 4), 0);
+        break;
+    case 0x0007000B: // get volume (client, float*)
+    {
+        const float one = 1.0f;
+        uint32_t bits;
+        memcpy(&bits, &one, 4);
+        StoreIfNonNull(LoadBE32(args + 4), bits);
+        break;
+    }
+    case 0x0007001B: // get dashboard init state (client, state*)
+        StoreIfNonNull(LoadBE32(args + 4), 0);
+        break;
+    default:
+        LOG_ONCE("XMP message %08X answered with success", message);
+        break;
+    }
+    Return(ctx, 0);
+}
 GUEST_EXPORT(XMsgStartIORequest) { FinishUi(ctx, ctx.r5.u32, X_ERROR_FUNCTION_FAILED); }
 GUEST_EXPORT(XMsgStartIORequestEx) { FinishUi(ctx, ctx.r5.u32, X_ERROR_FUNCTION_FAILED); }
 GUEST_EXPORT(XMsgCancelIORequest) { Return(ctx, X_ERROR_SUCCESS); }

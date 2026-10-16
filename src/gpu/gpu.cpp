@@ -46,6 +46,7 @@ struct Gpu
     std::atomic<uint64_t> swaps{ 0 };
     std::atomic<uint32_t> lastPacket{ 0 };
     std::atomic<uint32_t> waitingOn{ 0 };
+    std::atomic<uint32_t> waitingRef{ 0 }, waitingInfo{ 0 };
     std::atomic<uint32_t> interruptsRaised{ 0 };
     std::atomic<uint64_t> draws{ 0 };
     std::atomic<uint32_t> interruptsHandled{ 0 };
@@ -89,7 +90,7 @@ void InterruptLoop(PPCContext& ctx)
                 Log("gpu: interrupt 1 on cpu %u", cpu);
             // Runs with interrupts disabled, excluding guest code that has
             // them disabled too.
-            InterruptLockAcquire();
+            InterruptLockAcquire(int(cpu));
             ctx.msr &= ~0x8000ull;
             GuestCall(ctx, callback);
             ctx.msr |= 0x8000;
@@ -236,6 +237,8 @@ uint32_t ExecutePacket(uint32_t ptr)
     {
         const uint32_t info = arg(0);
         g_gpu.waitingOn = arg(1);
+        g_gpu.waitingRef = arg(2);
+        g_gpu.waitingInfo = info;
         // Usually satisfied within microseconds by an interrupt handler:
         // spin, then yield, then sleep.
         const auto start = Clock::now();
@@ -389,8 +392,8 @@ void GpuLogState()
     const uint32_t w = g_gpu.waitingOn;
     if (g_gpu.rptrWriteback)
         Log("  gpu: rptr writeback reads %u", LoadBE32(g_gpu.rptrWriteback));
-    Log("  gpu: rptr %u wptr %u last packet %08X waiting on %08X (= %08X) swaps %llu", g_gpu.rptr, Reg(CP_RB_WPTR),
-        g_gpu.lastPacket.load(), w, w ? ReadBack(w) : 0, (unsigned long long)g_gpu.swaps.load());
+    Log("  gpu: rptr %u wptr %u last packet %08X waiting on %08X (= %08X, want fn %u ref %08X) swaps %llu", g_gpu.rptr, Reg(CP_RB_WPTR),
+        g_gpu.lastPacket.load(), w, w ? ReadBack(w) : 0, g_gpu.waitingInfo & 7, g_gpu.waitingRef.load(), (unsigned long long)g_gpu.swaps.load());
     Log("  gpu: interrupts raised %u handled %u, draws %llu", g_gpu.interruptsRaised.load(), g_gpu.interruptsHandled.load(),
         (unsigned long long)g_gpu.draws.load());
     if (const uint32_t device = g_gpu.interruptData)

@@ -74,17 +74,3 @@ GUEST_EXPORT(XAudioGetVoiceCategoryVolume)
     StoreIfNonNull(ctx.r4.u32, bits);
     Return(ctx, X_STATUS_SUCCESS);
 }
-
-// XMA hardware decoder contexts: allocated and accepted, never decoding yet.
-GUEST_EXPORT(XMACreateContext)
-{
-    const uint32_t context = GuestAlloc(Heap::Physical, 0x40, 0x100);
-    StoreIfNonNull(ctx.r3.u32, context);
-    Return(ctx, context ? X_STATUS_SUCCESS : X_STATUS_NO_MEMORY);
-}
-
-GUEST_EXPORT(XMAReleaseContext)
-{
-    GuestFree(ctx.r3.u32);
-    Return(ctx, 0);
-}

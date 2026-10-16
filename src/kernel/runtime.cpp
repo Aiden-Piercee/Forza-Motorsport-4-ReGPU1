@@ -6,7 +6,10 @@
 #include <intrin.h>
 #include <windows.h>
 
+#include <unordered_map>
+
 #include "kernel/imports.h"
+#include "kernel/thread.h"
 #include "loader.h"
 
 namespace
@@ -100,4 +103,20 @@ void CompleteOverlapped(uint32_t overlapped, uint32_t result, uint32_t extendedE
     }
     if (LoadBE32(overlapped + 0x10))
         LOG_ONCE("XOVERLAPPED completion routines are not called yet");
+}
+
+void TraceImport(const char* name, PPCContext& ctx)
+{
+    static const double after = getenv("FM2_TRACE_IMPORTS") ? atof(getenv("FM2_TRACE_IMPORTS")) : -1;
+    if (after < 0)
+        return;
+    static const auto start = Clock::now();
+    if (std::chrono::duration<double>(Clock::now() - start).count() < after)
+        return;
+    static std::mutex mutex;
+    static std::unordered_map<std::string, int> counts;
+    std::lock_guard lock(mutex);
+    static const int limit = getenv("FM2_TRACE_LIMIT") ? atoi(getenv("FM2_TRACE_LIMIT")) : 5;
+    if (counts[name]++ < limit)
+        Log("import %s (thread %u, lr %08llX, r3 %08X r4 %08X r5 %08X r9 %08X)", name, CurrentGuestThreadId(), ctx.lr, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r9.u32);
 }
