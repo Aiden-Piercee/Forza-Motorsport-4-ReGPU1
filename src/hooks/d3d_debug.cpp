@@ -45,6 +45,8 @@ void D3DDebugLog()
 {
     if (const uint32_t dev = LoadBE32(LoadBE32(0x820009CC)))
         D3DDebugLogFlips(dev);
+    extern std::atomic<uint64_t> g_d3dSwaps, g_gamePresents;
+    Log("  d3d: game presents %llu, D3D swaps %llu", (unsigned long long)g_gamePresents.load(), (unsigned long long)g_d3dSwaps.load());
     if (!g_waiting || !g_waitDevice)
         return;
     const uint32_t block = LoadBE32(g_waitDevice + 0x2A10);
@@ -116,9 +118,12 @@ void StartWatch()
 extern "C" PPC_FUNC(__imp__sub_8236CB28);
 extern "C" PPC_FUNC(__imp__sub_825ADE70);
 
+std::atomic<uint64_t> g_d3dSwaps{ 0 }, g_gamePresents{ 0 };
+
 // D3D swap (calls VdSwap).
 PPC_FUNC(sub_8236CB28)
 {
+    g_d3dSwaps++;
     static std::atomic<int> n{ 0 };
     if (n++ < 200 && getenv("FM2_TRACE_SWAP"))
         Log("d3d swap #%d by thread %u (lr %08llX) flags 2A3E %02X", n.load(), CurrentGuestThreadId(), ctx.lr,
@@ -128,8 +133,10 @@ PPC_FUNC(sub_8236CB28)
 
 PPC_FUNC(sub_825ADE70)
 {
+    g_gamePresents++;
     static std::atomic<int> n{ 0 };
     if (n++ < 200 && getenv("FM2_TRACE_SWAP"))
         Log("game present #%d by thread %u (lr %08llX)", n.load(), CurrentGuestThreadId(), ctx.lr);
     __imp__sub_825ADE70(ctx, base);
 }
+

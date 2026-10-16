@@ -250,25 +250,31 @@ GUEST_EXPORT(XamShowDirtyDiscErrorUI)
 
 GUEST_EXPORT(XamShowDeviceSelectorUI)
 {
-    // (user, contentType, flags, totalRequested (u64), deviceId*, overlapped)
-    StoreIfNonNull(ctx.r8.u32, 1); // the hard drive
-    FinishUi(ctx, ctx.r9.u32);
+    // (user, contentType, flags, totalRequested (u64, one register), deviceId*, overlapped)
+    StoreIfNonNull(ctx.r7.u32, 1); // the hard drive
+    FinishUi(ctx, ctx.r8.u32);
 }
 
 GUEST_EXPORT(XamShowMessageBoxUI)
 {
-    // (user, title, text, buttonCount, buttons, focus, flags, result*, overlapped)
-    std::string text;
-    for (uint32_t i = 0, p = ctx.r5.u32; p && i < 256; i++)
-    {
-        const uint16_t c = __builtin_bswap16(GuestPtr<uint16_t>(p)[i]);
-        if (!c)
-            break;
-        text += c < 0x80 ? char(c) : '?';
-    }
+    // (user, title, text, buttonCount, buttons, focus, flags, result* (r10), overlapped (stack))
+    auto wide = [](uint32_t p) {
+        std::string out;
+        for (uint32_t i = 0; p && i < 512; i++)
+        {
+            const uint16_t c = __builtin_bswap16(GuestPtr<uint16_t>(p)[i]);
+            if (!c)
+                break;
+            out += c < 0x80 ? char(c) : '?';
+        }
+        return out;
+    };
+    std::string text = wide(ctx.r4.u32) + " | " + wide(ctx.r5.u32);
+    for (uint32_t b = 0; b < ctx.r6.u32 && b < 4; b++)
+        text += " [" + wide(LoadBE32(ctx.r7.u32 + b * 4)) + "]";
     Log("message box: %s", text.c_str());
-    StoreIfNonNull(StackArg(ctx, 8), 0); // first button
-    FinishUi(ctx, StackArg(ctx, 9));
+    StoreIfNonNull(ctx.r10.u32, 0); // result: first button
+    FinishUi(ctx, StackArg(ctx, 8));
 }
 
 GUEST_EXPORT(XamShowMessageBoxUIEx)

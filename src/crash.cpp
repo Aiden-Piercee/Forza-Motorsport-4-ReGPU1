@@ -58,6 +58,8 @@ LONG WINAPI OnCrash(EXCEPTION_POINTERS* info)
         Describe(frame.AddrPC.Offset, where, sizeof(where));
         Log("CRASH:   #%d %s", i, where);
     }
+    Log("CRASH: other threads:");
+    LogGuestThreads();
     return EXCEPTION_EXECUTE_HANDLER;
 }
 }
@@ -67,6 +69,8 @@ LONG WINAPI OnCrash(EXCEPTION_POINTERS* info)
 std::string HostStack(void* threadHandle, int maxFrames)
 {
     std::string out;
+    if (GetThreadId(threadHandle) == GetCurrentThreadId())
+        return "(this thread)";
     if (SuspendThread(threadHandle) == DWORD(-1))
         return out;
     CONTEXT context{};

@@ -50,6 +50,13 @@ struct Gpu
     std::atomic<uint32_t> waitingRef{ 0 }, waitingInfo{ 0 };
     std::atomic<uint32_t> interruptsRaised{ 0 };
     std::atomic<uint64_t> draws{ 0 };
+    // Predicated tiling: type-3 packets with the predicate bit run only
+    // when (binSelect & binMask) != 0. D3D replays each frame per tile and
+    // predicates its once-per-frame packets (swap callbacks, fences).
+    uint64_t binMask = ~0ull;
+    uint64_t binSelect = ~0ull;
+    std::atomic<uint64_t> skippedPredicated{ 0 };
+    std::atomic<uint64_t> waits{ 0 }, slowWaits{ 0 }, waitMicros{ 0 };
     std::atomic<uint32_t> interruptsHandled{ 0 };
 };
 
@@ -191,6 +198,11 @@ uint32_t ExecutePacket(uint32_t ptr)
     const uint32_t opcode = (header >> 8) & 0x7F;
     const uint32_t data = ptr + 4;
     auto arg = [&](uint32_t i) { return LoadBE32(data + i * 4); };
+    if ((header & 1) && !(g_gpu.binSelect & g_gpu.binMask))
+    {
+        g_gpu.skippedPredicated++;
+        return 1 + count;
+    }
     if (g_trace && opcode != 0x10)
         Log("gpu: %08X op %02X count %u: %08X %08X %08X %08X", ptr, opcode, count, arg(0), count > 1 ? arg(1) : 0,
             count > 2 ? arg(2) : 0, count > 3 ? arg(3) : 0);
@@ -256,6 +268,13 @@ uint32_t ExecutePacket(uint32_t ptr)
                 Sleep(1);
         }
         g_gpu.waitingOn = 0;
+        {
+            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count();
+            g_gpu.waits++;
+            g_gpu.waitMicros += us;
+            if (us > 1000)
+                g_gpu.slowWaits++;
+        }
         break;
     }
     case 0x21: // REG_RMW: reg, and mask, or mask
@@ -276,6 +295,24 @@ uint32_t ExecutePacket(uint32_t ptr)
                 g_gpu.interruptsHandled++;
             }
         }
+        break;
+    case 0x60: // SET_BIN_MASK_LO
+        g_gpu.binMask = (g_gpu.binMask & 0xFFFFFFFF00000000ull) | arg(0);
+        break;
+    case 0x61: // SET_BIN_MASK_HI
+        g_gpu.binMask = (g_gpu.binMask & 0xFFFFFFFFull) | (uint64_t(arg(0)) << 32);
+        break;
+    case 0x62: // SET_BIN_SELECT_LO
+        g_gpu.binSelect = (g_gpu.binSelect & 0xFFFFFFFF00000000ull) | arg(0);
+        break;
+    case 0x63: // SET_BIN_SELECT_HI
+        g_gpu.binSelect = (g_gpu.binSelect & 0xFFFFFFFFull) | (uint64_t(arg(0)) << 32);
+        break;
+    case 0x50: // SET_BIN_MASK (64-bit)
+        g_gpu.binMask = (uint64_t(arg(0)) << 32) | arg(1);
+        break;
+    case 0x51: // SET_BIN_SELECT (64-bit)
+        g_gpu.binSelect = (uint64_t(arg(0)) << 32) | arg(1);
         break;
     case 0x22: // DRAW_INDX
     case 0x36: // DRAW_INDX_2
@@ -389,6 +426,9 @@ void GpuLogState()
         Log("  gpu: rptr writeback reads %u", LoadBE32(g_gpu.rptrWriteback));
     Log("  gpu: rptr %u wptr %u last packet %08X waiting on %08X (= %08X, want fn %u ref %08X) swaps %llu", g_gpu.rptr, Reg(CP_RB_WPTR),
         g_gpu.lastPacket.load(), w, w ? ReadBack(w) : 0, g_gpu.waitingInfo & 7, g_gpu.waitingRef.load(), (unsigned long long)g_gpu.swaps.load());
+    Log("  gpu: predicated packets skipped %llu", (unsigned long long)g_gpu.skippedPredicated.load());
+    Log("  gpu: waits %llu (%llu over 1 ms, %.1f s total)", (unsigned long long)g_gpu.waits.load(), (unsigned long long)g_gpu.slowWaits.load(),
+        g_gpu.waitMicros / 1e6);
     Log("  gpu: interrupts raised %u handled %u, draws %llu", g_gpu.interruptsRaised.load(), g_gpu.interruptsHandled.load(),
         (unsigned long long)g_gpu.draws.load());
     if (const uint32_t device = g_gpu.interruptData)

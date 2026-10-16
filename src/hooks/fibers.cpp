@@ -4,6 +4,7 @@
 // with its own PPCContext and guest stack. The guest fiber object keeps
 // its layout where titles read it: the fiber data at +0 (GetFiberData),
 // the current fiber in KTHREAD+0x164 (GetCurrentFiber).
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 
@@ -26,6 +27,7 @@ struct Fiber
     uint64_t r13 = 0;       // PCR to run with, set by whoever switches in
     PPCContext* ctx = nullptr;
     bool converted = false; // a thread turned into a fiber
+    std::atomic<bool> running{ false };
 };
 
 std::mutex g_mutex;
@@ -99,6 +101,7 @@ PPC_FUNC(sub_82754CD0)
     fiber->converted = true;
     fiber->host = IsThreadAFiber() ? GetCurrentFiber() : ConvertThreadToFiberEx(nullptr, FIBER_FLAG_FLOAT_SWITCH);
     fiber->ctx = &ctx;
+    fiber->running = true;
     GuestThread* t = CurrentGuestThread();
     StoreBE32(fiber->guest + 8, t ? t->stackHigh : 0);
     StoreBE32(fiber->guest + 12, t ? t->stackLow : 0);
@@ -165,7 +168,12 @@ PPC_FUNC(sub_82754EF0)
     target->r13 = ctx.r13.u64;
     if (target->ctx)
         target->ctx->r13 = ctx.r13;
+    Fiber* self = Find(CurrentFiber(ctx));
+    if (target->running.exchange(true))
+        Log("SwitchToFiber: fiber %08X is still running on another thread (lr %08llX)", target->guest, ctx.lr);
     SetCurrentFiber(ctx, target->guest);
+    if (self)
+        self->running = false;
     SwitchToFiber(target->host);
 }
 

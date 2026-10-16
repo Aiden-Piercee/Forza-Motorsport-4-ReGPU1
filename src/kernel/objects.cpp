@@ -1,5 +1,6 @@
 #include "kernel/objects.h"
 
+#include <algorithm>
 #include <unordered_map>
 
 #include <windows.h>
@@ -9,6 +10,35 @@
 
 std::mutex g_objectMutex;
 std::condition_variable g_objectCv;
+
+namespace
+{
+// Threads blocked in WaitForObjects. A signal wakes only those whose wait
+// it can satisfy, instead of every waiting thread.
+struct Waiter
+{
+    std::condition_variable cv;
+    const std::vector<std::shared_ptr<KernelObject>>* objects;
+    bool waitAll;
+    uint32_t tid;
+};
+std::vector<Waiter*> g_waiters;
+
+bool Satisfiable(const Waiter& w)
+{
+    if (w.waitAll)
+    {
+        for (auto& o : *w.objects)
+            if (!o->IsSignaled(w.tid))
+                return false;
+        return true;
+    }
+    for (auto& o : *w.objects)
+        if (o->IsSignaled(w.tid))
+            return true;
+    return false;
+}
+}
 
 namespace
 {
@@ -206,16 +236,25 @@ uint32_t WaitForObjects(const std::vector<std::shared_ptr<KernelObject>>& object
         }
         if (deadline && Clock::now() >= *deadline)
             return X_STATUS_TIMEOUT;
+
+        Waiter waiter{ {}, &objects, waitAll, tid };
+        g_waiters.push_back(&waiter);
         if (wake)
-            g_objectCv.wait_until(lock, *wake);
+            waiter.cv.wait_until(lock, *wake);
         else
-            g_objectCv.wait(lock);
+            waiter.cv.wait(lock);
+        g_waiters.erase(std::find(g_waiters.begin(), g_waiters.end(), &waiter));
     }
 }
 
 void SignalObjectsChanged()
 {
-    g_objectCv.notify_all();
+    std::lock_guard lock(g_objectMutex);
+    for (Waiter* w : g_waiters)
+    {
+        if (Satisfiable(*w))
+            w->cv.notify_one();
+    }
 }
 
 void SyncGuestSignalState(KernelObject& object)
