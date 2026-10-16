@@ -7,9 +7,16 @@
 // target with depth. Resolves and other non-colour EDRAM passes are
 // skipped; render-target configuration (EDRAM surfaces, MSAA, tiles) comes
 // next.
-#include "gpu/renderer.h"
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <chrono>
 #include <cmath>
 #include <map>
@@ -24,9 +31,11 @@
 #include "gpu/regs.h"
 #include "gpu/texture.h"
 #include "gpu/ucode.h"
+#include "kernel/runtime.h"
 #include "log.h"
 #include "png.h"
 #include "render/presenter.h"
+#include "gpu/renderer.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -35,8 +44,9 @@ namespace
 constexpr UINT kWidth = 1280, kHeight = 720;
 constexpr UINT kFrames = 3;
 constexpr UINT64 kRingSize = 64ull << 20;
-constexpr UINT kDescriptorsPerFrame = 32768;
-constexpr UINT kTableSize = 33; // t0 guest data + 32 textures
+constexpr UINT kDescriptorsPerFrame = 34 * 8192; // 8192 draws
+constexpr UINT kTableSize = 34; // t0 upload ring, t1-t32 textures, t33 guest physical memory
+constexpr uint32_t kDirectFetchBytes = 64 * 1024;
 
 // Registers.
 constexpr uint32_t RB_COLOR_MASK = 0x2104, RB_ALPHA_REF = 0x210E, RB_DEPTHCONTROL = 0x2200, RB_BLENDCONTROL0 = 0x2201;
@@ -46,6 +56,7 @@ constexpr uint32_t PA_CL_VPORT_ZSCALE = 0x2113, PA_CL_VPORT_ZOFFSET = 0x2114;
 constexpr uint32_t PA_SC_WINDOW_OFFSET = 0x2080, PA_SC_WINDOW_SCISSOR_TL = 0x2081, PA_SC_WINDOW_SCISSOR_BR = 0x2082;
 constexpr uint32_t PA_SU_SC_MODE_CNTL = 0x2205;
 constexpr uint32_t RB_COPY_CONTROL = 0x2318, RB_COPY_DEST_BASE = 0x2319, RB_COPY_DEST_PITCH = 0x231A, RB_COPY_DEST_INFO = 0x231B;
+constexpr uint32_t SQ_PROGRAM_CNTL = 0x2180, SQ_CONTEXT_MISC = 0x2181, PA_SU_POINT_SIZE = 0x2280, PA_SU_POINT_MINMAX = 0x2281;
 constexpr uint32_t RB_DEPTH_CLEAR = 0x231D, RB_COLOR_CLEAR = 0x231E;
 
 void LogDebugMessages();
@@ -69,15 +80,20 @@ float RegFloat(uint32_t index)
 
 struct CompiledShader
 {
-    bool ok = false;
+    enum State { Pending, Ready, Failed };
+    std::atomic<int> state{ Pending }; // set by the compile worker
+    uint64_t hash = 0, cacheKey = 0;
+    bool pixel = false;
     ComPtr<ID3DBlob> code;
     TranslatedShader info;
+    bool IsReady() const { return state.load(std::memory_order_acquire) == Ready; }
 };
 
 struct CachedTexture
 {
     ComPtr<ID3D12Resource> resource;
     uint64_t contentHash = 0;
+    uint64_t checkedFrame = ~0ull; // content already validated in this frame
     uint32_t width = 0, height = 0;
 };
 
@@ -95,6 +111,8 @@ struct FrameResources
     ComPtr<ID3D12Resource> ring;
     uint8_t* ringCpu = nullptr;
     UINT64 ringUsed = 0;
+    // Guest ranges already uploaded this frame: (address << 32 | bytes) -> (offset, sample hash).
+    std::unordered_map<uint64_t, std::pair<UINT64, uint64_t>> uploads;
     UINT descriptorBase = 0;
     UINT descriptorsUsed = 0;
     UINT64 fence = 0;
@@ -106,6 +124,8 @@ struct Renderer
     ID3D12Device* device = nullptr;
     ID3D12CommandQueue* queue = nullptr;
     ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12Heap> physicalHeap;     // the guest's physical memory section, mapped for the GPU
+    ComPtr<ID3D12Resource> physical;     // 512 MB raw buffer over it (null if unsupported)
     ComPtr<ID3D12Fence> fence;
     HANDLE fenceEvent = nullptr;
     UINT64 nextFence = 1;
@@ -121,7 +141,7 @@ struct Renderer
     ComPtr<ID3D12Resource> color, depth, readback;
     D3D12_RESOURCE_STATES colorState = D3D12_RESOURCE_STATE_RENDER_TARGET;
 
-    std::unordered_map<uint64_t, CompiledShader> shaders;
+    std::unordered_map<uint64_t, std::unique_ptr<CompiledShader>> shaders;
     std::unordered_map<std::string, ComPtr<ID3D12PipelineState>> pipelines;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, CachedTexture> textures;
     std::unordered_map<uint32_t, ResolvedTexture> resolved; // by physical address
@@ -268,6 +288,38 @@ void Init()
     nullSrv.Texture2D.MipLevels = 1;
     d->CreateShaderResourceView(nullptr, &nullSrv, Cpu(g_r.stagingHeap.Get(), 0, g_r.srvStride));
 
+    // Guest physical memory for the GPU, in place: vertex fetches read it
+    // without copies.
+    ComPtr<ID3D12Device13> d13;
+    HRESULT hr = d->QueryInterface(IID_PPV_ARGS(&d13));
+    if (SUCCEEDED(hr))
+        hr = d13->OpenExistingHeapFromFileMapping(PhysicalSection(), IID_PPV_ARGS(&g_r.physicalHeap));
+    if (FAILED(hr) && d13)
+    {
+        Log("renderer: OpenExistingHeapFromFileMapping failed %08X; trying the view address", unsigned(hr));
+        hr = d13->OpenExistingHeapFromAddress1(GuestPtr(0xA0000000), 0x20000000, IID_PPV_ARGS(&g_r.physicalHeap));
+    }
+    if (FAILED(hr))
+        Log("renderer: mapping guest memory: %s failed %08X", d13 ? "OpenExistingHeapFromAddress1" : "ID3D12Device13", unsigned(hr));
+    else
+    {
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = g_r.physicalHeap->GetDesc().SizeInBytes;
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+        if (FAILED(hr = d->CreatePlacedResource(g_r.physicalHeap.Get(), 0, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_r.physical))))
+        {
+            Log("renderer: placing the guest memory buffer failed %08X", unsigned(hr));
+            g_r.physical.Reset();
+        }
+    }
+    Log("renderer: guest memory %s", g_r.physical ? "mapped for the GPU (zero-copy vertex fetch)" : "not mappable; vertex data is copied");
+
     // Colour and depth targets.
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -332,6 +384,7 @@ void BeginFrameIfNeeded()
     f.allocator->Reset();
     g_r.list->Reset(f.allocator.Get(), nullptr);
     f.ringUsed = 0;
+    f.uploads.clear();
     f.descriptorsUsed = 0;
     ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get() };
     g_r.list->SetDescriptorHeaps(1, heaps);
@@ -360,42 +413,156 @@ UINT64 RingAlloc(UINT64 bytes, UINT64 alignment = 256)
     FrameResources& f = Frame();
     const UINT64 offset = (f.ringUsed + alignment - 1) & ~(alignment - 1);
     if (offset + bytes > kRingSize)
+    {
+        static UINT64 lastFull = 0;
+        if (RendererTracing() && lastFull != g_r.frame)
+        {
+            lastFull = g_r.frame;
+            Log("ring full: %llu bytes requested, %llu used, %llu uploads cached", (unsigned long long)bytes, (unsigned long long)f.ringUsed, (unsigned long long)f.uploads.size());
+        }
         return ~0ull;
+    }
     f.ringUsed = offset + bytes;
     return offset;
 }
+
+// Copies a guest range into the ring once per frame; draws sharing a vertex
+// buffer reuse the copy. A sampled hash catches ranges rewritten mid-frame.
+UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
+{
+    FrameResources& f = Frame();
+    const uint8_t* src = GuestPtr<uint8_t>(guest);
+    uint64_t sample = bytes;
+    for (uint32_t i = 0; i < 16 && bytes >= 8; i++)
+    {
+        uint64_t v;
+        memcpy(&v, src + (uint64_t(bytes - 8) * i / 15), 8);
+        sample = (sample ^ v) * 0x100000001B3ull;
+    }
+    const uint64_t key = uint64_t(guest) << 32 | bytes;
+    if (auto it = f.uploads.find(key); it != f.uploads.end() && it->second.second == sample)
+        return it->second.first;
+    if (RendererTracing() && bytes > (16u << 10))
+        Log("upload: %08X %u bytes (ring %llu)", guest, bytes, (unsigned long long)f.ringUsed);
+    const UINT64 offset = RingAlloc(std::max<uint32_t>(bytes, 16) + 16, 16);
+    if (offset == ~0ull)
+        return offset;
+    memcpy(f.ringCpu + offset, src, bytes);
+    f.uploads[key] = { offset, sample };
+    return offset;
+}
+
+// Shader compilation runs on worker threads so the command processor never
+// stalls on fxc: a draw whose shaders are still compiling is skipped. The
+// bytecode is cached on disk by HLSL hash, so later runs start warm.
+std::filesystem::path ShaderCachePath(uint64_t key)
+{
+    char name[32];
+    snprintf(name, sizeof(name), "%016llx.dxbc", (unsigned long long)key);
+    return UserDir() / "shadercache" / name;
+}
+
+struct ShaderCompiler
+{
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<CompiledShader*> queue;
+    std::vector<std::thread> workers;
+
+    void Start()
+    {
+        std::filesystem::create_directories(UserDir() / "shadercache");
+        const unsigned n = std::max(2u, std::thread::hardware_concurrency() / 2);
+        for (unsigned i = 0; i < n; i++)
+            workers.emplace_back([this] { Run(); });
+        for (auto& w : workers)
+            w.detach();
+    }
+
+    void Push(CompiledShader* cs)
+    {
+        {
+            std::lock_guard lock(mutex);
+            queue.push_back(cs);
+        }
+        cv.notify_one();
+    }
+
+    void Run()
+    {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        for (;;)
+        {
+            CompiledShader* cs;
+            {
+                std::unique_lock lock(mutex);
+                cv.wait(lock, [this] { return !queue.empty(); });
+                cs = queue.front();
+                queue.pop_front();
+            }
+            Compile(*cs);
+        }
+    }
+
+    static void Compile(CompiledShader& cs)
+    {
+        ComPtr<ID3DBlob> errors;
+        // Runtime compiles skip optimisation: fxc can take minutes on the
+        // larger translated shaders.
+        const auto start = std::chrono::steady_clock::now();
+        const HRESULT hr = D3DCompile(cs.info.hlsl.data(), cs.info.hlsl.size(), nullptr, nullptr, nullptr, "main",
+            cs.pixel ? "ps_5_1" : "vs_5_1", D3DCOMPILE_SKIP_OPTIMIZATION, 0, &cs.code, &errors);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        if (FAILED(hr))
+        {
+            Log("renderer: %s %016llx failed to compile:\n%s", cs.pixel ? "ps" : "vs", (unsigned long long)cs.hash,
+                errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+            cs.state.store(CompiledShader::Failed, std::memory_order_release);
+            return;
+        }
+        if (ms > 200)
+            Log("renderer: %s %016llx compiled in %.0f ms (background)", cs.pixel ? "ps" : "vs", (unsigned long long)cs.hash, ms);
+        std::ofstream(ShaderCachePath(cs.cacheKey), std::ios::binary)
+            .write(static_cast<const char*>(cs.code->GetBufferPointer()), std::streamsize(cs.code->GetBufferSize()));
+        cs.state.store(CompiledShader::Ready, std::memory_order_release);
+    }
+} g_compiler;
 
 const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel)
 {
     auto it = g_r.shaders.find(hash);
     if (it != g_r.shaders.end())
-        return it->second;
-    CompiledShader& cs = g_r.shaders[hash];
+        return *it->second;
+    static std::once_flag started;
+    std::call_once(started, [] { g_compiler.Start(); });
+    auto& slot = g_r.shaders[hash];
+    slot = std::make_unique<CompiledShader>();
+    CompiledShader& cs = *slot;
+    cs.hash = hash;
+    cs.pixel = pixel;
     const ucode::Shader parsed = ucode::Parse(codeBE.data(), uint32_t(codeBE.size()), pixel);
     cs.info = TranslateShader(parsed);
     if (!cs.info.ok)
     {
         Log("renderer: %s %016llx not translated: %s", pixel ? "ps" : "vs", (unsigned long long)hash, cs.info.error.c_str());
-        return cs;
-    }
-    ComPtr<ID3DBlob> errors;
-    // Runtime compiles skip optimisation: fxc can take minutes on the larger
-    // translated shaders. Optimised bytecode will come from the offline cache.
-    const auto start = std::chrono::steady_clock::now();
-    const HRESULT hr = D3DCompile(cs.info.hlsl.data(), cs.info.hlsl.size(), nullptr, nullptr, nullptr, "main", pixel ? "ps_5_1" : "vs_5_1",
-        D3DCOMPILE_SKIP_OPTIMIZATION, 0, &cs.code, &errors);
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-    if (ms > 50)
-        Log("renderer: %s %016llx compiled in %.0f ms", pixel ? "ps" : "vs", (unsigned long long)hash, ms);
-    if (FAILED(hr))
-    {
-        Log("renderer: %s %016llx failed to compile:\n%s", pixel ? "ps" : "vs", (unsigned long long)hash,
-            errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+        cs.state = CompiledShader::Failed;
         return cs;
     }
     if (g_dumpHlsl)
         Log("renderer: %s %016llx:\n%s", pixel ? "ps" : "vs", (unsigned long long)hash, cs.info.hlsl.c_str());
-    cs.ok = true;
+    cs.cacheKey = Fnv(cs.info.hlsl.data(), cs.info.hlsl.size(), pixel ? 1 : 2);
+    if (std::ifstream in{ ShaderCachePath(cs.cacheKey), std::ios::binary | std::ios::ate })
+    {
+        const auto size = size_t(in.tellg());
+        if (size && SUCCEEDED(D3DCreateBlob(size, &cs.code)))
+        {
+            in.seekg(0);
+            in.read(static_cast<char*>(cs.code->GetBufferPointer()), std::streamsize(size));
+            cs.state = CompiledShader::Ready;
+            return cs;
+        }
+    }
+    g_compiler.Push(&cs);
     return cs;
 }
 
@@ -501,15 +668,22 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch)
         return nullptr;
     const uint32_t w = fetch.Width(), h = fetch.Height();
     auto& cached = g_r.textures[{ fetch.Address(), fetch.Format(), w, h }];
+    if (cached.resource && cached.checkedFrame == g_r.frame)
+        return cached.resource.Get();
+    cached.checkedFrame = g_r.frame;
     const uint8_t* source = GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address()));
     const size_t sourceBytes = std::max<size_t>(size_t(std::max(fetch.Pitch(), w)) * h / 2, 64); // conservative: >= 4 bpp
-    const uint64_t hash = ContentHash(source, sourceBytes) ^ fetch.dwords[3] ^ (uint64_t(fetch.dwords[0]) << 32);
+    // Only what changes the decoded image: sampler state (clamp, filter) varies per draw.
+    const uint64_t hash = ContentHash(source, sourceBytes) ^ (uint64_t(fetch.Swizzle()) << 8) ^ (uint64_t(fetch.Pitch()) << 24) ^
+        (uint64_t(fetch.Tiled()) << 40) ^ (uint64_t(fetch.Endian()) << 44);
     if (cached.resource && cached.contentHash == hash)
         return cached.resource.Get();
 
     std::vector<uint8_t> rgba;
     if (!DecodeTexture(fetch, rgba))
         return nullptr;
+    if (RendererTracing())
+        Log("texture upload: %08X %s %ux%u (%s)", fetch.Address(), TextureFormatName(fetch.Format()), w, h, cached.resource ? "changed" : "new");
     static const uint32_t dumpAddress = getenv("FM2_DUMP_TEXTURE") ? uint32_t(strtoul(getenv("FM2_DUMP_TEXTURE"), nullptr, 16)) : 0;
     if (dumpAddress && fetch.Address() == dumpAddress)
     {
@@ -617,6 +791,11 @@ bool BuildIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize, std:
     out.clear();
     switch (prim)
     {
+    case 1: // point list: a quad per point, corner in bits 29-30
+        for (uint32_t i = 0; i < count; i++)
+            for (uint32_t corner : { 0u, 1u, 2u, 2u, 1u, 3u })
+                out.push_back((corner << 29) | (g[i] & 0x1FFFFFFF));
+        return true;
     case 4: // triangle list
         out.assign(g.begin(), g.begin() + (count / 3) * 3);
         return true;
@@ -822,7 +1001,8 @@ void TraceSkip(const char* why, uint32_t initiator)
 
 void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
-    if (getenv("FM2_NO_RENDER"))
+    static const bool noRender = getenv("FM2_NO_RENDER") != nullptr;
+    if (noRender)
         return;
     if (!g_r.ok)
         Init();
@@ -841,9 +1021,9 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     const CompiledShader& vs = GetShader(g_r.vsHash, g_r.vsCode, false);
     const CompiledShader& ps = GetShader(g_r.psHash, g_r.psCode, true);
-    if (!vs.ok || !ps.ok)
+    if (!vs.IsReady() || !ps.IsReady())
     {
-        TraceSkip("shader", initiator);
+        TraceSkip(vs.state == CompiledShader::Failed || ps.state == CompiledShader::Failed ? "shader" : "compiling", initiator);
         g_r.skippedThisFrame++;
         return;
     }
@@ -857,13 +1037,19 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     BeginFrameIfNeeded();
     ID3D12PipelineState* pso = GetPipeline(vs, ps);
     if (!pso)
+    {
+        TraceSkip("pipeline", initiator);
         return;
+    }
     FrameResources& f = Frame();
 
     // Index list.
     const UINT64 listOffset = RingAlloc(list.size() * 4, 16);
     if (listOffset == ~0ull)
+    {
+        TraceSkip("ring full", initiator);
         return;
+    }
     memcpy(f.ringCpu + listOffset, list.data(), list.size() * 4);
 
     // Vertex constants: c[256], bools, fetch table, info.
@@ -873,6 +1059,7 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         uint32_t b[8];
         uint32_t vf[96][4];
         uint32_t info[4];
+        float point[4];
     };
     struct PSConstants
     {
@@ -884,7 +1071,10 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     };
     const UINT64 vsOffset = RingAlloc(sizeof(VSConstants)), psOffset = RingAlloc(sizeof(PSConstants));
     if (vsOffset == ~0ull || psOffset == ~0ull)
+    {
+        TraceSkip("ring full", initiator);
         return;
+    }
     auto* vc = reinterpret_cast<VSConstants*>(f.ringCpu + vsOffset);
     auto* pc = reinterpret_cast<PSConstants*>(f.ringCpu + psOffset);
     for (uint32_t i = 0; i < 256 * 4; i++)
@@ -900,18 +1090,36 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     {
         const uint32_t d0 = gpureg::Get(gpureg::FetchConstants + k * 2), d1 = gpureg::Get(gpureg::FetchConstants + k * 2 + 1);
         const uint32_t address = d0 & 0xFFFFFFFC, bytes = ((d1 >> 2) & 0xFFFFFF) * 4;
-        const UINT64 dataOffset = RingAlloc(std::max<uint32_t>(bytes, 16) + 16, 16);
+        // Large buffers (static geometry) are read in place; small ones may be
+        // rewritten before the GPU runs this frame, so they are copied.
+        if (g_r.physical && bytes >= kDirectFetchBytes)
+        {
+            vc->vf[k][0] = address & 0x1FFFFFFF;
+            vc->vf[k][1] = d1 & 3;
+            vc->vf[k][2] = 1;
+            continue;
+        }
+        const UINT64 dataOffset = UploadGuest(GpuPhysToGuest(address), bytes);
         if (dataOffset == ~0ull)
+        {
+            TraceSkip("ring full", initiator);
             return;
-        memcpy(f.ringCpu + dataOffset, GuestPtr(GpuPhysToGuest(address)), bytes);
+        }
         vc->vf[k][0] = uint32_t(dataOffset);
         vc->vf[k][1] = d1 & 3;
     }
     const bool clipSpace = gpureg::Get(PA_CL_VTE_CNTL) & 1;
     vc->info[0] = uint32_t(listOffset);
-    vc->info[1] = clipSpace ? 0 : 1;
+    vc->info[1] = (clipSpace ? 0 : 1) | ((initiator & 0x3F) == 1 ? 2 : 0);
     vc->info[2] = kWidth;
     vc->info[3] = kHeight;
+    // Point sizes are 12.4 fixed-point radii.
+    const uint32_t pointSize = gpureg::Get(PA_SU_POINT_SIZE), pointMinMax = gpureg::Get(PA_SU_POINT_MINMAX);
+    vc->point[0] = float(pointSize >> 16) / 8.0f;
+    vc->point[1] = float(pointSize & 0xFFFF) / 8.0f;
+    vc->point[2] = float(pointMinMax & 0xFFFF) / 8.0f;
+    vc->point[3] = float(pointMinMax >> 16) / 8.0f;
+    pc->info[1] = (gpureg::Get(SQ_PROGRAM_CNTL) >> 18) & 1 ? (gpureg::Get(SQ_CONTEXT_MISC) >> 8) & 0xFF : 0xFF;
 
     const uint32_t colorControl = gpureg::Get(RB_COLORCONTROL);
     pc->info[0] = (colorControl >> 3) & 1 ? (colorControl & 7) : 7;
@@ -919,7 +1127,10 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 
     // Descriptor table: t0 = upload ring (raw), t1+ = textures.
     if (f.descriptorsUsed + kTableSize > kDescriptorsPerFrame)
+    {
+        TraceSkip("descriptors", initiator);
         return;
+    }
     const UINT table = f.descriptorBase + f.descriptorsUsed;
     f.descriptorsUsed += kTableSize;
     D3D12_SHADER_RESOURCE_VIEW_DESC raw{};
@@ -929,6 +1140,13 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     raw.Buffer.NumElements = UINT(kRingSize / 4);
     raw.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     g_r.device->CreateShaderResourceView(f.ring.Get(), &raw, Cpu(g_r.srvHeap.Get(), table, g_r.srvStride));
+    if (g_r.physical)
+    {
+        raw.Buffer.NumElements = UINT(g_r.physical->GetDesc().Width / 4);
+        g_r.device->CreateShaderResourceView(g_r.physical.Get(), &raw, Cpu(g_r.srvHeap.Get(), table + 33, g_r.srvStride));
+    }
+    else
+        g_r.device->CopyDescriptorsSimple(1, Cpu(g_r.srvHeap.Get(), table + 33, g_r.srvStride), Cpu(g_r.stagingHeap.Get(), 0, g_r.srvStride), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     memset(pc->tinfo, 0, sizeof(pc->tinfo));
     for (uint32_t slot = 0; slot < 32; slot++)
     {
@@ -1097,4 +1315,10 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
             g_r.drawsThisFrame, g_r.skippedThisFrame, g_r.shaders.size(), g_r.pipelines.size(), g_r.textures.size());
     g_r.drawsThisFrame = g_r.skippedThisFrame = 0;
     g_r.frameIndex = (g_r.frameIndex + 1) % kFrames;
+}
+
+bool RendererTracing()
+{
+    static const uint64_t traceFrame = getenv("FM2_TRACE_DRAWS") ? strtoull(getenv("FM2_TRACE_DRAWS"), nullptr, 10) : 0;
+    return traceFrame && g_r.frame + 1 == traceFrame;
 }

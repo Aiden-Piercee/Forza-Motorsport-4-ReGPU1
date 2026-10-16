@@ -1,6 +1,7 @@
 // File system: guest paths map onto the extracted game folder (read-only)
 // and the user folder (cache, content packages).
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <unordered_map>
 
@@ -27,6 +28,7 @@ struct FileObject : KernelObject
     fs::path path;
     std::string guestPath;
     bool directory = false;
+    bool synchronous = true; // FILE_SYNCHRONOUS_IO_*: otherwise overlapped
     uint64_t position = 0;
 
     // NtQueryDirectoryFile state.
@@ -282,6 +284,7 @@ uint32_t OpenFile(uint32_t handleOut, uint32_t access, uint32_t attributes, uint
     file->path = host;
     file->guestPath = guest;
     file->directory = wantDirectory || isDirectory;
+    file->synchronous = (options & 0x30) != 0; // FILE_SYNCHRONOUS_IO_ALERT | _NONALERT
 
     if (!file->directory)
     {
@@ -325,8 +328,16 @@ GUEST_EXPORT(NtOpenFile)
     Return(ctx, OpenFile(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, 1, ctx.r8.u32));
 }
 
+std::atomic<uint64_t> g_readCalls{ 0 }, g_readBytes{ 0 };
+
+void LogFileStats()
+{
+    Log("  io: %llu reads, %.1f MB", (unsigned long long)g_readCalls.load(), g_readBytes.load() / 1048576.0);
+}
+
 GUEST_EXPORT(NtReadFile)
 {
+    g_readCalls++;
     // (handle, event, apcRoutine, apcContext, iosb*, buffer, length, byteOffset*)
     auto file = GetFile(ctx.r3.u32);
     const uint32_t iosb = ctx.r7.u32, buffer = ctx.r8.u32, length = ctx.r9.u32, offsetPtr = ctx.r10.u32;
@@ -351,6 +362,7 @@ GUEST_EXPORT(NtReadFile)
     DWORD read = 0;
     const BOOL ok = ReadFile(file->host, GuestPtr(buffer), length, &read, &ov);
     file->position = offset + read;
+    g_readBytes += read;
 
     uint32_t status = X_STATUS_SUCCESS;
     if (!ok && GetLastError() != ERROR_HANDLE_EOF)
@@ -359,7 +371,10 @@ GUEST_EXPORT(NtReadFile)
         status = X_STATUS_END_OF_FILE;
     SetIoStatus(iosb, status, read);
     SignalEventHandle(ctx.r4.u32);
-    Return(ctx, status);
+    // Overlapped handles report the (already finished) read as pending, as
+    // on the console: XAPI then returns ERROR_IO_PENDING and the title's
+    // streaming code relies on that to advance.
+    Return(ctx, !file->synchronous && status == X_STATUS_SUCCESS ? X_STATUS_PENDING : status);
 }
 
 GUEST_EXPORT(NtWriteFile)
@@ -388,7 +403,7 @@ GUEST_EXPORT(NtWriteFile)
     const uint32_t status = ok ? X_STATUS_SUCCESS : X_STATUS_ACCESS_DENIED;
     SetIoStatus(iosb, status, written);
     SignalEventHandle(ctx.r4.u32);
-    Return(ctx, status);
+    Return(ctx, !file->synchronous && status == X_STATUS_SUCCESS ? X_STATUS_PENDING : status);
 }
 
 GUEST_EXPORT(NtQueryInformationFile)

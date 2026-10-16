@@ -101,7 +101,7 @@ void CompositorLoop()
                 Blit(canvas, image, textures[i].Width(), textures[i].Height(), uint32_t(i % cols) * cellW + 2,
                     uint32_t(i / cols) * cellH + 2, cellW - 4, cellH - 4);
         }
-        static const uint64_t dumpFrame = getenv("FM2_DUMP_TEXVIEW") ? strtoull(getenv("FM2_DUMP_FRAME"), nullptr, 10) : 0;
+        static const uint64_t dumpFrame = getenv("FM2_DUMP_FRAME") ? strtoull(getenv("FM2_DUMP_FRAME"), nullptr, 10) : 0;
         static uint64_t composed = 0;
         if (++composed == dumpFrame)
         {

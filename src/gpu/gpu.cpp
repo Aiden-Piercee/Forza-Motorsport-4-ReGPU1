@@ -15,6 +15,7 @@
 #include "kernel/thread.h"
 #include "gpu/regs.h"
 #include "render/presenter.h"
+#include "gpu/renderer.h"
 
 namespace
 {
@@ -228,6 +229,8 @@ uint32_t ExecutePacket(uint32_t ptr)
     if (tracePredication && (header & 1) && (g_gpu.binSelect != 0xFFFFFFFFull || g_gpu.binMask != 0xFFFFFFFFull) && predLogged++ < 400)
         Log("pred: op %02X mask %016llX select %016llX -> %s", opcode, (unsigned long long)g_gpu.binMask, (unsigned long long)g_gpu.binSelect,
             (g_gpu.binSelect & g_gpu.binMask) ? "run" : "skip");
+    if (RendererTracing() && opcode != 0x10)
+        Log("pm4: op %02X count %u%s", opcode, count, (header & 1) && !(g_gpu.binSelect & g_gpu.binMask) ? " (predicated off)" : "");
     if ((header & 1) && !(g_gpu.binSelect & g_gpu.binMask))
     {
         g_gpu.skippedPredicated++;

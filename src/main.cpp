@@ -46,6 +46,8 @@ int main(int argc, char** argv)
         LogGuestThreads();
         GpuLogState();
         D3DDebugLog();
+        void LogFileStats();
+        LogFileStats();
     }
     Log("fm2: main thread exited with %08X", main->exitCode);
     return 0;

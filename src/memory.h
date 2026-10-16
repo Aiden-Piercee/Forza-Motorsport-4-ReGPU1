@@ -88,3 +88,6 @@ uint32_t PhysicalViewBase(uint32_t protect);
 bool GuestFree(uint32_t address);
 // Size of the allocation that contains address, 0 if none.
 uint32_t GuestAllocationSize(uint32_t address, uint32_t* start = nullptr);
+
+// File-mapping handle of the 512 MB physical memory section (for GPU access).
+void* PhysicalSection();

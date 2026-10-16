@@ -313,7 +313,8 @@ GUEST_EXPORT(__C_specific_handler)
 
 GUEST_EXPORT(KeBugCheck)
 {
-    Fatal("KeBugCheck(%08X) (lr %08llX)", ctx.r3.u32, ctx.lr);
+    Log("KeBugCheck(%08X) (lr %08llX)", ctx.r3.u32, ctx.lr);
+    __builtin_debugtrap(); // crash handler logs the call stack
 }
 
 GUEST_EXPORT(KeBugCheckEx)

@@ -26,6 +26,11 @@ savevmx_14_address = 0x82414630
 restvmx_64_address = 0x8241495C
 savevmx_64_address = 0x824146C4
 
+# CRT setjmp/longjmp (Lua error handling): mapped to host setjmp/longjmp
+# with the guest context saved and restored around them.
+setjmp_address = 0x82418560
+longjmp_address = 0x82418210
+
 # Leaf functions without .pdata entries whose jump tables XenonAnalyse's size
 # guess cut off. Each runs to the next .pdata function (minus padding/EH data).
 functions = [

@@ -95,6 +95,7 @@ RangeAllocator g_virtual;  // guest addresses
 RangeAllocator g_physical; // physical offsets 0..0x1FFFFFFF
 
 constexpr uint32_t kPhysicalSize = 0x20000000;
+HANDLE g_physicalSection = nullptr;
 constexpr uint32_t kPhysicalViews[] = { 0xA0000000, 0xC0000000, 0xE0000000 };
 
 bool IsPhysicalView(uint32_t address)
@@ -125,7 +126,7 @@ void MemoryInit()
     Check(VirtualAlloc2(nullptr, base, 0xA0000000, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) == base,
         "committing low memory");
 
-    HANDLE section = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_READ | FILE_MAP_WRITE, PAGE_READWRITE, SEC_COMMIT,
+    HANDLE section = g_physicalSection = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_READ | FILE_MAP_WRITE, PAGE_READWRITE, SEC_COMMIT,
         kPhysicalSize, nullptr, nullptr, 0);
     Check(section != nullptr, "creating physical memory");
     for (uint32_t view : kPhysicalViews)
@@ -199,4 +200,9 @@ uint32_t GuestAllocationSize(uint32_t address, uint32_t* start)
         return size;
     }
     return g_virtual.SizeOf(address, start);
+}
+
+void* PhysicalSection()
+{
+    return g_physicalSection;
 }

@@ -18,9 +18,14 @@ Renderer progress: the native D3D12 renderer draws the game. Xenos shaders
 are translated to HLSL (all menu/title shaders so far), vertices and indices
 are fetched in the translated vertex shader, textures are decoded and cached
 by content, EDRAM resolves become GPU copies into host textures, and
-predicated tiling is drawn tile by tile in screen space. The title screen,
-the attract video and the loading screen render correctly. After Start the
-game stays on the loading screen; that is the next thing to chase.
+predicated tiling is drawn tile by tile in screen space. Point lists become
+screen-aligned sprites. Large vertex buffers are read in place from guest
+memory (the physical section is mapped for the GPU), small ones are copied
+once per frame. Shaders compile on background threads (draws wait a few
+frames instead of stalling the game) and are cached in
+`Documentsm2shadercache`. The title screen, attract video, loading
+screen, main menu and the race-setup menus (class select, starting grid with
+the 3D track behind it) render correctly.
 
 ## Building
 
@@ -55,7 +60,7 @@ code (`out/ppc`, ~131 MB) is generated from your own copy and never committed.
 | `FM2_AUTOSTART=1` | Tap Start + A every 3 s |
 | `FM2_DUMP_SHADERS=1` | Save every distinct shader's microcode to `Documentsm2\shaders` |
 | `FM2_DUMP_FRAME=<n>` | Write the n-th rendered frame to `frame.png` |
-| `FM2_TRACE_DRAWS=<n>` | Log every draw, skip and resolve of frame n |
+| `FM2_TRACE_DRAWS=<n>` | Log every draw, skip, resolve, PM4 packet and texture upload of frame n |
 | `FM2_DUMP_TEXTURE=<hex address>` | Write that texture, decoded, to `texture.png` |
 | `FM2_DUMP_HLSL=1` | Log each translated shader |
 | `FM2_TRACE_PRED=1` | Log predicated packets under tiling |

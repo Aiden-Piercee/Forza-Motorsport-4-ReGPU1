@@ -11,18 +11,20 @@ cbuffer VSConstants : register(b0)
 {
     float4 vc[256];
     uint4 vb[2];      // 256 bool constants
-    uint4 vf[96];     // vertex fetch: x byte offset in gmem, y endian
-    uint4 vinfo;      // x index list byte offset, y position mode (0 clip, 1 screen), z/w target size
+    uint4 vf[96];     // vertex fetch: x byte offset (gmem, or gphys if z), y endian
+    uint4 vinfo;      // x index list byte offset, y position mode (0 clip, 1 screen) | 2 points, z/w target size
+    float4 vpoint;    // xy constant point diameter (pixels), z/w min/max diameter
 };
 cbuffer PSConstants : register(b1)
 {
     float4 pc[256];
     uint4 pb[2];
-    uint4 pinfo;      // x alpha test function (7 = always)
+    uint4 pinfo;      // x alpha test function (7 = always), y generated-parameter register (0xFF none)
     float4 pinfo2;    // x alpha reference
     uint4 tinfo[32];  // x sampler (0 lin wrap, 1 lin clamp, 2 point clamp, 3 point wrap), y/z size
 };
 ByteAddressBuffer gmem : register(t0);
+ByteAddressBuffer gphys : register(t33);  // guest physical memory (large vertex buffers)
 Texture2D<float4> tex[32] : register(t1);
 SamplerState sLinearWrap : register(s0);
 SamplerState sLinearClamp : register(s1);
@@ -35,6 +37,7 @@ struct VSOut
 {
     float4 pos : SV_Position;
     float4 o[16] : TEXCOORD0;
+    float2 pcoord : TEXCOORD16; // point sprite coordinate
 };
 
 uint Swap(uint v, uint e)
@@ -45,7 +48,11 @@ uint Swap(uint v, uint e)
     return v;
 }
 
-uint LoadGuest(uint fetch, uint dword) { return Swap(gmem.Load(vf[fetch].x + dword * 4), vf[fetch].y); }
+uint LoadGuest(uint fetch, uint dword)
+{
+    uint a = vf[fetch].x + dword * 4;
+    return Swap(vf[fetch].z ? gphys.Load(a) : gmem.Load(a), vf[fetch].y);
+}
 
 float SignExtend(uint v, uint bits) { return float(int(v << (32 - bits)) >> (32 - bits)); }
 
@@ -153,6 +160,8 @@ struct Emitter
     {
         if (pixel)
             return reg < 4 ? "oC[" + std::to_string(reg) + "]" : "";
+        if (reg == 63)
+            return "opts";
         if (reg == 62)
             return "opos";
         if (reg < 16)
@@ -521,16 +530,31 @@ TranslatedShader TranslateShader(const Shader& shader)
     std::string h = kPreamble;
     if (!shader.pixel)
     {
-        h += "void GuestVS(uint vindex, out float4 opos, out float4 o[16])\n{\n"
+        h += "void GuestVS(uint vindex, out float4 opos, out float4 o[16], out float4 opts)\n{\n"
              "    float4 r[64];\n    [unroll] for (int i = 0; i < 64; i++) r[i] = 0;\n"
              "    [unroll] for (int j = 0; j < 16; j++) o[j] = 0;\n"
-             "    r[0].x = float(vindex); opos = float4(0, 0, 0, 1); float ps = 0; bool p = false;\n";
+             "    r[0].x = float(vindex); opos = float4(0, 0, 0, 1); opts = 0; float ps = 0; bool p = false;\n";
         h += e.out;
         h += "}\n"
+             "void GuestVS(uint vindex, out float4 opos, out float4 o[16])\n{\n"
+             "    float4 opts; GuestVS(vindex, opos, o, opts);\n}\n"
              "VSOut main(uint id : SV_VertexID)\n{\n"
              "    VSOut r;\n"
+             "    r.pcoord = 0;\n"
              "    uint e = gmem.Load(vinfo.x + id * 4);\n"
-             "    if (e & 0x80000000u)\n    {\n"
+             "    float2 pointOffset = 0;\n"
+             "    if (vinfo.y & 2u)\n    {\n"
+             "        // Point sprite: corner in bits 29-30, expanded around the point in screen space.\n"
+             "        uint corner = (e >> 29) & 3u;\n"
+             "        float4 opts;\n"
+             "        GuestVS(e & 0x1FFFFFFFu, r.pos, r.o, opts);\n"
+             "        float2 d = opts.x > 0 ? opts.xx : vpoint.xy;\n"
+             "        d = clamp(d, vpoint.zz, vpoint.ww);\n"
+             "        float2 c = float2(corner & 1u, corner >> 1);\n"
+             "        r.pcoord = c;\n"
+             "        pointOffset = (c * 2.0 - 1.0) * d * 0.5;\n"
+             "    }\n"
+             "    else if (e & 0x80000000u)\n    {\n"
              "        // Rectangle second triangle: role 0 is the computed fourth corner, roles 1 and 2 the\n"
              "        // ends of the hypotenuse (the corners next to the right angle).\n"
              "        uint b = vinfo.x + (e & 0x1FFFFFFFu) * 4, role = (e >> 29) & 3u;\n"
@@ -545,11 +569,12 @@ TranslatedShader TranslateShader(const Shader& shader)
              "        else { r.pos = p[e1] + p[e2] - p[ra]; [unroll] for (int i = 0; i < 16; i++) r.o[i] = q[e1][i] + q[e2][i] - q[ra][i]; }\n"
              "    }\n"
              "    else\n        GuestVS(e, r.pos, r.o);\n"
-             "    if (vinfo.y == 1)\n    {\n"
+             "    float2 size = float2(vinfo.zw);\n"
+             "    if (vinfo.y & 1u)\n    {\n"
              "        // Screen-space positions: to clip space for the target size.\n"
-             "        float2 size = float2(vinfo.zw);\n"
              "        r.pos.xy = float2(r.pos.x / r.pos.w / size.x * 2.0 - 1.0, 1.0 - r.pos.y / r.pos.w / size.y * 2.0) * r.pos.w;\n"
              "    }\n"
+             "    r.pos.xy += float2(pointOffset.x / size.x * 2.0, -pointOffset.y / size.y * 2.0) * r.pos.w;\n"
              "    return r;\n}\n";
     }
     else
@@ -558,7 +583,9 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    float4 r[64];\n    [unroll] for (int i = 0; i < 64; i++) r[i] = 0;\n"
              "    [unroll] for (int j = 0; j < 16; j++) r[j] = input.o[j];\n"
              "    float4 oC[4]; [unroll] for (int k = 0; k < 4; k++) oC[k] = 0;\n"
-             "    float ps = 0; bool p = false;\n";
+             "    float ps = 0; bool p = false;\n"
+             "    // Generated parameter: pixel position, point sprite coordinate.\n"
+             "    if (pinfo.y < 16u) r[pinfo.y] = float4(input.pos.xy, input.pcoord);\n";
         h += e.out;
         h += "    switch (pinfo.x)\n    {\n"
              "    case 0: discard; break;\n"
