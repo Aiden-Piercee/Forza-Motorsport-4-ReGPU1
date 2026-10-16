@@ -773,8 +773,10 @@ D3D12_BLEND Blend(uint32_t f)
     case 9: return D3D12_BLEND_INV_DEST_COLOR;
     case 10: return D3D12_BLEND_DEST_ALPHA;
     case 11: return D3D12_BLEND_INV_DEST_ALPHA;
-    case 12: case 14: return D3D12_BLEND_BLEND_FACTOR;
-    case 13: case 15: return D3D12_BLEND_INV_BLEND_FACTOR;
+    case 12: return D3D12_BLEND_BLEND_FACTOR;
+    case 14: return D3D12_BLEND_ALPHA_FACTOR;
+    case 13: return D3D12_BLEND_INV_BLEND_FACTOR;
+    case 15: return D3D12_BLEND_INV_ALPHA_FACTOR;
     case 16: return D3D12_BLEND_SRC_ALPHA_SAT;
     default: return D3D12_BLEND_ONE;
     }
@@ -1011,6 +1013,13 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
             std::vector<uint8_t> rgba;
             if (!DecodeTexture(face, rgba))
                 rgba.assign(size_t(w) * h * 4, 0);
+            if (getenv("FM2_DUMP_CUBES"))
+            {
+                char name[80];
+                std::filesystem::create_directories("out/cube");
+                snprintf(name, sizeof(name), "out/cube/%08X_face%u_stride%X.png", fetch.Address(), i, stride);
+                WritePng(name, w, h, rgba);
+            }
             for (uint32_t y = 0; y < h; y++)
                 memcpy(Frame().ringCpu + offset + faceBytes * i + UINT64(y) * rowPitch, &rgba[size_t(y) * w * 4], size_t(w) * 4);
             D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
@@ -1817,6 +1826,11 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     g_r.list->RSSetViewports(1, &vp);
     g_r.list->RSSetScissorRects(1, &scissor);
     g_r.list->OMSetStencilRef(gpureg::Get(RB_STENCILREFMASK) & 0xFF);
+    {
+        // RB_BLEND_RED..ALPHA: the constant colour for blend factors 12-15.
+        const float factor[4] = { RegFloat(0x2105), RegFloat(0x2106), RegFloat(0x2107), RegFloat(0x2108) };
+        g_r.list->OMSetBlendFactor(factor);
+    }
     g_r.list->SetPipelineState(pso);
     g_r.list->SetGraphicsRootConstantBufferView(0, f.ring->GetGPUVirtualAddress() + vsOffset);
     g_r.list->SetGraphicsRootConstantBufferView(1, f.ring->GetGPUVirtualAddress() + psOffset);
@@ -1869,7 +1883,7 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
         Log("    surface %08X color %08X depth %08X depthctl %08X colorctl %08X mode %X", gpureg::Get(0x2000), gpureg::Get(0x2001), gpureg::Get(0x2002),
             gpureg::Get(RB_DEPTHCONTROL), gpureg::Get(RB_COLORCONTROL), gpureg::Get(PA_SU_SC_MODE_CNTL));
-        for (uint32_t c : { 5u, 6u, 7u, 14u, 22u, 254u, 255u })
+        for (uint32_t c : { 0u, 1u, 5u, 6u, 7u, 14u, 22u, 254u, 255u })
             Log("    pc%u = %g %g %g %g", c, pc->c[c][0], pc->c[c][1], pc->c[c][2], pc->c[c][3]);
     }
     g_r.list->DrawInstanced(UINT(list.size()), 1, 0, 0);
