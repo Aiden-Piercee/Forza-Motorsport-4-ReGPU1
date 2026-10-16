@@ -184,6 +184,12 @@ float4 CubeOp(float4 a, float4 b)
     return float4(tc, sc, 2.0 * abs(ma), face);
 }
 
+// Direct3D 9 multiplication, as the Xenos ALU does it: zero times anything (even
+// infinity or NaN) is zero. Shaders rely on it to switch terms off by weight.
+float4 Mul9(float4 a, float4 b) { return (a == 0 || b == 0) ? 0 : a * b; }
+float Mul9(float a, float b) { return (a == 0 || b == 0) ? 0 : a * b; }
+float Dot9(float4 a, float4 b) { float4 m = Mul9(a, b); return m.x + m.y + m.z + m.w; }
+
 bool BoolConstant(uint4 b[2], uint index) { return (b[index >> 7][(index >> 5) & 3] >> (index & 31)) & 1; }
 )";
 
@@ -261,7 +267,7 @@ struct Emitter
         switch (a.vectorOp)
         {
         case 0: return A + " + " + B;
-        case 1: return A + " * " + B;
+        case 1: return "Mul9(" + A + ", " + B + ")";
         case 2: return "max(" + A + ", " + B + ")";
         case 3: return "min(" + A + ", " + B + ")";
         case 4: return "float4(" + A + " == " + B + ")";
@@ -271,13 +277,13 @@ struct Emitter
         case 8: return "frac(" + A + ")";
         case 9: return "trunc(" + A + ")";
         case 10: return "floor(" + A + ")";
-        case 11: return A + " * " + B + " + " + C;
+        case 11: return "Mul9(" + A + ", " + B + ") + " + C;
         case 12: return "(" + A + " == 0.0) ? " + B + " : " + C;
         case 13: return "(" + A + " >= 0.0) ? " + B + " : " + C;
         case 14: return "(" + A + " > 0.0) ? " + B + " : " + C;
-        case 15: return "dot(" + A + ", " + B + ").xxxx";
-        case 16: return "dot((" + A + ").xyz, (" + B + ").xyz).xxxx";
-        case 17: return "((" + A + ").x * (" + B + ").x + (" + A + ").y * (" + B + ").y + (" + C + ").x).xxxx";
+        case 15: return "Dot9(" + A + ", " + B + ").xxxx";
+        case 16: return "Dot9(float4((" + A + ").xyz, 0), float4((" + B + ").xyz, 0)).xxxx";
+        case 17: return "(Dot9(float4((" + A + ").xy, 0, 0), float4((" + B + ").xy, 0, 0)) + (" + C + ").x).xxxx";
         case 18: // CUBE: operands are v.zzxy and v.yxzz; result (tc, sc, 2 * major axis, face)
             return "CubeOp(" + A + ", " + B + ")";
         case 19: { std::string t = A; return "max(max(" + t + ".x, " + t + ".y), max(" + t + ".z, " + t + ".w)).xxxx"; }
@@ -297,8 +303,8 @@ struct Emitter
         {
         case 0: return set(A + " + " + B);
         case 1: return set(A + " + ps");
-        case 2: return set(A + " * " + B);
-        case 3: case 4: return set(A + " * ps");
+        case 2: return set("Mul9(" + A + ", " + B + ")");
+        case 3: case 4: return set("Mul9(" + A + ", ps)");
         case 5: return set("max(" + A + ", " + B + ")");
         case 6: return set("min(" + A + ", " + B + ")");
         case 7: return set("float(" + A + " == 0.0)");
@@ -347,6 +353,8 @@ struct Emitter
             const std::string tb = "r[" + std::to_string(temp) + "]." + comp[a.src3RawSwizzle & 3];
             const char* op = a.scalarOp <= 43 ? " * " : (a.scalarOp <= 45 ? " + " : " - ");
             const char* neg = a.src[2].negate ? "-" : "";
+            if (a.scalarOp <= 43)
+                return set(std::string("Mul9(") + neg + ca + ", " + neg + tb + ")");
             return set(std::string("(") + neg + ca + ")" + op + "(" + neg + tb + ")");
         }
         case 48: return set("sin(" + A + ")");

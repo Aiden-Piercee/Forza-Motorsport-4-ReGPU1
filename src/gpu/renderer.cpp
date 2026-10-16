@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cmath>
 #include <map>
+#include <set>
 #include <unordered_map>
 
 #include <d3d12.h>
@@ -49,7 +50,7 @@ constexpr UINT kTableSize = 66; // t0 upload ring, t1-t32 2D textures, t33 guest
 // The EDRAM colour target: half floats hold the title's HDR (7e3) range.
 constexpr DXGI_FORMAT kColorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 constexpr UINT kMaxSurfaces = 64; // EDRAM bases with host surfaces
-constexpr uint32_t RB_COLOR_INFO = 0x2001, RB_DEPTH_INFO = 0x2002;
+constexpr uint32_t RB_SURFACE_INFO = 0x2000, RB_COLOR_INFO = 0x2001, RB_DEPTH_INFO = 0x2002;
 constexpr uint32_t kDirectFetchBytes = 64 * 1024;
 
 // Registers.
@@ -695,6 +696,28 @@ const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& code
     }
     if (g_dumpHlsl)
         Log("renderer: %s %016llx:\n%s", pixel ? "ps" : "vs", (unsigned long long)hash, cs.info.hlsl.c_str());
+    // Debug: FM2_DEBUG_VS=<hash>:<statement> appends a statement to that vertex
+    // shader's guest program (it can read r[] and write o[]).
+    if (const char* dbg = getenv("FM2_DEBUG_VS"); dbg && !pixel && strtoull(dbg, nullptr, 16) == hash)
+        if (const char* stmt = strchr(dbg, ':'))
+        {
+            // "<hash>:@<block>:<statement>" inserts at the start of control-flow block <block>.
+            std::string s = stmt + 1, marker = "}\nvoid GuestVS(uint vindex, out float4 opos, out float4 o[16])\n";
+            if (s[0] == '@')
+            {
+                const size_t colon = s.find(':');
+                marker = "        if (cfpc == " + s.substr(1, colon - 1) + "u)\n        {\n";
+                s = s.substr(colon + 1);
+            }
+            if (size_t at = cs.info.hlsl.find(marker); at != std::string::npos)
+                cs.info.hlsl.insert(marker[0] == '}' ? at : at + marker.size(), "            " + s + "\n");
+        }
+    // Debug: FM2_DEBUG_PS=<hash>:<expr> replaces that pixel shader's output, e.g.
+    // "a62c809452fcc71b:float4(input.o[4].xyz, 1)".
+    if (const char* dbg = getenv("FM2_DEBUG_PS"); dbg && pixel && strtoull(dbg, nullptr, 16) == hash)
+        if (const char* expr = strchr(dbg, ':'))
+            if (size_t at = cs.info.hlsl.rfind("return oC[0];"); at != std::string::npos)
+                cs.info.hlsl.replace(at, 13, std::string("return ") + (expr + 1) + ";");
     cs.cacheKey = Fnv(cs.info.hlsl.data(), cs.info.hlsl.size(), pixel ? 1 : 2);
     if (std::ifstream in{ ShaderCachePath(cs.cacheKey), std::ios::binary | std::ios::ate })
     {
@@ -1368,18 +1391,32 @@ void Resolve()
         const int bias = int32_t(info << 10) >> 26; // bits 16-21, signed
         BlitResolve(depth, base, width, height, format, rect, depth ? 1.0f : std::ldexp(1.0f, bias));
     }
+    // Clears after a tile's resolve prepare the EDRAM for the next tile, which
+    // we draw lower on the same host surface: a full-width clear covers every
+    // row from the tile down.
+    D3D12_RECT clearRect = rect;
+    const uint32_t surfacePitch = gpureg::Get(RB_SURFACE_INFO) & 0x3FFF;
+    if (surfacePitch && uint32_t(rect.right - rect.left) >= std::min<uint32_t>(surfacePitch, kWidth) && rect.left == 0)
+        clearRect.bottom = kHeight;
     if ((control >> 8) & 1) // colour clear (ARGB)
     {
         const uint32_t c = gpureg::Get(RB_COLOR_CLEAR);
         const float color[4] = { ((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f, (c & 0xFF) / 255.0f, (c >> 24) / 255.0f };
         TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
-        g_r.list->ClearRenderTargetView(g_r.rtv, color, 1, &rect);
+        g_r.list->ClearRenderTargetView(g_r.rtv, color, 1, &clearRect);
     }
     if ((control >> 9) & 1) // depth/stencil clear: depth 24 bits | stencil 8
     {
-        const uint32_t v = gpureg::Get(RB_DEPTH_CLEAR);
-        g_r.list->ClearDepthStencilView(g_r.dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
-            float(v >> 8) / 16777215.0f, UINT8(v & 0xFF), 1, &rect);
+        const uint32_t v = gpureg::Get(RB_DEPTH_CLEAR), d = v >> 8;
+        float depth = float(d) / 16777215.0f;
+        if ((gpureg::Get(RB_DEPTH_INFO) >> 16) & 1)
+        {
+            // D24FS8: 20e4 float (4-bit exponent, bias 15, 20-bit mantissa).
+            const uint32_t e = d >> 20, m = d & 0xFFFFF;
+            depth = e ? std::ldexp(1.0f + float(m) / 1048576.0f, int(e) - 15) : std::ldexp(float(m) / 1048576.0f, -14);
+            depth = std::clamp(depth, 0.0f, 1.0f);
+        }
+        g_r.list->ClearDepthStencilView(g_r.dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, depth, UINT8(v & 0xFF), 1, &clearRect);
     }
 }
 }
@@ -1603,6 +1640,20 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         {
             fetch = ReadTextureFetch(slot);
             cube = fetch.Dimension() == 3;
+            static const uint64_t dumpPs = getenv("FM2_DUMP_PS_TEXTURES") ? strtoull(getenv("FM2_DUMP_PS_TEXTURES"), nullptr, 16) : 0;
+            static std::set<uint32_t> dumped;
+            if (dumpPs && g_r.psHash == dumpPs && !cube && dumped.insert(fetch.Address()).second)
+            {
+                std::vector<uint8_t> rgba;
+                if (DecodeTexture(fetch, rgba))
+                {
+                    char name[80];
+                    std::filesystem::create_directories("out/tex");
+                    snprintf(name, sizeof(name), "out/tex/t%u_%08X_%s_%ux%u_sw%03X.png", slot, fetch.Address(), TextureFormatName(fetch.Format()), fetch.Width(),
+                        fetch.Height(), fetch.Swizzle());
+                    WritePng(name, fetch.Width(), fetch.Height(), rgba);
+                }
+            }
             texture = cube ? GetCubeTexture(fetch, format) : GetTexture(fetch, format);
         }
         pc->tinfo[slot][3] = cube ? 3 : 1;
