@@ -1,6 +1,7 @@
 // Xenos texture decoding on the CPU: untiling, endian swaps, swizzle and the
 // formats the frontend uses. The renderer will decode on the GPU later;
 // this is the reference implementation and the first-pixels path.
+#include <cstdio>
 #include "gpu/texture.h"
 
 #include <algorithm>
@@ -20,6 +21,7 @@ enum Format : uint32_t
     k_DXT1 = 18,
     k_DXT2_3 = 19,
     k_DXT4_5 = 20,
+    k_DXT5A = 59, // one interpolated channel (BC4-like), 8-byte blocks
 };
 
 struct FormatInfo
@@ -41,6 +43,7 @@ bool Info(uint32_t format, FormatInfo& out)
     case k_DXT1: out = { 4, 3 }; return true;
     case k_DXT2_3:
     case k_DXT4_5: out = { 4, 4 }; return true;
+    case k_DXT5A: out = { 4, 3 }; return true;
     default: return false;
     }
 }
@@ -124,8 +127,18 @@ void DecodeColorBlock(const uint8_t* b, uint8_t out[16][4], bool bc1)
         memcpy(out[i], palette[(bits >> (i * 2)) & 3], 4);
 }
 
+void DecodeAlphaBlock(const uint8_t* b, uint8_t out[16][4]);
+
 void DecodeBlock(uint32_t format, const uint8_t* b, uint8_t out[16][4])
 {
+    if (format == k_DXT5A)
+    {
+        // Single channel: replicated, the fetch swizzle picks what the shader sees.
+        DecodeAlphaBlock(b, out);
+        for (int i = 0; i < 16; i++)
+            out[i][0] = out[i][1] = out[i][2] = out[i][3];
+        return;
+    }
     if (format == k_DXT1)
     {
         DecodeColorBlock(b, out, true);
@@ -138,7 +151,12 @@ void DecodeBlock(uint32_t format, const uint8_t* b, uint8_t out[16][4])
             out[i][3] = uint8_t(((b[i / 2] >> ((i & 1) * 4)) & 15) * 17);
         return;
     }
-    // DXT4/5 interpolated alpha.
+    DecodeAlphaBlock(b, out);
+}
+
+// DXT5 interpolated alpha block (8 bytes) into channel 3.
+void DecodeAlphaBlock(const uint8_t* b, uint8_t out[16][4])
+{
     uint8_t a[8];
     a[0] = b[0];
     a[1] = b[1];
@@ -235,7 +253,13 @@ const char* TextureFormatName(uint32_t format)
     case k_DXT1: return "DXT1";
     case k_DXT2_3: return "DXT3";
     case k_DXT4_5: return "DXT5";
-    default: return "?";
+    case k_DXT5A: return "DXT5A";
+    default:
+    {
+        static thread_local char name[8];
+        snprintf(name, sizeof(name), "?%u", format);
+        return name;
+    }
     }
 }
 

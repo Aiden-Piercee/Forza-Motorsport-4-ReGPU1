@@ -25,7 +25,9 @@ once per frame. Shaders compile on background threads (draws wait a few
 frames instead of stalling the game) and are cached in
 `Documents/fm2/shadercache`. The title screen, attract video, loading
 screen, main menu and the race-setup menus (class select, starting grid with
-the 3D track behind it) render correctly.
+the 3D track behind it) render correctly. Races load and draw: the track is
+lit and textured (DXT5A textures, depth-only passes and depth resolves for the
+shadow maps); HDR render targets are still 8-bit, so bright surfaces clip.
 
 ## Building
 

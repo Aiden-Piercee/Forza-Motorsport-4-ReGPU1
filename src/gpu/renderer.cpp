@@ -103,6 +103,7 @@ struct ResolvedTexture
 {
     ComPtr<ID3D12Resource> resource;
     uint32_t width = 0, height = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM; // R32_FLOAT for depth resolves
 };
 
 struct FrameResources
@@ -138,6 +139,9 @@ struct Renderer
     ComPtr<ID3D12DescriptorHeap> stagingHeap; // CPU: null texture SRV
     UINT srvStride = 0;
     ComPtr<ID3D12DescriptorHeap> rtvHeap, dsvHeap;
+    ComPtr<ID3D12DescriptorHeap> blitRtvHeap;             // one RTV, rewritten per depth resolve
+    ComPtr<ID3D12RootSignature> blitRootSignature;
+    ComPtr<ID3D12PipelineState> depthBlit;                // depth buffer -> R32_FLOAT
     ComPtr<ID3D12Resource> color, depth, readback;
     D3D12_RESOURCE_STATES colorState = D3D12_RESOURCE_STATE_RENDER_TARGET;
 
@@ -226,6 +230,59 @@ ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RES
     ComPtr<ID3D12Resource> r;
     Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr, IID_PPV_ARGS(&r)), "CreateCommittedResource(buffer)");
     return r;
+}
+
+// Depth resolves: a depth-stencil buffer can only be copied whole, so the
+// resolve rectangle is drawn into an R32_FLOAT texture by a tiny pass that
+// reads the depth buffer at the same pixel.
+void InitDepthBlit()
+{
+    auto* d = g_r.device;
+    D3D12_DESCRIPTOR_RANGE range{};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER param{};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    param.DescriptorTable.NumDescriptorRanges = 1;
+    param.DescriptorTable.pDescriptorRanges = &range;
+    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rs{};
+    rs.NumParameters = 1;
+    rs.pParameters = &param;
+    ComPtr<ID3DBlob> blob, error;
+    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)))
+        Fatal("renderer: blit root signature: %s", error ? static_cast<const char*>(error->GetBufferPointer()) : "?");
+    Check(d->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&g_r.blitRootSignature)),
+        "CreateRootSignature(blit)");
+
+    static const char kSource[] = R"(
+Texture2D<float> depthTex : register(t0);
+float4 vs(uint id : SV_VertexID) : SV_Position
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float ps(float4 pos : SV_Position) : SV_Target
+{
+    return depthTex.Load(int3(int2(pos.xy), 0));
+}
+)";
+    ComPtr<ID3DBlob> vs, ps;
+    Check(D3DCompile(kSource, sizeof(kSource) - 1, nullptr, nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vs, &error), "D3DCompile(blit vs)");
+    Check(D3DCompile(kSource, sizeof(kSource) - 1, nullptr, nullptr, nullptr, "ps", "ps_5_0", 0, 0, &ps, &error), "D3DCompile(blit ps)");
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g_r.blitRootSignature.Get();
+    pd.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+    pd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = UINT_MAX;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
+    pd.SampleDesc.Count = 1;
+    Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.depthBlit)), "CreateGraphicsPipelineState(depth blit)");
 }
 
 void Init()
@@ -336,9 +393,9 @@ void Init()
     cv.Format = td.Format;
     Check(d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, IID_PPV_ARGS(&g_r.color)),
         "CreateCommittedResource(color)");
-    td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    td.Format = DXGI_FORMAT_R24G8_TYPELESS; // typeless: depth resolves read it
     td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-    cv.Format = td.Format;
+    cv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
     cv.DepthStencil.Depth = 1.0f;
     Check(d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(&g_r.depth)),
         "CreateCommittedResource(depth)");
@@ -347,7 +404,13 @@ void Init()
     d->CreateRenderTargetView(g_r.color.Get(), nullptr, g_r.rtvHeap->GetCPUDescriptorHandleForHeapStart());
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     Check(d->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_r.dsvHeap)), "CreateDescriptorHeap(dsv)");
-    d->CreateDepthStencilView(g_r.depth.Get(), nullptr, g_r.dsvHeap->GetCPUDescriptorHandleForHeapStart());
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc{};
+    dsvDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    d->CreateDepthStencilView(g_r.depth.Get(), &dsvDesc, g_r.dsvHeap->GetCPUDescriptorHandleForHeapStart());
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    Check(d->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_r.blitRtvHeap)), "CreateDescriptorHeap(blit rtv)");
+    InitDepthBlit();
     g_r.readback = CreateBuffer(UINT64(kWidth) * kHeight * 4, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
 
     for (UINT i = 0; i < kFrames; i++)
@@ -612,9 +675,10 @@ D3D12_BLEND_OP BlendOp(uint32_t op)
     }
 }
 
-ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps)
+ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly)
 {
-    const uint32_t blend = gpureg::Get(RB_BLENDCONTROL0), depth = gpureg::Get(RB_DEPTHCONTROL), mask = gpureg::Get(RB_COLOR_MASK) & 0xF;
+    const uint32_t blend = gpureg::Get(RB_BLENDCONTROL0), depth = gpureg::Get(RB_DEPTHCONTROL);
+    const uint32_t mask = depthOnly ? 0 : gpureg::Get(RB_COLOR_MASK) & 0xF;
     char key[96];
     snprintf(key, sizeof(key), "%016llx%016llx%08x%08x%x", (unsigned long long)g_r.vsHash, (unsigned long long)g_r.psHash, blend, depth, mask);
     auto it = g_r.pipelines.find(key);
@@ -660,10 +724,14 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
 }
 
 // Decodes (if changed) and uploads a texture; returns its resource.
-ID3D12Resource* GetTexture(const TextureFetch& fetch)
+ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
 {
+    format = DXGI_FORMAT_R8G8B8A8_UNORM;
     if (auto it = g_r.resolved.find(fetch.Address()); it != g_r.resolved.end())
+    {
+        format = it->second.format;
         return it->second.resource.Get();
+    }
     if (fetch.Type() != 2 || fetch.Dimension() != 1 || !TextureFormatSupported(fetch.Format()))
         return nullptr;
     const uint32_t w = fetch.Width(), h = fetch.Height();
@@ -912,6 +980,79 @@ void Resolve()
     if (traceFrame && g_r.frame + 1 == traceFrame)
         Log("resolve: control %08X dest %08X pitch %08X info %08X rect %ld,%ld-%ld,%ld clear %08X", control, gpureg::Get(RB_COPY_DEST_BASE),
             gpureg::Get(RB_COPY_DEST_PITCH), gpureg::Get(RB_COPY_DEST_INFO), rect.left, rect.top, rect.right, rect.bottom, gpureg::Get(RB_COLOR_CLEAR));
+    if (command != 3 && sourceSelect == 4) // depth copy (shadow maps)
+    {
+        const uint32_t pitchReg = gpureg::Get(RB_COPY_DEST_PITCH);
+        const uint32_t pitch = pitchReg & 0x3FFF;
+        const uint32_t base = ((gpureg::Get(RB_COPY_DEST_BASE) & 0x1FFFFFFF) - uint32_t(rect.top) * pitch * 4) & 0x1FFFFFFF;
+        const uint32_t width = std::clamp<uint32_t>(pitch, 1, kWidth);
+        const uint32_t height = std::clamp<uint32_t>(((pitchReg >> 16) & 0x3FFF) + uint32_t(rect.top), 1, kHeight);
+        ResolvedTexture& dest = g_r.resolved[base];
+        if (!dest.resource || dest.width != width || dest.height != height || dest.format != DXGI_FORMAT_R32_FLOAT)
+        {
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC td{};
+            td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            td.Width = width;
+            td.Height = height;
+            td.DepthOrArraySize = 1;
+            td.MipLevels = 1;
+            td.SampleDesc.Count = 1;
+            td.Format = DXGI_FORMAT_R32_FLOAT;
+            td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            if (dest.resource)
+                Frame().garbage.push_back(std::move(dest.resource));
+            Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                      IID_PPV_ARGS(&dest.resource)),
+                "CreateCommittedResource(depth resolve)");
+            dest.width = width;
+            dest.height = height;
+            dest.format = DXGI_FORMAT_R32_FLOAT;
+        }
+        FrameResources& f = Frame();
+        if (f.descriptorsUsed < kDescriptorsPerFrame)
+        {
+            const UINT slot = f.descriptorBase + f.descriptorsUsed++;
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MipLevels = 1;
+            g_r.device->CreateShaderResourceView(g_r.depth.Get(), &srv, Cpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
+            const auto rtv = g_r.blitRtvHeap->GetCPUDescriptorHandleForHeapStart();
+            g_r.device->CreateRenderTargetView(dest.resource.Get(), nullptr, rtv);
+
+            D3D12_RESOURCE_BARRIER b[2]{};
+            b[0].Type = b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b[0].Transition.pResource = g_r.depth.Get();
+            b[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            b[1].Transition.pResource = dest.resource.Get();
+            b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            g_r.list->ResourceBarrier(2, b);
+            g_r.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            g_r.list->SetGraphicsRootSignature(g_r.blitRootSignature.Get());
+            g_r.list->SetPipelineState(g_r.depthBlit.Get());
+            g_r.list->SetGraphicsRootDescriptorTable(0, Gpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
+            const D3D12_VIEWPORT vp{ 0, 0, float(width), float(height), 0, 1 };
+            const D3D12_RECT sr{ rect.left, rect.top, std::min<LONG>(rect.right, width), std::min<LONG>(rect.bottom, height) };
+            g_r.list->RSSetViewports(1, &vp);
+            g_r.list->RSSetScissorRects(1, &sr);
+            g_r.list->DrawInstanced(3, 1, 0, 0);
+            std::swap(b[0].Transition.StateBefore, b[0].Transition.StateAfter);
+            std::swap(b[1].Transition.StateBefore, b[1].Transition.StateAfter);
+            g_r.list->ResourceBarrier(2, b);
+            // Back to the main targets and root signature.
+            const auto mainRtv = g_r.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            const auto dsv = g_r.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+            g_r.list->OMSetRenderTargets(1, &mainRtv, FALSE, &dsv);
+            g_r.list->SetGraphicsRootSignature(g_r.rootSignature.Get());
+        }
+    }
     if (command != 3 && sourceSelect < 4) // colour copy
     {
         // Each tile resolves to the destination row it starts at; key the
@@ -922,7 +1063,7 @@ void Resolve()
         const uint32_t width = std::clamp<uint32_t>(pitch, 1, kWidth);
         const uint32_t height = std::clamp<uint32_t>(((pitchReg >> 16) & 0x3FFF) + uint32_t(rect.top), 1, kHeight);
         ResolvedTexture& dest = g_r.resolved[base];
-        if (!dest.resource || dest.width != width || dest.height != height)
+        if (!dest.resource || dest.width != width || dest.height != height || dest.format != DXGI_FORMAT_R8G8B8A8_UNORM)
         {
             D3D12_HEAP_PROPERTIES hp{};
             hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -942,6 +1083,7 @@ void Resolve()
                 "CreateCommittedResource(resolve)");
             dest.width = width;
             dest.height = height;
+            dest.format = DXGI_FORMAT_R8G8B8A8_UNORM;
         }
         const D3D12_BOX box{ UINT(rect.left), UINT(rect.top), 0, UINT(std::min<LONG>(rect.right, width)), UINT(std::min<LONG>(rect.bottom, height)), 1 };
         if (box.right > box.left && box.bottom > box.top)
@@ -1012,8 +1154,8 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         Resolve();
         return;
     }
-    // Colour/depth passes draw; depth-only passes come later.
-    if (edramMode != 4 || g_r.vsCode.empty() || g_r.psCode.empty())
+    // Colour+depth (4) and depth-only (5) passes draw.
+    if ((edramMode != 4 && edramMode != 5) || g_r.vsCode.empty() || g_r.psCode.empty())
     {
         TraceSkip("edram mode", initiator);
         g_r.skippedThisFrame++;
@@ -1035,7 +1177,7 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         return;
     }
     BeginFrameIfNeeded();
-    ID3D12PipelineState* pso = GetPipeline(vs, ps);
+    ID3D12PipelineState* pso = GetPipeline(vs, ps, edramMode == 5);
     if (!pso)
     {
         TraceSkip("pipeline", initiator);
@@ -1152,11 +1294,12 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     {
         const auto dest = Cpu(g_r.srvHeap.Get(), table + 1 + slot, g_r.srvStride);
         ID3D12Resource* texture = nullptr;
+        DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
         TextureFetch fetch{};
         if (((ps.info.usedTextureSlots | vs.info.usedTextureSlots) >> slot) & 1)
         {
             fetch = ReadTextureFetch(slot);
-            texture = GetTexture(fetch);
+            texture = GetTexture(fetch, format);
         }
         if (!texture)
         {
@@ -1164,7 +1307,7 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             continue;
         }
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-        srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srv.Format = format;
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.Texture2D.MipLevels = 1;
