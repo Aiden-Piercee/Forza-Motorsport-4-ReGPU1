@@ -161,8 +161,26 @@ Alu DecodeAlu(const uint32_t* w)
     const uint32_t reg[3] = { Bits(w[2], 16, 8), Bits(w[2], 8, 8), Bits(w[2], 0, 8) };
     a.vectorOp = Bits(w[2], 24, 5);
     const bool temp[3] = { bool(Bits(w[2], 31, 1)), bool(Bits(w[2], 30, 1)), bool(Bits(w[2], 29, 1)) };
+    // Constant sources take the const_0 / const_1 relative bits in order;
+    // address_absolute picks a0 over the loop index.
+    const bool addressAbsolute = Bits(w[1], 29, 1);
+    const bool constRelative[2] = { bool(Bits(w[1], 31, 1)), bool(Bits(w[1], 30, 1)) };
+    // Operands in slot order: the vector op's (by arity), then src3 for the scalar op.
+    const uint32_t op = Bits(w[2], 24, 5);
+    const uint32_t vectorArity = (op == 11 || op == 12 || op == 13 || op == 14 || op == 17) ? 3
+        : (op == 8 || op == 9 || op == 10 || op == 19) ? 1 : 2;
+    uint32_t constSlot = 0;
     for (int i = 0; i < 3; i++)
+    {
         a.src[i] = DecodeSource(reg[i], temp[i], swz[i], neg[i], absConstants);
+        const bool used = uint32_t(i) < vectorArity || i == 2;
+        if (used && !temp[i] && constSlot < 2)
+        {
+            if (constRelative[constSlot])
+                a.src[i].relative = addressAbsolute ? 1 : 2;
+            constSlot++;
+        }
+    }
     a.src3RawReg = reg[2];
     a.src3IsTemp = temp[2];
     a.src3RawSwizzle = swz[2];
@@ -186,6 +204,8 @@ Fetch DecodeFetch(const uint32_t* w)
         f.isNormalized = Bits(w[1], 13, 1) == 0;
         f.format = Bits(w[1], 16, 6);
         f.isMini = Bits(w[1], 30, 1);
+        f.roundIndex = Bits(w[1], 15, 1);
+        f.expAdjust = int32_t(Bits(w[1], 24, 6) << 26) >> 26;
         f.stride = Bits(w[2], 0, 8);
         f.offset = Bits(w[2], 8, 23);
     }

@@ -40,6 +40,7 @@ struct Source
     bool negate;
     bool abs;
     uint8_t swizzle[4]; // component per channel, 0-3
+    uint8_t relative;   // constants: 0 absolute, 1 + a0, 2 + aL (loop index)
 };
 
 struct Alu
@@ -66,6 +67,8 @@ struct Fetch
     // Vertex fetch.
     uint32_t format, stride, offset;
     bool isSigned, isNormalized, isMini;
+    int32_t expAdjust;   // result scaled by 2^expAdjust
+    bool roundIndex;     // index rounded to nearest instead of truncated
     // Texture fetch.
     uint32_t srcSwizzle; // 6 bits for texture (3 x 2)
     bool denormalized;   // coordinates in texels

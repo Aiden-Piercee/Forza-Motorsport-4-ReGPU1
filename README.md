@@ -70,6 +70,10 @@ code (`out/ppc`, ~131 MB) is generated from your own copy and never committed.
 | `FM2_TRACE_PRED=1` | Log predicated packets under tiling |
 | `FM2_TEXVIEW=1` | Show decoded textures instead of rendering |
 | `FM2_HEADLESS=1` | No window |
+| `FM2_SKIP_VS=<hash>,...` | With `FM2_DUMP_FRAME=n`: drop those vertex shaders in frame n+1 and write it to `frame2.png` (A/B under the same camera) |
+| `FM2_SKIP_DRAWS=a-b` | Drop draws a..b-1 of the dumped frame |
+| `FM2_TRACE_VFETCH=1` | Print every translated vertex fetch (format, stride, offset, scale) |
+| `FM2_NO_DIRECT_FETCH=1` | Copy all vertex data instead of reading large buffers in place |
 
 `build/rel/xenos_dis.exe <shaders...>` disassembles captured Xenos microcode;
 `--hlsl` translates and compiles them instead.

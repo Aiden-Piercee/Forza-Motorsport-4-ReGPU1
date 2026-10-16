@@ -1,3 +1,4 @@
+#include <cmath>
 #include "gpu/hlsl.h"
 
 #include <cstdio>
@@ -56,6 +57,19 @@ uint LoadGuest(uint fetch, uint dword)
 
 float SignExtend(uint v, uint bits) { return float(int(v << (32 - bits)) >> (32 - bits)); }
 
+// Xenos 16-bit float: like IEEE half but exponent 31 is an ordinary exponent
+// (no infinities or NaNs), so the range reaches 131008.
+float XHalf(uint h)
+{
+    h &= 0xFFFF;
+    if (((h >> 10) & 31) == 31)
+    {
+        float v = (1.0 + float(h & 1023) / 1024.0) * 65536.0;
+        return (h & 0x8000) ? -v : v;
+    }
+    return f16tof32(h);
+}
+
 float4 Unpack(uint w0, uint w1, uint w2, uint w3, uint format, bool isSigned, bool norm)
 {
     float4 r = float4(0, 0, 0, 1);
@@ -84,8 +98,8 @@ float4 Unpack(uint w0, uint w1, uint w2, uint w3, uint format, bool isSigned, bo
         if (format == 25) r.zw = float2(0, 1);
         break;
     }
-    case 31: r = float4(f16tof32(w0), f16tof32(w0 >> 16), 0, 1); break;
-    case 32: r = float4(f16tof32(w0), f16tof32(w0 >> 16), f16tof32(w1), f16tof32(w1 >> 16)); break;
+    case 31: r = float4(XHalf(w0), XHalf(w0 >> 16), 0, 1); break;
+    case 32: r = float4(XHalf(w0), XHalf(w0 >> 16), XHalf(w1), XHalf(w1 >> 16)); break;
     case 33: r = float4(isSigned ? float(int(w0)) : float(w0), 0, 0, 1); break;
     case 34: r = float4(isSigned ? float2(int2(w0, w1)) : float2(w0, w1), 0, 1); break;
     case 35: r = isSigned ? float4(int4(w0, w1, w2, w3)) : float4(w0, w1, w2, w3); break;
@@ -93,14 +107,30 @@ float4 Unpack(uint w0, uint w1, uint w2, uint w3, uint format, bool isSigned, bo
     case 37: r = float4(asfloat(w0), asfloat(w1), 0, 1); break;
     case 57: r = float4(asfloat(w0), asfloat(w1), asfloat(w2), 1); break;
     case 38: r = asfloat(uint4(w0, w1, w2, w3)); break;
-    case 16: case 17: r = float4((w0 & 0x7FF) / 2047.0, ((w0 >> 11) & 0x7FF) / 2047.0, (w0 >> 22) / 1023.0, 1); break;
+    case 16: // 10_11_11: X 11 bits, Y 11 bits, Z 10 bits from the bottom
+    case 17: // 11_11_10: X 10 bits, Y 11 bits, Z 11 bits
+    {
+        uint3 bits = format == 16 ? uint3(11, 11, 10) : uint3(10, 11, 11);
+        uint3 u = uint3(w0 & ((1u << bits.x) - 1), (w0 >> bits.x) & ((1u << bits.y) - 1), w0 >> (bits.x + bits.y));
+        if (isSigned)
+        {
+            r.xyz = float3(SignExtend(u.x, bits.x), SignExtend(u.y, bits.y), SignExtend(u.z, bits.z));
+            if (norm) r.xyz = max(r.xyz / float3((1u << (bits - 1)) - 1), -1.0);
+        }
+        else
+        {
+            r.xyz = float3(u);
+            if (norm) r.xyz /= float3((1u << bits) - 1);
+        }
+        break;
+    }
     }
     return r;
 }
 
 float4 VFetch(uint fetch, float index, uint stride, uint offset, uint format, bool isSigned, bool norm)
 {
-    uint d = uint(max(index, 0.0)) * stride + offset;
+    uint d = uint(max(index, 0.0)) * stride + offset; // index already rounded or floored
     return Unpack(LoadGuest(fetch, d), LoadGuest(fetch, d + 1), LoadGuest(fetch, d + 2), LoadGuest(fetch, d + 3), format, isSigned, norm);
 }
 
@@ -127,6 +157,8 @@ struct Emitter
     std::string error;
     TranslatedShader& result;
     uint32_t lastStride = 0;
+    uint32_t lastSrc = 0, lastSrcSwizzle = 0; // mini fetches reuse the full fetch's index
+    bool lastRound = false;
     int indent = 1;
 
     void Line(const std::string& s)
@@ -136,17 +168,20 @@ struct Emitter
         out += '\n';
     }
 
-    std::string Constant(uint32_t index) const
+    std::string Constant(uint32_t index, uint32_t relative = 0) const
     {
-        char b[16];
-        snprintf(b, sizeof(b), "%s[%u]", pixel ? "pc" : "vc", index & 255);
+        char b[48];
+        if (relative)
+            snprintf(b, sizeof(b), "%s[(%u + %s) & 255]", pixel ? "pc" : "vc", index & 255, relative == 1 ? "a0" : "aL");
+        else
+            snprintf(b, sizeof(b), "%s[%u]", pixel ? "pc" : "vc", index & 255);
         return b;
     }
 
     std::string Src(const Source& s) const
     {
         static const char comp[] = "xyzw";
-        std::string base = s.isConstant ? Constant(s.reg) : "r[" + std::to_string(s.reg) + "]";
+        std::string base = s.isConstant ? Constant(s.reg, s.relative) : "r[" + std::to_string(s.reg) + "]";
         if (s.abs)
             base = "abs(" + base + ")";
         std::string swz = ".";
@@ -208,7 +243,7 @@ struct Emitter
         case 18: return "float4(0, 0, 0, 0)"; // cube: not used by the frontend yet
         case 19: { std::string t = A; return "max(max(" + t + ".x, " + t + ".y), max(" + t + ".z, " + t + ".w)).xxxx"; }
         case 28: return "float4(1.0, (" + A + ").y * (" + B + ").y, (" + A + ").z, (" + B + ").w)";
-        case 29: return "max(" + A + ", " + B + ")";
+        case 29: return "max(" + A + ", " + B + ")"; // MAXAv: a0 is set by the caller
         default: return "float4(0, 0, 0, 0)";
         }
     }
@@ -243,7 +278,9 @@ struct Emitter
         case 20: return "s = rsqrt(" + A + "); s = clamp(s, -FLT_MAX, FLT_MAX);";
         case 21: return "s = rsqrt(" + A + "); if (isinf(s)) s = 0.0;";
         case 22: return set("rsqrt(" + A + ")");
-        case 23: case 24: return set("max(" + A + ", " + B + ")");
+        // MAXAs / MAXAsf: also load the address register.
+        case 23: return set("max(" + A + ", " + B + ")") + " a0 = clamp(int(floor(" + A + " + 0.5)), -256, 255);";
+        case 24: return set("max(" + A + ", " + B + ")") + " a0 = clamp(int(floor(" + A + ")), -256, 255);";
         case 25: return set(A + " - " + B);
         case 26: return set(A + " - ps");
         case 27: return "p = (" + A + " == 0.0); s = p ? 0.0 : 1.0;";
@@ -305,6 +342,8 @@ struct Emitter
         if (a.vectorClamp)
             body += "v = saturate(v); ";
         body += ScalarCode(a) + " ";
+        if (a.vectorOp == 29) // MAXAv: a0 from the first operand's W, after the reads
+            body += "a0 = clamp(int(floor((" + A + ").w + 0.5)), -256, 255); ";
         if (a.scalarClamp)
             body += "s = saturate(s); ";
         body += "ps = s; ";
@@ -361,10 +400,19 @@ struct Emitter
                 return;
             }
             if (!f.isMini)
+            {
                 lastStride = f.stride;
-            char call[256];
-            snprintf(call, sizeof(call), "VFetch(%u, r[%u].%c, %u, %u, %u, %s, %s)", f.constIndex, f.src, "xyzw"[f.srcSwizzle & 3], lastStride,
-                f.offset, f.format, f.isSigned ? "true" : "false", f.isNormalized ? "true" : "false");
+                lastSrc = f.src;
+                lastSrcSwizzle = f.srcSwizzle;
+                lastRound = f.roundIndex;
+            }
+            if (getenv("FM2_TRACE_VFETCH"))
+                fprintf(stderr, "vfetch: fmt %u signed %d norm %d exp %d stride %u offset %u mini %d round %d\n", f.format, f.isSigned, f.isNormalized,
+                    f.expAdjust, lastStride, f.offset, f.isMini, lastRound);
+            char call[320];
+            snprintf(call, sizeof(call), "VFetch(%u, %s(r[%u].%c), %u, %u, %u, %s, %s) * %.9g", f.constIndex, lastRound ? "round" : "floor",
+                lastSrc, "xyzw"[lastSrcSwizzle & 3], lastStride, f.offset, f.format, f.isSigned ? "true" : "false",
+                f.isNormalized ? "true" : "false", std::ldexp(1.0, f.expAdjust));
             body = std::string("{ float4 t = ") + call + "; " + DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
             bool known = false;
             for (uint32_t c : result.vertexFetchConstants)
@@ -533,7 +581,7 @@ TranslatedShader TranslateShader(const Shader& shader)
         h += "void GuestVS(uint vindex, out float4 opos, out float4 o[16], out float4 opts)\n{\n"
              "    float4 r[64];\n    [unroll] for (int i = 0; i < 64; i++) r[i] = 0;\n"
              "    [unroll] for (int j = 0; j < 16; j++) o[j] = 0;\n"
-             "    r[0].x = float(vindex); opos = float4(0, 0, 0, 1); opts = 0; float ps = 0; bool p = false;\n";
+             "    r[0].x = float(vindex); opos = float4(0, 0, 0, 1); opts = 0; float ps = 0; bool p = false; int a0 = 0, aL = 0;\n";
         h += e.out;
         h += "}\n"
              "void GuestVS(uint vindex, out float4 opos, out float4 o[16])\n{\n"
@@ -583,7 +631,7 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    float4 r[64];\n    [unroll] for (int i = 0; i < 64; i++) r[i] = 0;\n"
              "    [unroll] for (int j = 0; j < 16; j++) r[j] = input.o[j];\n"
              "    float4 oC[4]; [unroll] for (int k = 0; k < 4; k++) oC[k] = 0;\n"
-             "    float ps = 0; bool p = false;\n"
+             "    float ps = 0; bool p = false; int a0 = 0, aL = 0;\n"
              "    // Generated parameter: pixel position, point sprite coordinate.\n"
              "    if (pinfo.y < 16u) r[pinfo.y] = float4(input.pos.xy, input.pcoord);\n";
         h += e.out;

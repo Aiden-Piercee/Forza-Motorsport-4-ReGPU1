@@ -51,8 +51,10 @@ constexpr DXGI_FORMAT kColorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 constexpr uint32_t kDirectFetchBytes = 64 * 1024;
 
 // Registers.
+constexpr uint32_t RB_STENCILREFMASK = 0x210D;
 constexpr uint32_t RB_COLOR_MASK = 0x2104, RB_ALPHA_REF = 0x210E, RB_DEPTHCONTROL = 0x2200, RB_BLENDCONTROL0 = 0x2201;
 constexpr uint32_t RB_COLORCONTROL = 0x2202, PA_CL_VTE_CNTL = 0x2206, RB_MODECONTROL = 0x2208, VGT_INDX_OFFSET = 0x2102;
+constexpr uint32_t VGT_MULTI_PRIM_IB_RESET_INDX = 0x2103;
 constexpr uint32_t PA_CL_VPORT_XSCALE = 0x210F, PA_CL_VPORT_XOFFSET = 0x2110, PA_CL_VPORT_YSCALE = 0x2111, PA_CL_VPORT_YOFFSET = 0x2112;
 constexpr uint32_t PA_CL_VPORT_ZSCALE = 0x2113, PA_CL_VPORT_ZOFFSET = 0x2114;
 constexpr uint32_t PA_SC_WINDOW_OFFSET = 0x2080, PA_SC_WINDOW_SCISSOR_TL = 0x2081, PA_SC_WINDOW_SCISSOR_BR = 0x2082;
@@ -698,8 +700,11 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
 {
     const uint32_t blend = gpureg::Get(RB_BLENDCONTROL0), depth = gpureg::Get(RB_DEPTHCONTROL);
     const uint32_t mask = depthOnly ? 0 : gpureg::Get(RB_COLOR_MASK) & 0xF;
-    char key[96];
-    snprintf(key, sizeof(key), "%016llx%016llx%08x%08x%x", (unsigned long long)g_r.vsHash, (unsigned long long)g_r.psHash, blend, depth, mask);
+    // Stencil masks (not the reference, which is dynamic) and culling are pipeline state.
+    const uint32_t stencil = gpureg::Get(RB_STENCILREFMASK) & 0xFFFF00, mode = gpureg::Get(PA_SU_SC_MODE_CNTL) & 7;
+    char key[112];
+    snprintf(key, sizeof(key), "%016llx%016llx%08x%08x%x%06x%x", (unsigned long long)g_r.vsHash, (unsigned long long)g_r.psHash, blend, depth, mask,
+        stencil, mode);
     auto it = g_r.pipelines.find(key);
     if (it != g_r.pipelines.end())
         return it->second.Get();
@@ -726,6 +731,32 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     pd.DepthStencilState.DepthEnable = (depth >> 1) & 1;
     pd.DepthStencilState.DepthWriteMask = ((depth >> 2) & 1) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
     pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC(((depth >> 4) & 7) + 1);
+    // Stencil: Xenos ops 0 keep, 1 zero, 2 replace, 3 incr wrap, 4 decr wrap, 5 invert,
+    // 6 incr clamp, 7 decr clamp. Back faces use their own ops when enabled.
+    static const D3D12_STENCIL_OP kOps[8] = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_ZERO, D3D12_STENCIL_OP_REPLACE, D3D12_STENCIL_OP_INCR,
+        D3D12_STENCIL_OP_DECR, D3D12_STENCIL_OP_INVERT, D3D12_STENCIL_OP_INCR_SAT, D3D12_STENCIL_OP_DECR_SAT };
+    if (depth & 1)
+    {
+        auto& ds = pd.DepthStencilState;
+        ds.StencilEnable = TRUE;
+        ds.StencilReadMask = UINT8(stencil >> 8);
+        ds.StencilWriteMask = UINT8(stencil >> 16);
+        auto faceOps = [&](uint32_t shift) {
+            D3D12_DEPTH_STENCILOP_DESC op{};
+            op.StencilFunc = D3D12_COMPARISON_FUNC(((depth >> shift) & 7) + 1);
+            op.StencilFailOp = kOps[(depth >> (shift + 3)) & 7];
+            op.StencilPassOp = kOps[(depth >> (shift + 6)) & 7];
+            op.StencilDepthFailOp = kOps[(depth >> (shift + 9)) & 7];
+            return op;
+        };
+        ds.FrontFace = faceOps(8);
+        ds.BackFace = (depth >> 7) & 1 ? faceOps(20) : ds.FrontFace;
+    }
+    // Culling: bit 0 front, bit 1 back; bit 2 set means clockwise faces are front.
+    pd.RasterizerState.FrontCounterClockwise = (mode & 4) == 0;
+    // Culling stays off: the translated geometry (rectangle corners, strips) does
+    // not keep the guest winding reliably yet. Two-sided stencil still needs the facing.
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = kColorFormat;
@@ -859,13 +890,25 @@ bool BuildIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize, std:
     const bool is32 = (initiator >> 11) & 1;
     const uint32_t offset = gpureg::Get(VGT_INDX_OFFSET);
     std::vector<uint32_t> g(count);
+    // Primitive restart: a raw index equal to the reset value ends the strip/fan.
+    const bool restart = (gpureg::Get(PA_SU_SC_MODE_CNTL) >> 21) & 1;
+    const uint32_t resetIndex = gpureg::Get(VGT_MULTI_PRIM_IB_RESET_INDX) & (is32 ? 0xFFFFFF : 0xFFFF);
+    std::vector<bool> cut;
     if (source == 0) // DMA
     {
         const uint32_t base = GpuPhysToGuest(dmaBase & ~(is32 ? 3u : 1u));
         const uint32_t endian = dmaSize >> 30;
         const uint32_t available = (dmaSize & 0xFFFFFF) * (is32 ? 1 : 2);
         for (uint32_t i = 0; i < count && i < available; i++)
-            g[i] = ReadIndex(base, i, is32, endian) + offset;
+        {
+            const uint32_t raw = ReadIndex(base, i, is32, endian);
+            if (restart && (raw & (is32 ? 0xFFFFFF : 0xFFFF)) == resetIndex)
+            {
+                cut.resize(count);
+                cut[i] = true;
+            }
+            g[i] = raw + offset;
+        }
     }
     else if (source == 2) // auto
     {
@@ -886,18 +929,25 @@ bool BuildIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize, std:
     case 4: // triangle list
         out.assign(g.begin(), g.begin() + (count / 3) * 3);
         return true;
-    case 6: // triangle strip
-        for (uint32_t i = 0; i + 2 < count; i++)
+    case 6: // triangle strip(s), split at restart indices
+    case 5: // triangle fan(s)
+        for (uint32_t start = 0; start < count;)
         {
-            if (i & 1)
-                out.insert(out.end(), { g[i + 1], g[i], g[i + 2] });
-            else
-                out.insert(out.end(), { g[i], g[i + 1], g[i + 2] });
+            uint32_t end = start;
+            while (end < count && !(end < cut.size() && cut[end]))
+                end++;
+            for (uint32_t i = start; i + 2 < end; i++)
+            {
+                const uint32_t k = i - start;
+                if (prim == 5)
+                    out.insert(out.end(), { g[start], g[i + 1], g[i + 2] });
+                else if (k & 1)
+                    out.insert(out.end(), { g[i + 1], g[i], g[i + 2] });
+                else
+                    out.insert(out.end(), { g[i], g[i + 1], g[i + 2] });
+            }
+            start = end + 1;
         }
-        return true;
-    case 5: // triangle fan
-        for (uint32_t i = 1; i + 1 < count; i++)
-            out.insert(out.end(), { g[0], g[i], g[i + 1] });
         return true;
     case 13: // quad list
         for (uint32_t i = 0; i + 3 < count; i += 4)
@@ -1172,6 +1222,32 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         g_r.skippedThisFrame++;
         return;
     }
+    {
+        // Debug bisection: FM2_SKIP_DRAWS=a-b drops draws a..b-1 of the FM2_DUMP_FRAME frame.
+        static uint32_t skipFrom = 0, skipTo = 0;
+        static const bool parsed = [] { if (const char* s = getenv("FM2_SKIP_DRAWS")) sscanf(s, "%u-%u", &skipFrom, &skipTo); return true; }();
+        static const uint64_t dumpFrame = getenv("FM2_DUMP_FRAME") ? strtoull(getenv("FM2_DUMP_FRAME"), nullptr, 10) : 0;
+        (void)parsed;
+        // FM2_SKIP_VS=h1,h2,...: drop those vertex shaders in the frame after the dump
+        // (written to frame2.png), for an A/B pair under the same camera.
+        static const std::vector<uint64_t> skipVs = [] {
+            std::vector<uint64_t> v;
+            for (const char* s = getenv("FM2_SKIP_VS"); s && *s;)
+            {
+                char* end;
+                v.push_back(strtoull(s, &end, 16));
+                s = *end == ',' ? end + 1 : end;
+                if (end == s && *end != ',') break;
+            }
+            return v;
+        }();
+        const bool skipThis = g_r.frame == dumpFrame && std::find(skipVs.begin(), skipVs.end(), g_r.vsHash) != skipVs.end();
+        if (skipThis || (skipTo && g_r.frame + 1 == dumpFrame && g_r.drawsThisFrame >= skipFrom && g_r.drawsThisFrame < skipTo))
+        {
+            g_r.drawsThisFrame++;
+            return;
+        }
+    }
     BeginFrameIfNeeded();
     ID3D12PipelineState* pso = GetPipeline(vs, ps, edramMode == 5);
     if (!pso)
@@ -1230,7 +1306,8 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         const uint32_t address = d0 & 0xFFFFFFFC, bytes = ((d1 >> 2) & 0xFFFFFF) * 4;
         // Large buffers (static geometry) are read in place; small ones may be
         // rewritten before the GPU runs this frame, so they are copied.
-        if (g_r.physical && bytes >= kDirectFetchBytes)
+        static const bool noDirect = getenv("FM2_NO_DIRECT_FETCH") != nullptr;
+        if (g_r.physical && !noDirect && bytes >= kDirectFetchBytes)
         {
             vc->vf[k][0] = address & 0x1FFFFFFF;
             vc->vf[k][1] = d1 & 3;
@@ -1339,6 +1416,7 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     g_r.list->RSSetViewports(1, &vp);
     g_r.list->RSSetScissorRects(1, &scissor);
+    g_r.list->OMSetStencilRef(gpureg::Get(RB_STENCILREFMASK) & 0xFF);
     g_r.list->SetPipelineState(pso);
     g_r.list->SetGraphicsRootConstantBufferView(0, f.ring->GetGPUVirtualAddress() + vsOffset);
     g_r.list->SetGraphicsRootConstantBufferView(1, f.ring->GetGPUVirtualAddress() + psOffset);
@@ -1404,7 +1482,8 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
 
     static const uint64_t dumpFrame = getenv("FM2_DUMP_FRAME") ? strtoull(getenv("FM2_DUMP_FRAME"), nullptr, 10) : 0;
     ++g_r.frame;
-    const bool dump = fromResolve && dumpFrame && g_r.frame == dumpFrame;
+    static const bool dumpSecond = getenv("FM2_SKIP_VS") != nullptr;
+    const bool dump = fromResolve && dumpFrame && (g_r.frame == dumpFrame || (dumpSecond && g_r.frame == dumpFrame + 1));
     if (dump)
     {
         D3D12_TEXTURE_COPY_LOCATION dst{};
@@ -1446,7 +1525,7 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
         g_r.readback->Unmap(0, nullptr);
         for (size_t i = 3; i < rgba.size(); i += 4)
             rgba[i] = 255;
-        WritePng("frame.png", kWidth, kHeight, rgba);
+        WritePng(g_r.frame == dumpFrame ? "frame.png" : "frame2.png", kWidth, kHeight, rgba);
         Log("renderer: wrote frame.png (frame %llu: %u draws, %u skipped)", (unsigned long long)frameNumber, g_r.drawsThisFrame,
             g_r.skippedThisFrame);
     }
