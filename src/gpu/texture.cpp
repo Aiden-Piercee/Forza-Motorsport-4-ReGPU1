@@ -327,3 +327,19 @@ bool DecodeTexture(const TextureFetch& fetch, std::vector<uint8_t>& rgba)
     }
     return true;
 }
+
+uint32_t TextureFaceStride(const TextureFetch& fetch)
+{
+    FormatInfo info;
+    if (!Info(fetch.Format(), info))
+        info = { 1, 2 }; // 32 bpp (render-target formats)
+    const uint32_t blocksX = (fetch.Width() + info.blockSize - 1) / info.blockSize;
+    uint32_t blocksY = (fetch.Height() + info.blockSize - 1) / info.blockSize;
+    uint32_t pitchBlocks = std::max(fetch.Pitch() / info.blockSize, blocksX);
+    if (fetch.Tiled())
+    {
+        pitchBlocks = (pitchBlocks + 31) & ~31u;
+        blocksY = (blocksY + 31) & ~31u;
+    }
+    return ((pitchBlocks * blocksY << info.log2Bytes) + 4095) & ~4095u;
+}

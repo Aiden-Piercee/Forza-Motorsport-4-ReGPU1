@@ -278,6 +278,12 @@ uint32_t ExecutePacket(uint32_t ptr)
         const uint32_t finished = __builtin_bswap32(0xFFFFFEED);
         // Layout (little-endian dwords): Total A/B, ZFail A/B, ZPass A/B, StencilFail A/B.
         const bool end = (c[4] == finished && c[5] == finished) || (c[2] == finished && c[3] == finished);
+        static int logged = 0;
+        if (logged < 12 && getenv("FM2_TRACE_ZPD"))
+        {
+            logged++;
+            Log("zpd: %08X %08X %08X %08X %08X %08X %08X %08X%s", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], end ? " (end)" : "");
+        }
         memset(c, 0, 8 * 4);
         if (end)
         {

@@ -45,9 +45,11 @@ constexpr UINT kWidth = 1280, kHeight = 720;
 constexpr UINT kFrames = 3;
 constexpr UINT64 kRingSize = 64ull << 20;
 constexpr UINT kDescriptorsPerFrame = 34 * 8192; // 8192 draws
-constexpr UINT kTableSize = 34; // t0 upload ring, t1-t32 textures, t33 guest physical memory
+constexpr UINT kTableSize = 66; // t0 upload ring, t1-t32 2D textures, t33 guest memory, t34-t65 cube textures
 // The EDRAM colour target: half floats hold the title's HDR (7e3) range.
 constexpr DXGI_FORMAT kColorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+constexpr UINT kMaxSurfaces = 64; // EDRAM bases with host surfaces
+constexpr uint32_t RB_COLOR_INFO = 0x2001, RB_DEPTH_INFO = 0x2002;
 constexpr uint32_t kDirectFetchBytes = 64 * 1024;
 
 // Registers.
@@ -99,6 +101,7 @@ struct CachedTexture
     uint64_t contentHash = 0;
     uint64_t checkedFrame = ~0ull; // content already validated in this frame
     uint32_t width = 0, height = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM; // cubes: matches their faces
 };
 
 // A resolve destination backed by a host texture: fetches of this guest
@@ -147,12 +150,26 @@ struct Renderer
     ComPtr<ID3D12RootSignature> blitRootSignature;
     ComPtr<ID3D12PipelineState> depthBlit;                // depth buffer -> R32_FLOAT
     ComPtr<ID3D12PipelineState> colorBlit8, colorBlit16;  // colour -> 8888 / RGBA16F, scaled
+    // EDRAM surfaces: one host colour and one host depth target per EDRAM base
+    // (RB_COLOR_INFO / RB_DEPTH_INFO bits 0-11), so passes that the title
+    // places at different EDRAM offsets do not overwrite each other.
+    struct Surface
+    {
+        ComPtr<ID3D12Resource> resource;
+        D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        D3D12_CPU_DESCRIPTOR_HANDLE view{};
+    };
+    std::unordered_map<uint32_t, Surface> colorSurfaces, depthSurfaces;
+    uint32_t colorBase = ~0u, depthBase = ~0u;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv{}, dsv{};
+    // The bound surfaces.
     ComPtr<ID3D12Resource> color, depth, readback;
     D3D12_RESOURCE_STATES colorState = D3D12_RESOURCE_STATE_RENDER_TARGET;
 
     std::unordered_map<uint64_t, std::unique_ptr<CompiledShader>> shaders;
     std::unordered_map<std::string, ComPtr<ID3D12PipelineState>> pipelines;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, CachedTexture> textures;
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, CachedTexture> cubes;
     std::unordered_map<uint32_t, ResolvedTexture> resolved; // by physical address
 
     // Active shaders: the last microcode loaded per stage.
@@ -356,15 +373,19 @@ void Init()
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     Check(d->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_r.srvHeap)), "CreateDescriptorHeap(srv)");
     g_r.srvStride = d->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    hd.NumDescriptors = 1;
+    hd.NumDescriptors = 2;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     Check(d->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_r.stagingHeap)), "CreateDescriptorHeap(staging)");
+    hd.NumDescriptors = 1;
     D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
     nullSrv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     nullSrv.Texture2D.MipLevels = 1;
     d->CreateShaderResourceView(nullptr, &nullSrv, Cpu(g_r.stagingHeap.Get(), 0, g_r.srvStride));
+    nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    nullSrv.TextureCube.MipLevels = 1;
+    d->CreateShaderResourceView(nullptr, &nullSrv, Cpu(g_r.stagingHeap.Get(), 1, g_r.srvStride));
 
     // Guest physical memory for the GPU, in place: vertex fetches read it
     // without copies.
@@ -398,37 +419,13 @@ void Init()
     }
     Log("renderer: guest memory %s", g_r.physical ? "mapped for the GPU (zero-copy vertex fetch)" : "not mappable; vertex data is copied");
 
-    // Colour and depth targets.
-    D3D12_HEAP_PROPERTIES hp{};
-    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC td{};
-    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    td.Width = kWidth;
-    td.Height = kHeight;
-    td.DepthOrArraySize = 1;
-    td.MipLevels = 1;
-    td.SampleDesc.Count = 1;
-    td.Format = kColorFormat;
-    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    D3D12_CLEAR_VALUE cv{};
-    cv.Format = td.Format;
-    Check(d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, IID_PPV_ARGS(&g_r.color)),
-        "CreateCommittedResource(color)");
-    td.Format = DXGI_FORMAT_R24G8_TYPELESS; // typeless: depth resolves read it
-    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-    cv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    cv.DepthStencil.Depth = 1.0f;
-    Check(d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(&g_r.depth)),
-        "CreateCommittedResource(depth)");
+    // Views for the EDRAM surfaces (created on first use).
+    hd.NumDescriptors = kMaxSurfaces;
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     Check(d->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_r.rtvHeap)), "CreateDescriptorHeap(rtv)");
-    d->CreateRenderTargetView(g_r.color.Get(), nullptr, g_r.rtvHeap->GetCPUDescriptorHandleForHeapStart());
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     Check(d->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_r.dsvHeap)), "CreateDescriptorHeap(dsv)");
-    D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc{};
-    dsvDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-    d->CreateDepthStencilView(g_r.depth.Get(), &dsvDesc, g_r.dsvHeap->GetCPUDescriptorHandleForHeapStart());
+    hd.NumDescriptors = 1;
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     Check(d->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_r.blitRtvHeap)), "CreateDescriptorHeap(blit rtv)");
     InitDepthBlit();
@@ -454,6 +451,83 @@ void Init()
 
 FrameResources& Frame() { return g_r.frames[g_r.frameIndex]; }
 
+void TransitionColor(D3D12_RESOURCE_STATES to);
+
+// Gets (creating on first use) the host surface for an EDRAM base.
+Renderer::Surface& GetSurface(bool depth, uint32_t base)
+{
+    auto& map = depth ? g_r.depthSurfaces : g_r.colorSurfaces;
+    if (auto it = map.find(base); it != map.end())
+        return it->second;
+    if (map.size() >= kMaxSurfaces)
+        return map.begin()->second; // out of views: share one (should not happen)
+    Renderer::Surface& s = map[base];
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC td{};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = kWidth;
+    td.Height = kHeight;
+    td.DepthOrArraySize = 1;
+    td.MipLevels = 1;
+    td.SampleDesc.Count = 1;
+    D3D12_CLEAR_VALUE cv{};
+    const UINT index = UINT(map.size() - 1);
+    if (depth)
+    {
+        td.Format = DXGI_FORMAT_R24G8_TYPELESS; // typeless: depth resolves read it
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        cv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        cv.DepthStencil.Depth = 1.0f;
+        Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv,
+                  IID_PPV_ARGS(&s.resource)),
+            "CreateCommittedResource(depth surface)");
+        s.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        s.view = g_r.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        s.view.ptr += SIZE_T(index) * g_r.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc{};
+        dsvDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        g_r.device->CreateDepthStencilView(s.resource.Get(), &dsvDesc, s.view);
+    }
+    else
+    {
+        td.Format = kColorFormat;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        cv.Format = td.Format;
+        Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv,
+                  IID_PPV_ARGS(&s.resource)),
+            "CreateCommittedResource(colour surface)");
+        s.view = g_r.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        s.view.ptr += SIZE_T(index) * g_r.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        g_r.device->CreateRenderTargetView(s.resource.Get(), nullptr, s.view);
+    }
+    Log("renderer: EDRAM %s surface at base %03X", depth ? "depth" : "colour", base);
+    return s;
+}
+
+// Binds the surfaces for the current RB_COLOR_INFO / RB_DEPTH_INFO bases
+// (the list must be open).
+void SelectSurfaces(bool force)
+{
+    const uint32_t colorBase = gpureg::Get(RB_COLOR_INFO) & 0xFFF, depthBase = gpureg::Get(RB_DEPTH_INFO) & 0xFFF;
+    if (!force && colorBase == g_r.colorBase && depthBase == g_r.depthBase)
+        return;
+    if (g_r.colorBase != ~0u)
+        g_r.colorSurfaces[g_r.colorBase].state = g_r.colorState;
+    Renderer::Surface& c = GetSurface(false, colorBase);
+    Renderer::Surface& z = GetSurface(true, depthBase);
+    g_r.color = c.resource;
+    g_r.colorState = c.state;
+    g_r.rtv = c.view;
+    g_r.depth = z.resource;
+    g_r.dsv = z.view;
+    g_r.colorBase = colorBase;
+    g_r.depthBase = depthBase;
+    TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
+    g_r.list->OMSetRenderTargets(1, &g_r.rtv, FALSE, &g_r.dsv);
+}
+
 void BeginFrameIfNeeded()
 {
     if (g_r.listOpen)
@@ -473,20 +547,7 @@ void BeginFrameIfNeeded()
     ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get() };
     g_r.list->SetDescriptorHeaps(1, heaps);
     g_r.list->SetGraphicsRootSignature(g_r.rootSignature.Get());
-    if (g_r.colorState != D3D12_RESOURCE_STATE_RENDER_TARGET)
-    {
-        D3D12_RESOURCE_BARRIER b{};
-        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition.pResource = g_r.color.Get();
-        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        b.Transition.StateBefore = g_r.colorState;
-        b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        g_r.list->ResourceBarrier(1, &b);
-        g_r.colorState = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    }
-    const auto rtv = g_r.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    const auto dsv = g_r.dsvHeap->GetCPUDescriptorHandleForHeapStart();
-    g_r.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+    SelectSurfaces(true);
     g_r.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_r.listOpen = true;
 }
@@ -702,9 +763,11 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     const uint32_t mask = depthOnly ? 0 : gpureg::Get(RB_COLOR_MASK) & 0xF;
     // Stencil masks (not the reference, which is dynamic) and culling are pipeline state.
     const uint32_t stencil = gpureg::Get(RB_STENCILREFMASK) & 0xFFFF00, mode = gpureg::Get(PA_SU_SC_MODE_CNTL) & 7;
+    // Alpha-to-mask (RB_COLORCONTROL bit 4): cut-out foliage and fences.
+    const bool alphaToMask = (gpureg::Get(RB_COLORCONTROL) >> 4) & 1;
     char key[112];
-    snprintf(key, sizeof(key), "%016llx%016llx%08x%08x%x%06x%x", (unsigned long long)g_r.vsHash, (unsigned long long)g_r.psHash, blend, depth, mask,
-        stencil, mode);
+    snprintf(key, sizeof(key), "%016llx%016llx%08x%08x%x%06x%x%d", (unsigned long long)g_r.vsHash, (unsigned long long)g_r.psHash, blend, depth, mask,
+        stencil, mode, alphaToMask);
     auto it = g_r.pipelines.find(key);
     if (it != g_r.pipelines.end())
         return it->second.Get();
@@ -724,6 +787,7 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     rt.DestBlendAlpha = AlphaBlend(dstA);
     rt.BlendOpAlpha = BlendOp(opA);
     rt.RenderTargetWriteMask = UINT8(mask);
+    pd.BlendState.AlphaToCoverageEnable = alphaToMask; // one sample: coverage where alpha >= 0.5
     pd.SampleMask = UINT_MAX;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -773,6 +837,149 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     return pso.Get();
 }
 
+// Cube textures: six faces, each a padded 2D slice. Faces the title rendered
+// and resolved (dynamic reflections) are copied from their host textures every
+// frame; static faces are decoded once and re-decoded when their data changes.
+ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
+{
+    const uint32_t w = fetch.Width(), h = fetch.Height();
+    if (w != h || w > 2048)
+        return nullptr;
+    const uint32_t stride = TextureFaceStride(fetch);
+    CachedTexture& cached = g_r.cubes[{ fetch.Address(), fetch.Format(), w, h }];
+    if (cached.resource && cached.checkedFrame == g_r.frame)
+    {
+        format = cached.format;
+        return cached.resource.Get();
+    }
+    cached.checkedFrame = g_r.frame;
+
+    // Faces the title resolved into?
+    const ResolvedTexture* faces[6]{};
+    bool resolved = false;
+    for (uint32_t i = 0; i < 6; i++)
+    {
+        auto it = g_r.resolved.find((fetch.Address() + i * stride) & 0x1FFFFFFF);
+        if (it != g_r.resolved.end() && it->second.format != DXGI_FORMAT_R32_FLOAT && it->second.width >= w && it->second.height >= h)
+        {
+            faces[i] = &it->second;
+            resolved = true;
+        }
+    }
+    DXGI_FORMAT want = DXGI_FORMAT_R8G8B8A8_UNORM;
+    for (uint32_t i = 0; i < 6 && resolved; i++)
+        if (faces[i])
+        {
+            want = faces[i]->format;
+            break;
+        }
+    if (!cached.resource || cached.width != w || cached.height != h || cached.format != want)
+    {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = w;
+        td.Height = h;
+        td.DepthOrArraySize = 6;
+        td.MipLevels = 1;
+        td.SampleDesc.Count = 1;
+        td.Format = want;
+        if (cached.resource)
+            Frame().garbage.push_back(std::move(cached.resource));
+        Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                  IID_PPV_ARGS(&cached.resource)),
+            "CreateCommittedResource(cube)");
+        cached.width = w;
+        cached.height = h;
+        cached.format = want;
+        cached.contentHash = 0;
+    }
+    format = want;
+
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = cached.resource.Get();
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+
+    if (resolved)
+    {
+        D3D12_RESOURCE_BARRIER fb[6]{};
+        UINT n = 0;
+        for (uint32_t i = 0; i < 6; i++)
+        {
+            if (!faces[i] || faces[i]->format != want)
+                continue;
+            fb[n].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            fb[n].Transition.pResource = faces[i]->resource.Get();
+            fb[n].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            fb[n].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            n++;
+        }
+        g_r.list->ResourceBarrier(1, &b);
+        if (n)
+            g_r.list->ResourceBarrier(n, fb);
+        for (uint32_t i = 0; i < 6; i++)
+        {
+            if (!faces[i] || faces[i]->format != want)
+                continue;
+            D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+            dst.pResource = cached.resource.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.SubresourceIndex = i;
+            src.pResource = faces[i]->resource.Get();
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            const D3D12_BOX box{ 0, 0, 0, w, h, 1 };
+            g_r.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+        }
+        for (UINT k = 0; k < n; k++)
+            std::swap(fb[k].Transition.StateBefore, fb[k].Transition.StateAfter);
+        if (n)
+            g_r.list->ResourceBarrier(n, fb);
+    }
+    else
+    {
+        // Static: hash all six faces, decode on change.
+        const uint8_t* source = GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address()));
+        const uint64_t hash = ContentHash(source, size_t(stride) * 6) ^ (uint64_t(fetch.Swizzle()) << 8) ^ (uint64_t(fetch.Endian()) << 44);
+        if (cached.contentHash == hash)
+            return cached.resource.Get();
+        const UINT rowPitch = (w * 4 + 255) & ~255u;
+        const UINT64 faceBytes = (UINT64(rowPitch) * h + 511) & ~511ull;
+        const UINT64 offset = RingAlloc(faceBytes * 6, 512);
+        if (offset == ~0ull)
+            return nullptr;
+        g_r.list->ResourceBarrier(1, &b);
+        for (uint32_t i = 0; i < 6; i++)
+        {
+            TextureFetch face = fetch;
+            face.dwords[1] = (face.dwords[1] & 0xFFF) | ((fetch.Address() + i * stride) & 0xFFFFF000);
+            face.dwords[5] = (face.dwords[5] & ~(3u << 9)) | (1u << 9); // decode as 2D
+            std::vector<uint8_t> rgba;
+            if (!DecodeTexture(face, rgba))
+                rgba.assign(size_t(w) * h * 4, 0);
+            for (uint32_t y = 0; y < h; y++)
+                memcpy(Frame().ringCpu + offset + faceBytes * i + UINT64(y) * rowPitch, &rgba[size_t(y) * w * 4], size_t(w) * 4);
+            D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+            dst.pResource = cached.resource.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.SubresourceIndex = i;
+            src.pResource = Frame().ring.Get();
+            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            src.PlacedFootprint.Offset = offset + faceBytes * i;
+            src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1, rowPitch };
+            g_r.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+        cached.contentHash = hash;
+    }
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    g_r.list->ResourceBarrier(1, &b);
+    return cached.resource.Get();
+}
+
 // Decodes (if changed) and uploads a texture; returns its resource.
 ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
 {
@@ -786,7 +993,9 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
         return nullptr;
     const uint32_t w = fetch.Width(), h = fetch.Height();
     auto& cached = g_r.textures[{ fetch.Address(), fetch.Format(), w, h }];
-    if (cached.resource && cached.checkedFrame == g_r.frame)
+    static const bool dumpAll = getenv("FM2_DUMP_TEXTURES") != nullptr;
+    const bool forceDecode = dumpAll && RendererTracing();
+    if (cached.resource && cached.checkedFrame == g_r.frame && !forceDecode)
         return cached.resource.Get();
     cached.checkedFrame = g_r.frame;
     const uint8_t* source = GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address()));
@@ -794,7 +1003,7 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
     // Only what changes the decoded image: sampler state (clamp, filter) varies per draw.
     const uint64_t hash = ContentHash(source, sourceBytes) ^ (uint64_t(fetch.Swizzle()) << 8) ^ (uint64_t(fetch.Pitch()) << 24) ^
         (uint64_t(fetch.Tiled()) << 40) ^ (uint64_t(fetch.Endian()) << 44);
-    if (cached.resource && cached.contentHash == hash)
+    if (cached.resource && cached.contentHash == hash && !forceDecode)
         return cached.resource.Get();
 
     std::vector<uint8_t> rgba;
@@ -803,6 +1012,13 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
     if (RendererTracing())
         Log("texture upload: %08X %s %ux%u (%s)", fetch.Address(), TextureFormatName(fetch.Format()), w, h, cached.resource ? "changed" : "new");
     static const uint32_t dumpAddress = getenv("FM2_DUMP_TEXTURE") ? uint32_t(strtoul(getenv("FM2_DUMP_TEXTURE"), nullptr, 16)) : 0;
+    if (RendererTracing() && getenv("FM2_DUMP_TEXTURES"))
+    {
+        char name[64];
+        snprintf(name, sizeof(name), "out/tex/%08X_%s_%ux%u.png", fetch.Address(), TextureFormatName(fetch.Format()), w, h);
+        std::filesystem::create_directories("out/tex");
+        WritePng(name, w, h, rgba);
+    }
     if (dumpAddress && fetch.Address() == dumpAddress)
     {
         WritePng("texture.png", w, h, rgba);
@@ -1085,9 +1301,7 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     g_r.list->ResourceBarrier(barriers, b);
     TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
     // Back to the main targets and root signature.
-    const auto mainRtv = g_r.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    const auto dsv = g_r.dsvHeap->GetCPUDescriptorHandleForHeapStart();
-    g_r.list->OMSetRenderTargets(1, &mainRtv, FALSE, &dsv);
+    g_r.list->OMSetRenderTargets(1, &g_r.rtv, FALSE, &g_r.dsv);
     g_r.list->SetGraphicsRootSignature(g_r.rootSignature.Get());
 }
 
@@ -1098,6 +1312,7 @@ void Resolve()
     if (!g_r.ok)
         Init();
     BeginFrameIfNeeded();
+    SelectSurfaces(false);
     const uint32_t control = gpureg::Get(RB_COPY_CONTROL);
     const uint32_t command = (control >> 20) & 3;
 
@@ -1158,12 +1373,12 @@ void Resolve()
         const uint32_t c = gpureg::Get(RB_COLOR_CLEAR);
         const float color[4] = { ((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f, (c & 0xFF) / 255.0f, (c >> 24) / 255.0f };
         TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
-        g_r.list->ClearRenderTargetView(g_r.rtvHeap->GetCPUDescriptorHandleForHeapStart(), color, 1, &rect);
+        g_r.list->ClearRenderTargetView(g_r.rtv, color, 1, &rect);
     }
     if ((control >> 9) & 1) // depth/stencil clear: depth 24 bits | stencil 8
     {
         const uint32_t v = gpureg::Get(RB_DEPTH_CLEAR);
-        g_r.list->ClearDepthStencilView(g_r.dsvHeap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+        g_r.list->ClearDepthStencilView(g_r.dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
             float(v >> 8) / 16777215.0f, UINT8(v & 0xFF), 1, &rect);
     }
 }
@@ -1249,6 +1464,7 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
     }
     BeginFrameIfNeeded();
+    SelectSurfaces(false);
     ID3D12PipelineState* pso = GetPipeline(vs, ps, edramMode == 5);
     if (!pso)
     {
@@ -1274,6 +1490,8 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         uint32_t vf[96][4];
         uint32_t info[4];
         float point[4];
+        float vscale[4], voffset[4];
+        uint32_t vte[4];
     };
     struct PSConstants
     {
@@ -1323,9 +1541,19 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         vc->vf[k][0] = uint32_t(dataOffset);
         vc->vf[k][1] = d1 & 3;
     }
-    const bool clipSpace = gpureg::Get(PA_CL_VTE_CNTL) & 1;
     vc->info[0] = uint32_t(listOffset);
-    vc->info[1] = (clipSpace ? 0 : 1) | ((initiator & 0x3F) == 1 ? 2 : 0);
+    vc->info[1] = (initiator & 0x3F) == 1 ? 2 : 0;
+    // Viewport transform in the vertex shader (see hlsl.cpp).
+    vc->vscale[0] = RegFloat(PA_CL_VPORT_XSCALE);
+    vc->vscale[1] = RegFloat(PA_CL_VPORT_YSCALE);
+    vc->vscale[2] = RegFloat(PA_CL_VPORT_ZSCALE);
+    vc->vscale[3] = 0;
+    vc->voffset[0] = RegFloat(PA_CL_VPORT_XOFFSET);
+    vc->voffset[1] = RegFloat(PA_CL_VPORT_YOFFSET);
+    vc->voffset[2] = RegFloat(PA_CL_VPORT_ZOFFSET);
+    vc->voffset[3] = 0;
+    vc->vte[0] = gpureg::Get(PA_CL_VTE_CNTL);
+    vc->vte[1] = vc->vte[2] = vc->vte[3] = 0;
     vc->info[2] = kWidth;
     vc->info[3] = kHeight;
     // Point sizes are 12.4 fixed-point radii.
@@ -1366,25 +1594,41 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     for (uint32_t slot = 0; slot < 32; slot++)
     {
         const auto dest = Cpu(g_r.srvHeap.Get(), table + 1 + slot, g_r.srvStride);
+        const auto destCube = Cpu(g_r.srvHeap.Get(), table + 34 + slot, g_r.srvStride);
         ID3D12Resource* texture = nullptr;
         DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
         TextureFetch fetch{};
+        bool cube = false;
         if (((ps.info.usedTextureSlots | vs.info.usedTextureSlots) >> slot) & 1)
         {
             fetch = ReadTextureFetch(slot);
-            texture = GetTexture(fetch, format);
+            cube = fetch.Dimension() == 3;
+            texture = cube ? GetCubeTexture(fetch, format) : GetTexture(fetch, format);
         }
+        pc->tinfo[slot][3] = cube ? 3 : 1;
+        // The unused view of this slot gets a null descriptor of its kind.
+        g_r.device->CopyDescriptorsSimple(1, cube ? dest : destCube, Cpu(g_r.stagingHeap.Get(), cube ? 0 : 1, g_r.srvStride),
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         if (!texture)
         {
-            g_r.device->CopyDescriptorsSimple(1, dest, Cpu(g_r.stagingHeap.Get(), 0, g_r.srvStride), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            g_r.device->CopyDescriptorsSimple(1, cube ? destCube : dest, Cpu(g_r.stagingHeap.Get(), cube ? 1 : 0, g_r.srvStride),
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             continue;
         }
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
         srv.Format = format;
-        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv.Texture2D.MipLevels = 1;
-        g_r.device->CreateShaderResourceView(texture, &srv, dest);
+        if (cube)
+        {
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+            srv.TextureCube.MipLevels = 1;
+        }
+        else
+        {
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Texture2D.MipLevels = 1;
+        }
+        g_r.device->CreateShaderResourceView(texture, &srv, cube ? destCube : dest);
         // Clamp X (dword 0 bits 10-12): 0 wrap, else clamp. Filter: dword 3 bits 19-20 (mag): 0 point.
         const bool clamp = ((fetch.dwords[0] >> 10) & 7) != 0;
         const bool point = ((fetch.dwords[3] >> 19) & 3) == 0;
@@ -1394,19 +1638,8 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
 
     // Viewport.
-    D3D12_VIEWPORT vp{ 0, 0, float(kWidth), float(kHeight), 0, 1 };
-    if (clipSpace)
-    {
-        const float xs = std::fabs(RegFloat(PA_CL_VPORT_XSCALE)), ys = std::fabs(RegFloat(PA_CL_VPORT_YSCALE));
-        if (xs > 0 && ys > 0)
-            vp = { RegFloat(PA_CL_VPORT_XOFFSET) - xs, RegFloat(PA_CL_VPORT_YOFFSET) - ys, xs * 2, ys * 2, 0, 1 };
-        const float zs = RegFloat(PA_CL_VPORT_ZSCALE), zo = RegFloat(PA_CL_VPORT_ZOFFSET);
-        if (zs != 0)
-        {
-            vp.MinDepth = std::clamp(zo, 0.0f, 1.0f);
-            vp.MaxDepth = std::clamp(zo + zs, 0.0f, 1.0f);
-        }
-    }
+    // The viewport transform happens in the vertex shader; D3D maps 1:1.
+    const D3D12_VIEWPORT vp{ 0, 0, float(kWidth), float(kHeight), 0, 1 };
     const D3D12_RECT scissor = WindowScissor();
     if (scissor.right <= scissor.left || scissor.bottom <= scissor.top)
     {
@@ -1431,7 +1664,8 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 continue;
             const TextureFetch t = ReadTextureFetch(slot);
             char e[96];
-            snprintf(e, sizeof(e), " t%u=%s %ux%u@%08X sw%03X", slot, TextureFormatName(t.Format()), t.Width(), t.Height(), t.Address(), t.Swizzle());
+            snprintf(e, sizeof(e), " t%u=%s %ux%u@%08X sw%03X sg%02X d%u", slot, TextureFormatName(t.Format()), t.Width(), t.Height(), t.Address(), t.Swizzle(),
+                (t.dwords[0] >> 2) & 0xFF, t.Dimension());
             tex += e;
         }
         Log("draw vs %016llx ps %016llx prim %u n %zu blend %08X mask %X scissor %ld,%ld-%ld,%ld%s", (unsigned long long)g_r.vsHash,
@@ -1440,7 +1674,16 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         uint32_t bools[8];
         for (int i = 0; i < 8; i++)
             bools[i] = gpureg::Get(gpureg::BoolConstants + i);
-        Log("    bools %08X %08X %08X %08X", bools[0], bools[1], bools[2], bools[3]);
+        Log("    bools %08X %08X %08X %08X %08X %08X %08X %08X", bools[0], bools[1], bools[2], bools[3], bools[4], bools[5], bools[6], bools[7]);
+        if (getenv("FM2_TRACE_VC"))
+            for (uint32_t i = 0; i < 256; i++)
+            {
+                const float* c = vc->c[i];
+                if (c[0] != 0 || c[1] != 0 || c[2] != 0 || c[3] != 0)
+                    Log("    vc%u = %g %g %g %g", i, c[0], c[1], c[2], c[3]);
+            }
+        Log("    surface %08X color %08X depth %08X depthctl %08X colorctl %08X mode %X", gpureg::Get(0x2000), gpureg::Get(0x2001), gpureg::Get(0x2002),
+            gpureg::Get(RB_DEPTHCONTROL), gpureg::Get(RB_COLORCONTROL), gpureg::Get(PA_SU_SC_MODE_CNTL));
         for (uint32_t c : { 5u, 6u, 7u, 14u, 22u, 254u, 255u })
             Log("    pc%u = %g %g %g %g", c, pc->c[c][0], pc->c[c][1], pc->c[c][2], pc->c[c][3]);
     }
@@ -1483,7 +1726,8 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
     static const uint64_t dumpFrame = getenv("FM2_DUMP_FRAME") ? strtoull(getenv("FM2_DUMP_FRAME"), nullptr, 10) : 0;
     ++g_r.frame;
     static const bool dumpSecond = getenv("FM2_SKIP_VS") != nullptr;
-    const bool dump = fromResolve && dumpFrame && (g_r.frame == dumpFrame || (dumpSecond && g_r.frame == dumpFrame + 1));
+    static const uint64_t dumpEvery = getenv("FM2_DUMP_EVERY") ? strtoull(getenv("FM2_DUMP_EVERY"), nullptr, 10) : 0;
+    const bool dump = fromResolve && ((dumpFrame && (g_r.frame == dumpFrame || (dumpSecond && g_r.frame == dumpFrame + 1))) || (dumpEvery && g_r.frame % dumpEvery == 0));
     if (dump)
     {
         D3D12_TEXTURE_COPY_LOCATION dst{};
@@ -1525,7 +1769,16 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
         g_r.readback->Unmap(0, nullptr);
         for (size_t i = 3; i < rgba.size(); i += 4)
             rgba[i] = 255;
-        WritePng(g_r.frame == dumpFrame ? "frame.png" : "frame2.png", kWidth, kHeight, rgba);
+        static const uint64_t every = getenv("FM2_DUMP_EVERY") ? strtoull(getenv("FM2_DUMP_EVERY"), nullptr, 10) : 0;
+        if (every && g_r.frame % every == 0 && g_r.frame != dumpFrame)
+        {
+            char name[64];
+            std::filesystem::create_directories("out/frames");
+            snprintf(name, sizeof(name), "out/frames/%05llu.png", (unsigned long long)g_r.frame);
+            WritePng(name, kWidth, kHeight, rgba);
+        }
+        else
+            WritePng(g_r.frame == dumpFrame ? "frame.png" : "frame2.png", kWidth, kHeight, rgba);
         Log("renderer: wrote frame.png (frame %llu: %u draws, %u skipped)", (unsigned long long)frameNumber, g_r.drawsThisFrame,
             g_r.skippedThisFrame);
     }

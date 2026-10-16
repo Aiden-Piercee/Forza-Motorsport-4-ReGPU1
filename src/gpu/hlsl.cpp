@@ -15,6 +15,9 @@ cbuffer VSConstants : register(b0)
     uint4 vf[96];     // vertex fetch: x byte offset (gmem, or gphys if z), y endian
     uint4 vinfo;      // x index list byte offset, y position mode (0 clip, 1 screen) | 2 points, z/w target size
     float4 vpoint;    // xy constant point diameter (pixels), z/w min/max diameter
+    float4 vscale;    // PA_CL_VPORT_X/Y/ZSCALE
+    float4 voffset;   // PA_CL_VPORT_X/Y/ZOFFSET
+    uint4 vte;        // x PA_CL_VTE_CNTL
 };
 cbuffer PSConstants : register(b1)
 {
@@ -22,11 +25,12 @@ cbuffer PSConstants : register(b1)
     uint4 pb[2];
     uint4 pinfo;      // x alpha test function (7 = always), y generated-parameter register (0xFF none)
     float4 pinfo2;    // x alpha reference
-    uint4 tinfo[32];  // x sampler (0 lin wrap, 1 lin clamp, 2 point clamp, 3 point wrap), y/z size
+    uint4 tinfo[32];  // x sampler (0 lin wrap, 1 lin clamp, 2 point clamp, 3 point wrap), y/z size, w dimension (3 cube)
 };
 ByteAddressBuffer gmem : register(t0);
 ByteAddressBuffer gphys : register(t33);  // guest physical memory (large vertex buffers)
 Texture2D<float4> tex[32] : register(t1);
+TextureCube<float4> texc[32] : register(t34); // the same slots when the fetch constant is a cube
 SamplerState sLinearWrap : register(s0);
 SamplerState sLinearClamp : register(s1);
 SamplerState sPointClamp : register(s2);
@@ -134,8 +138,31 @@ float4 VFetch(uint fetch, float index, uint stride, uint offset, uint format, bo
     return Unpack(LoadGuest(fetch, d), LoadGuest(fetch, d + 1), LoadGuest(fetch, d + 2), LoadGuest(fetch, d + 3), format, isSigned, norm);
 }
 
-float4 TFetch(Texture2D<float4> t, uint slot, float2 uv, bool denorm, bool vertexStage)
+// Cube fetch coordinates are (s, t, face) as produced by the CUBE instruction
+// plus the usual 1.5 bias: s, t in [1, 2]. Back to a direction for the host.
+float3 CubeDirection(float3 stf)
 {
+    float sc = (stf.x - 1.5) * 2.0, tc = (stf.y - 1.5) * 2.0;
+    uint face = uint(round(stf.z));
+    switch (face)
+    {
+    case 0: return float3(1, -tc, -sc);
+    case 1: return float3(-1, -tc, sc);
+    case 2: return float3(sc, 1, tc);
+    case 3: return float3(sc, -1, -tc);
+    case 4: return float3(sc, -tc, 1);
+    default: return float3(-sc, -tc, -1);
+    }
+}
+
+float4 TFetch(Texture2D<float4> t, TextureCube<float4> tc, uint slot, float3 coord, bool denorm, bool vertexStage)
+{
+    if (tinfo[slot].w == 3)
+    {
+        float3 dir = CubeDirection(coord);
+        return vertexStage ? tc.SampleLevel(sLinearClamp, dir, 0) : tc.Sample(sLinearClamp, dir);
+    }
+    float2 uv = coord.xy;
     if (denorm) uv /= float2(max(tinfo[slot].yz, uint2(1, 1)));
     uint mode = tinfo[slot].x;
     if (vertexStage)
@@ -144,6 +171,17 @@ float4 TFetch(Texture2D<float4> t, uint slot, float2 uv, bool denorm, bool verte
     if (mode == 2) return t.Sample(sPointClamp, uv);
     if (mode == 3) return t.Sample(sPointWrap, uv);
     return t.Sample(sLinearWrap, uv);
+}
+
+float4 CubeOp(float4 a, float4 b)
+{
+    float3 v = float3(a.z, a.w, a.x);
+    float3 m = abs(v);
+    float sc, tc, ma, face;
+    if (m.z >= m.x && m.z >= m.y) { ma = v.z; face = v.z < 0 ? 5 : 4; sc = v.z < 0 ? -v.x : v.x; tc = -v.y; }
+    else if (m.y >= m.x) { ma = v.y; face = v.y < 0 ? 3 : 2; sc = v.x; tc = v.y < 0 ? -v.z : v.z; }
+    else { ma = v.x; face = v.x < 0 ? 1 : 0; sc = v.x < 0 ? v.z : -v.z; tc = -v.y; }
+    return float4(tc, sc, 2.0 * abs(ma), face);
 }
 
 bool BoolConstant(uint4 b[2], uint index) { return (b[index >> 7][(index >> 5) & 3] >> (index & 31)) & 1; }
@@ -240,7 +278,8 @@ struct Emitter
         case 15: return "dot(" + A + ", " + B + ").xxxx";
         case 16: return "dot((" + A + ").xyz, (" + B + ").xyz).xxxx";
         case 17: return "((" + A + ").x * (" + B + ").x + (" + A + ").y * (" + B + ").y + (" + C + ").x).xxxx";
-        case 18: return "float4(0, 0, 0, 0)"; // cube: not used by the frontend yet
+        case 18: // CUBE: operands are v.zzxy and v.yxzz; result (tc, sc, 2 * major axis, face)
+            return "CubeOp(" + A + ", " + B + ")";
         case 19: { std::string t = A; return "max(max(" + t + ".x, " + t + ".y), max(" + t + ".z, " + t + ".w)).xxxx"; }
         case 28: return "float4(1.0, (" + A + ").y * (" + B + ").y, (" + A + ").z, (" + B + ").w)";
         case 29: return "max(" + A + ", " + B + ")"; // MAXAv: a0 is set by the caller
@@ -423,16 +462,28 @@ struct Emitter
         else if (f.opcode == 1)
         {
             static const char comp[] = "xyzw";
-            const std::string uv = std::string("float2(r[") + std::to_string(f.src) + "]." + comp[f.srcSwizzle & 3] + ", r[" +
-                std::to_string(f.src) + "]." + comp[(f.srcSwizzle >> 2) & 3] + ")";
-            char call[256];
-            snprintf(call, sizeof(call), "TFetch(tex[%u], %u, %s, %s, %s)", f.constIndex, f.constIndex, uv.c_str(), f.denormalized ? "true" : "false",
+            const std::string reg = "r[" + std::to_string(f.src) + "].";
+            const std::string uv = "float3(" + reg + comp[f.srcSwizzle & 3] + ", " + reg + comp[(f.srcSwizzle >> 2) & 3] + ", " + reg +
+                comp[(f.srcSwizzle >> 4) & 3] + ")";
+            char call[320];
+            snprintf(call, sizeof(call), "TFetch(tex[%u], texc[%u], %u, %s, %s, %s)", f.constIndex, f.constIndex, f.constIndex, uv.c_str(), f.denormalized ? "true" : "false",
                 pixel ? "false" : "true");
             body = std::string("{ float4 t = ") + call + "; " + DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
             result.usedTextureSlots |= 1u << f.constIndex;
         }
+        else if (f.opcode == 18 && pixel)
+        {
+            // getGradients: screen-space derivatives of two source components,
+            // (ddx(a), ddy(a), ddx(b), ddy(b)). Vector-font shaders use it for
+            // anti-aliased curve edges.
+            static const char comp[] = "xyzw";
+            const std::string a = "r[" + std::to_string(f.src) + "]." + comp[f.srcSwizzle & 3];
+            const std::string b = "r[" + std::to_string(f.src) + "]." + comp[(f.srcSwizzle >> 2) & 3];
+            body = "{ float4 t = float4(ddx(" + a + "), ddy(" + a + "), ddx(" + b + "), ddy(" + b + ")); " +
+                DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
+        }
         else
-            body = DestSwizzleWrite(f.dest, f.destSwizzle, "float4(0, 0, 0, 0)"); // texture queries: not needed yet
+            body = DestSwizzleWrite(f.dest, f.destSwizzle, "float4(0, 0, 0, 0)"); // other texture queries
         if (f.predicated)
             body = std::string("if (") + (f.predCondition ? "p" : "!p") + ") { " + body + " }";
         Line(body);
@@ -618,11 +669,22 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    }\n"
              "    else\n        GuestVS(e, r.pos, r.o);\n"
              "    float2 size = float2(vinfo.zw);\n"
-             "    if (vinfo.y & 1u)\n    {\n"
-             "        // Screen-space positions: to clip space for the target size.\n"
-             "        r.pos.xy = float2(r.pos.x / r.pos.w / size.x * 2.0 - 1.0, 1.0 - r.pos.y / r.pos.w / size.y * 2.0) * r.pos.w;\n"
-             "    }\n"
-             "    r.pos.xy += float2(pointOffset.x / size.x * 2.0, -pointOffset.y / size.y * 2.0) * r.pos.w;\n"
+             "    // The Xenos viewport transform (PA_CL_VTE_CNTL): optional divide by w, then\n"
+             "    // per-axis scale and offset to screen pixels; back to D3D clip space after.\n"
+             "    float w = r.pos.w;\n"
+             "    // (VTX_W0_FMT set means w is the true W0, the normal case.)\n"
+             "    float3 p = r.pos.xyz;\n"
+             "    if (!(vte.x & (1u << 8))) p.xy /= w;\n"
+             "    if (!(vte.x & (1u << 9))) p.z /= w;\n"
+             "    if (vte.x & 1u) p.x *= vscale.x;\n"
+             "    if (vte.x & 2u) p.x += voffset.x;\n"
+             "    if (vte.x & 4u) p.y *= vscale.y;\n"
+             "    if (vte.x & 8u) p.y += voffset.y;\n"
+             "    if (vte.x & 16u) p.z *= vscale.z;\n"
+             "    if (vte.x & 32u) p.z += voffset.z;\n"
+             "    p.xy += pointOffset;\n"
+             "    if (vte.x & (1u << 8)) w = 1.0;\n"
+             "    r.pos = float4(float2(p.x / size.x * 2.0 - 1.0, 1.0 - p.y / size.y * 2.0) * w, p.z * w, w);\n"
              "    return r;\n}\n";
     }
     else
