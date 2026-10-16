@@ -1,5 +1,5 @@
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..bb4f869 100644
+index fa91527..a9c5ec5 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
 @@ -662,6 +662,14 @@ bool Recompiler::Recompile(
@@ -25,7 +25,36 @@ index fa91527..bb4f869 100644
          // no op
          break;
  
-@@ -980,6 +989,11 @@ bool Recompiler::Recompile(
+@@ -827,23 +836,24 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_DIVD:
+-        println("\t{}.s64 = {}.s64 / {}.s64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        // PowerPC divides never trap: zero divisors and overflow give an undefined result.
++        println("\t{}.s64 = ({}.s64 == 0 || ({}.s64 == INT64_MIN && {}.s64 == -1)) ? 0 : {}.s64 / {}.s64;", r(insn.operands[0]), r(insn.operands[2]), r(insn.operands[1]), r(insn.operands[2]), r(insn.operands[1]), r(insn.operands[2]));
+         break;
+ 
+     case PPC_INST_DIVDU:
+-        println("\t{}.u64 = {}.u64 / {}.u64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u64 = {}.u64 == 0 ? 0 : {}.u64 / {}.u64;", r(insn.operands[0]), r(insn.operands[2]), r(insn.operands[1]), r(insn.operands[2]));
+         if (strchr(insn.opcode->name, '.'))
+             println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+ 
+     case PPC_INST_DIVW:
+-        println("\t{}.s32 = {}.s32 / {}.s32;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.s32 = ({}.s32 == 0 || ({}.s32 == INT32_MIN && {}.s32 == -1)) ? 0 : {}.s32 / {}.s32;", r(insn.operands[0]), r(insn.operands[2]), r(insn.operands[1]), r(insn.operands[2]), r(insn.operands[1]), r(insn.operands[2]));
+         if (strchr(insn.opcode->name, '.'))
+             println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+ 
+     case PPC_INST_DIVWU:
+-        println("\t{}.u32 = {}.u32 / {}.u32;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u32 = {}.u32 == 0 ? 0 : {}.u32 / {}.u32;", r(insn.operands[0]), r(insn.operands[2]), r(insn.operands[1]), r(insn.operands[2]));
+         if (strchr(insn.opcode->name, '.'))
+             println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+@@ -980,6 +990,11 @@ bool Recompiler::Recompile(
          println("\t{}.f64 = double(float(-({}.f64 * {}.f64 - {}.f64)));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
          break;
  
@@ -37,7 +66,7 @@ index fa91527..bb4f869 100644
      case PPC_INST_FRES:
          printSetFlushMode(false);
          println("\t{}.f64 = float(1.0 / {}.f64);", f(insn.operands[0]), f(insn.operands[1]));
-@@ -1136,6 +1150,7 @@ bool Recompiler::Recompile(
+@@ -1136,6 +1151,7 @@ bool Recompiler::Recompile(
      case PPC_INST_LVEWX:
      case PPC_INST_LVEWX128:
      case PPC_INST_LVX:
@@ -45,7 +74,21 @@ index fa91527..bb4f869 100644
      case PPC_INST_LVX128:
          // NOTE: for endian swapping, we reverse the whole vector instead of individual elements.
          // this is accounted for in every instruction (eg. dp3 sums yzw instead of xyz)
-@@ -1305,6 +1320,16 @@ bool Recompiler::Recompile(
+@@ -1292,7 +1308,13 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_MTMSRD:
+         if (!config.skipMsr)
++        {
++            // Toggling MSR[EE] masks interrupts on the console; the runtime
++            // turns that into a global interrupt lock (PPC_MSR_CHANGED).
++            println("\t{{ const uint64_t oldMsr = ctx.msr;");
+             println("\tctx.msr = ({}.u32 & 0x8020) | (ctx.msr & ~0x8020);", r(insn.operands[0]));
++            println("\tPPC_MSR_CHANGED(ctx, oldMsr); }}");
++        }
+         break;
+ 
+     case PPC_INST_MTXER:
+@@ -1305,6 +1327,16 @@ bool Recompiler::Recompile(
          println("\t{}.s64 = (int64_t({}.s32) * int64_t({}.s32)) >> 32;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
          break;
  
@@ -62,7 +105,7 @@ index fa91527..bb4f869 100644
      case PPC_INST_MULHWU:
          println("\t{}.u64 = (uint64_t({}.u32) * uint64_t({}.u32)) >> 32;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
          if (strchr(insn.opcode->name, '.'))
-@@ -1634,6 +1659,7 @@ bool Recompiler::Recompile(
+@@ -1634,6 +1666,7 @@ bool Recompiler::Recompile(
          break;
  
      case PPC_INST_STVX:
@@ -70,7 +113,7 @@ index fa91527..bb4f869 100644
      case PPC_INST_STVX128:
          print("\tsimde_mm_store_si128((simde__m128i*)(base + ((");
          if (insn.operands[1] != 0)
-@@ -2088,6 +2114,7 @@ bool Recompiler::Recompile(
+@@ -2088,6 +2121,7 @@ bool Recompiler::Recompile(
          break;
  
      case PPC_INST_VSEL:
@@ -78,7 +121,7 @@ index fa91527..bb4f869 100644
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_or_si128(simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8))));", v(insn.operands[0]), v(insn.operands[3]), v(insn.operands[1]), v(insn.operands[3]), v(insn.operands[2]));
          break;
  
-@@ -2145,6 +2172,56 @@ bool Recompiler::Recompile(
+@@ -2145,6 +2179,56 @@ bool Recompiler::Recompile(
          break;
      }
  

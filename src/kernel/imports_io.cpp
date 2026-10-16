@@ -1,0 +1,628 @@
+// File system: guest paths map onto the extracted game folder (read-only)
+// and the user folder (cache, content packages).
+#include <algorithm>
+#include <filesystem>
+#include <unordered_map>
+
+#include <windows.h>
+
+#include "kernel/imports.h"
+#include "kernel/runtime.h"
+#include "kernel/vfs.h"
+
+namespace fs = std::filesystem;
+
+namespace
+{
+struct FileObject : KernelObject
+{
+    FileObject() : KernelObject(Kind::File) {}
+    ~FileObject() override
+    {
+        if (host != INVALID_HANDLE_VALUE)
+            ::CloseHandle(host);
+    }
+
+    HANDLE host = INVALID_HANDLE_VALUE;
+    fs::path path;
+    std::string guestPath;
+    bool directory = false;
+    uint64_t position = 0;
+
+    // NtQueryDirectoryFile state.
+    std::vector<fs::directory_entry> entries;
+    size_t nextEntry = 0;
+    bool listed = false;
+};
+
+std::mutex g_linkMutex;
+std::unordered_map<std::string, std::string> g_links; // lower-case "x:" -> target
+
+std::string Lower(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return char(tolower(c)); });
+    return s;
+}
+
+std::string StripPrefix(std::string path)
+{
+    for (const char* prefix : { "\\??\\", "\\\\?\\" })
+    {
+        if (path.rfind(prefix, 0) == 0)
+            path = path.substr(strlen(prefix));
+    }
+    return path;
+}
+
+uint64_t ToFileTime(const FILETIME& ft)
+{
+    return (uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+}
+
+struct HostInfo
+{
+    uint64_t creation = 0, access = 0, write = 0, size = 0;
+    uint32_t attributes = 0;
+};
+
+bool QueryHostInfo(const fs::path& path, HostInfo& info)
+{
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data))
+        return false;
+    info.creation = ToFileTime(data.ftCreationTime);
+    info.access = ToFileTime(data.ftLastAccessTime);
+    info.write = ToFileTime(data.ftLastWriteTime);
+    info.size = (uint64_t(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+    info.attributes = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 0x10 : 0x80; // DIRECTORY : NORMAL
+    if (data.dwFileAttributes & FILE_ATTRIBUTE_READONLY)
+        info.attributes |= 0x01;
+    return true;
+}
+
+void WriteNetworkOpenInfo(uint32_t out, const HostInfo& h)
+{
+    StoreBE64(out + 0x00, h.creation);
+    StoreBE64(out + 0x08, h.access);
+    StoreBE64(out + 0x10, h.write);
+    StoreBE64(out + 0x18, h.write);
+    StoreBE64(out + 0x20, (h.size + 0xFFF) & ~0xFFFull);
+    StoreBE64(out + 0x28, h.size);
+    StoreBE32(out + 0x30, h.attributes);
+    StoreBE32(out + 0x34, 0);
+}
+
+void SetIoStatus(uint32_t iosb, uint32_t status, uint32_t information)
+{
+    if (!iosb)
+        return;
+    StoreBE32(iosb, status);
+    StoreBE32(iosb + 4, information);
+}
+
+std::shared_ptr<FileObject> GetFile(uint32_t handle)
+{
+    auto object = GetHandle(handle);
+    if (!object || object->kind != KernelObject::Kind::File)
+        return nullptr;
+    return std::static_pointer_cast<FileObject>(object);
+}
+
+void SignalEventHandle(uint32_t handle)
+{
+    if (!handle)
+        return;
+    if (auto e = GetHandle(handle); e && e->kind == KernelObject::Kind::Event)
+    {
+        {
+            std::lock_guard lock(g_objectMutex);
+            static_cast<EventObject&>(*e).signaled = true;
+            SyncGuestSignalState(*e);
+        }
+        SignalObjectsChanged();
+    }
+}
+
+bool WildcardMatch(const char* pattern, const char* name)
+{
+    if (!*pattern)
+        return !*name;
+    if (*pattern == '*')
+        return WildcardMatch(pattern + 1, name) || (*name && WildcardMatch(pattern, name + 1));
+    if (*pattern == '?' || tolower(*pattern) == tolower(*name))
+        return *name && WildcardMatch(pattern + 1, name + 1);
+    return false;
+}
+}
+
+// Path mapping ------------------------------------------------------------------
+
+void VfsAddLink(const std::string& name, const std::string& target)
+{
+    std::lock_guard lock(g_linkMutex);
+    g_links[Lower(StripPrefix(name))] = StripPrefix(target);
+}
+
+void VfsRemoveLink(const std::string& name)
+{
+    std::lock_guard lock(g_linkMutex);
+    g_links.erase(Lower(StripPrefix(name)));
+}
+
+bool VfsResolve(std::string guest, fs::path& host, bool* readOnly)
+{
+    guest = StripPrefix(guest);
+    std::replace(guest.begin(), guest.end(), '/', '\\');
+
+    // Symbolic links ("game:" -> "\Device\Cdrom0"), possibly chained.
+    for (int depth = 0; depth < 4; depth++)
+    {
+        const size_t colon = guest.find(':');
+        if (colon == std::string::npos)
+            break;
+        std::lock_guard lock(g_linkMutex);
+        auto it = g_links.find(Lower(guest.substr(0, colon + 1)));
+        if (it == g_links.end())
+            break;
+        guest = it->second + "\\" + guest.substr(colon + 1);
+    }
+
+    // A bare relative path ("UIFrontEnd.fsb") is relative to the title's
+    // working directory, the root of the disc.
+    if (guest.find(':') == std::string::npos && (guest.empty() || guest.front() != '\\'))
+        guest = "game:\\" + guest;
+
+    std::string rest;
+    fs::path root;
+    bool ro = false;
+    const std::string lower = Lower(guest);
+    auto match = [&](const char* prefix, const fs::path& dir, bool isReadOnly) {
+        if (lower.rfind(prefix, 0) != 0)
+            return false;
+        root = dir;
+        rest = guest.substr(strlen(prefix));
+        ro = isReadOnly;
+        return true;
+    };
+    if (!(match("\\device\\cdrom0", GameDir(), true) || match("game:", GameDir(), true) || match("d:", GameDir(), true) ||
+            match("\\device\\harddisk0\\partition1", UserDir() / "hdd", false) ||
+            match("\\device\\harddisk0\\partition0", UserDir() / "hdd", false) ||
+            match("\\device\\harddisk0\\cache0", UserDir() / "cache", false) ||
+            match("\\device\\harddisk0\\cache1", UserDir() / "cache", false) || match("cache:", UserDir() / "cache", false) ||
+            match("\\device\\content", UserDir() / "content", false)))
+        return false;
+
+    while (!rest.empty() && rest.front() == '\\')
+        rest.erase(rest.begin());
+    host = rest.empty() ? root : root / fs::path(rest);
+    if (readOnly)
+        *readOnly = ro;
+    return true;
+}
+
+// Imports ---------------------------------------------------------------------
+
+GUEST_EXPORT(ObCreateSymbolicLink)
+{
+    // (name ANSI_STRING*, target ANSI_STRING*)
+    const std::string name = GuestAnsiString(ctx.r3.u32), target = GuestAnsiString(ctx.r4.u32);
+    Log("vfs: link %s -> %s", name.c_str(), target.c_str());
+    VfsAddLink(name, target);
+    Return(ctx, X_STATUS_SUCCESS);
+}
+
+GUEST_EXPORT(ObDeleteSymbolicLink)
+{
+    VfsRemoveLink(GuestAnsiString(ctx.r3.u32));
+    Return(ctx, X_STATUS_SUCCESS);
+}
+
+namespace
+{
+uint32_t OpenFile(uint32_t handleOut, uint32_t access, uint32_t attributes, uint32_t iosb, uint32_t disposition, uint32_t options)
+{
+    uint32_t root = 0;
+    std::string guest = ObjectAttributesName(attributes, &root);
+    if (root)
+    {
+        if (auto parent = GetFile(root))
+            guest = parent->guestPath + "\\" + guest;
+    }
+
+    fs::path host;
+    bool readOnly = false;
+    if (!VfsResolve(guest, host, &readOnly))
+    {
+        Log("vfs: no mapping for \"%s\"", guest.c_str());
+        SetIoStatus(iosb, X_STATUS_OBJECT_PATH_NOT_FOUND, 5);
+        return X_STATUS_OBJECT_PATH_NOT_FOUND;
+    }
+
+    const bool wantDirectory = options & 0x1;   // FILE_DIRECTORY_FILE
+    const bool wantFile = options & 0x40;       // FILE_NON_DIRECTORY_FILE
+    std::error_code ec;
+    const bool exists = fs::exists(host, ec);
+    const bool isDirectory = exists && fs::is_directory(host, ec);
+
+    if (exists && ((wantDirectory && !isDirectory) || (wantFile && isDirectory)))
+    {
+        SetIoStatus(iosb, X_STATUS_ACCESS_DENIED, 0);
+        return X_STATUS_ACCESS_DENIED;
+    }
+
+    // Dispositions: 0 supersede, 1 open, 2 create, 3 open-if, 4 overwrite, 5 overwrite-if.
+    uint32_t information = 1; // FILE_OPENED
+    if (!exists)
+    {
+        if (disposition == 1 || disposition == 4)
+        {
+            SetIoStatus(iosb, X_STATUS_OBJECT_NAME_NOT_FOUND, 5);
+            return X_STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+        if (readOnly)
+        {
+            SetIoStatus(iosb, X_STATUS_ACCESS_DENIED, 0);
+            return X_STATUS_ACCESS_DENIED;
+        }
+        if (wantDirectory)
+            fs::create_directories(host, ec);
+        else
+            fs::create_directories(host.parent_path(), ec);
+        information = 2; // FILE_CREATED
+    }
+    else if (disposition == 2)
+    {
+        SetIoStatus(iosb, X_STATUS_OBJECT_NAME_COLLISION, 4);
+        return X_STATUS_OBJECT_NAME_COLLISION;
+    }
+
+    auto file = std::make_shared<FileObject>();
+    file->path = host;
+    file->guestPath = guest;
+    file->directory = wantDirectory || isDirectory;
+
+    if (!file->directory)
+    {
+        const bool write = !readOnly && (access & (0x40000000 | 0x2 | 0x4 | 0x10000000)); // GENERIC_WRITE, WRITE_DATA, APPEND_DATA, GENERIC_ALL
+        DWORD create = OPEN_EXISTING;
+        if (!exists)
+            create = CREATE_NEW;
+        else if (!readOnly && (disposition == 0 || disposition == 4 || disposition == 5))
+        {
+            create = TRUNCATE_EXISTING;
+            information = disposition == 0 ? 0 : 3;
+        }
+        file->host = CreateFileW(host.c_str(), GENERIC_READ | (write || create != OPEN_EXISTING ? GENERIC_WRITE : 0),
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, create, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file->host == INVALID_HANDLE_VALUE)
+        {
+            Log("vfs: CreateFile %s failed (%lu)", host.string().c_str(), GetLastError());
+            SetIoStatus(iosb, X_STATUS_ACCESS_DENIED, 0);
+            return X_STATUS_ACCESS_DENIED;
+        }
+    }
+
+    StoreBE32(handleOut, CreateHandle(file));
+    SetIoStatus(iosb, X_STATUS_SUCCESS, information);
+    return X_STATUS_SUCCESS;
+}
+}
+
+GUEST_EXPORT(NtCreateFile)
+{
+    // (handle*, access, attributes*, iosb*, allocationSize*, fileAttributes, share, disposition, options)
+    Return(ctx, OpenFile(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r10.u32, StackArg(ctx, 8)));
+}
+
+GUEST_EXPORT(NtOpenFile)
+{
+    // (handle*, access, attributes*, iosb*, share, options)
+    Return(ctx, OpenFile(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, 1, ctx.r8.u32));
+}
+
+GUEST_EXPORT(NtReadFile)
+{
+    // (handle, event, apcRoutine, apcContext, iosb*, buffer, length, byteOffset*)
+    auto file = GetFile(ctx.r3.u32);
+    const uint32_t iosb = ctx.r7.u32, buffer = ctx.r8.u32, length = ctx.r9.u32, offsetPtr = ctx.r10.u32;
+    if (!file || file->directory)
+    {
+        Return(ctx, X_STATUS_INVALID_HANDLE);
+        return;
+    }
+    if (ctx.r5.u32)
+        LOG_ONCE("NtReadFile with an APC routine is not supported");
+
+    uint64_t offset = file->position;
+    if (offsetPtr)
+    {
+        const int64_t requested = int64_t(LoadBE64(offsetPtr));
+        if (requested >= 0)
+            offset = uint64_t(requested);
+    }
+    OVERLAPPED ov{};
+    ov.Offset = DWORD(offset);
+    ov.OffsetHigh = DWORD(offset >> 32);
+    DWORD read = 0;
+    const BOOL ok = ReadFile(file->host, GuestPtr(buffer), length, &read, &ov);
+    file->position = offset + read;
+
+    uint32_t status = X_STATUS_SUCCESS;
+    if (!ok && GetLastError() != ERROR_HANDLE_EOF)
+        status = X_STATUS_UNSUCCESSFUL;
+    else if (read == 0 && length != 0)
+        status = X_STATUS_END_OF_FILE;
+    SetIoStatus(iosb, status, read);
+    SignalEventHandle(ctx.r4.u32);
+    Return(ctx, status);
+}
+
+GUEST_EXPORT(NtWriteFile)
+{
+    // (handle, event, apcRoutine, apcContext, iosb*, buffer, length, byteOffset*)
+    auto file = GetFile(ctx.r3.u32);
+    const uint32_t iosb = ctx.r7.u32, buffer = ctx.r8.u32, length = ctx.r9.u32, offsetPtr = ctx.r10.u32;
+    if (!file || file->directory)
+    {
+        Return(ctx, X_STATUS_INVALID_HANDLE);
+        return;
+    }
+    uint64_t offset = file->position;
+    if (offsetPtr)
+    {
+        const int64_t requested = int64_t(LoadBE64(offsetPtr));
+        if (requested >= 0)
+            offset = uint64_t(requested);
+    }
+    OVERLAPPED ov{};
+    ov.Offset = DWORD(offset);
+    ov.OffsetHigh = DWORD(offset >> 32);
+    DWORD written = 0;
+    const BOOL ok = WriteFile(file->host, GuestPtr(buffer), length, &written, &ov);
+    file->position = offset + written;
+    const uint32_t status = ok ? X_STATUS_SUCCESS : X_STATUS_ACCESS_DENIED;
+    SetIoStatus(iosb, status, written);
+    SignalEventHandle(ctx.r4.u32);
+    Return(ctx, status);
+}
+
+GUEST_EXPORT(NtQueryInformationFile)
+{
+    // (handle, iosb*, info*, length, class)
+    auto file = GetFile(ctx.r3.u32);
+    const uint32_t iosb = ctx.r4.u32, info = ctx.r5.u32, cls = ctx.r7.u32;
+    if (!file)
+    {
+        Return(ctx, X_STATUS_INVALID_HANDLE);
+        return;
+    }
+    HostInfo h;
+    QueryHostInfo(file->path, h);
+    uint32_t written = 0;
+    switch (cls)
+    {
+    case 4: // FileBasicInformation
+        StoreBE64(info + 0x00, h.creation);
+        StoreBE64(info + 0x08, h.access);
+        StoreBE64(info + 0x10, h.write);
+        StoreBE64(info + 0x18, h.write);
+        StoreBE32(info + 0x20, h.attributes);
+        StoreBE32(info + 0x24, 0);
+        written = 0x28;
+        break;
+    case 5: // FileStandardInformation
+        StoreBE64(info + 0x00, (h.size + 0xFFF) & ~0xFFFull);
+        StoreBE64(info + 0x08, h.size);
+        StoreBE32(info + 0x10, 1);
+        *GuestPtr<uint8_t>(info + 0x14) = 0;
+        *GuestPtr<uint8_t>(info + 0x15) = file->directory;
+        written = 0x18;
+        break;
+    case 14: // FilePositionInformation
+        StoreBE64(info, file->position);
+        written = 8;
+        break;
+    case 20: // FileEndOfFileInformation
+        StoreBE64(info, h.size);
+        written = 8;
+        break;
+    case 34: // FileNetworkOpenInformation
+        WriteNetworkOpenInfo(info, h);
+        written = 0x38;
+        break;
+    default:
+        Log("NtQueryInformationFile: class %u not supported", cls);
+        SetIoStatus(iosb, X_STATUS_NOT_IMPLEMENTED, 0);
+        Return(ctx, X_STATUS_NOT_IMPLEMENTED);
+        return;
+    }
+    SetIoStatus(iosb, X_STATUS_SUCCESS, written);
+    Return(ctx, X_STATUS_SUCCESS);
+}
+
+GUEST_EXPORT(NtSetInformationFile)
+{
+    // (handle, iosb*, info*, length, class)
+    auto file = GetFile(ctx.r3.u32);
+    const uint32_t iosb = ctx.r4.u32, info = ctx.r5.u32, cls = ctx.r7.u32;
+    if (!file)
+    {
+        Return(ctx, X_STATUS_INVALID_HANDLE);
+        return;
+    }
+    uint32_t status = X_STATUS_SUCCESS;
+    switch (cls)
+    {
+    case 14: // FilePositionInformation
+        file->position = LoadBE64(info);
+        break;
+    case 19: // FileAllocationInformation
+    case 20: // FileEndOfFileInformation
+    {
+        LARGE_INTEGER size;
+        size.QuadPart = int64_t(LoadBE64(info));
+        if (!SetFileInformationByHandle(file->host, FileEndOfFileInfo, &size, sizeof(size)))
+            status = X_STATUS_ACCESS_DENIED;
+        break;
+    }
+    case 4:  // FileBasicInformation: times/attributes, ignored
+        break;
+    case 13: // FileDispositionInformation
+        if (*GuestPtr<uint8_t>(info))
+        {
+            ::CloseHandle(file->host);
+            file->host = INVALID_HANDLE_VALUE;
+            std::error_code ec;
+            fs::remove(file->path, ec);
+        }
+        break;
+    default:
+        Log("NtSetInformationFile: class %u not supported", cls);
+        status = X_STATUS_NOT_IMPLEMENTED;
+        break;
+    }
+    SetIoStatus(iosb, status, 0);
+    Return(ctx, status);
+}
+
+GUEST_EXPORT(NtQueryFullAttributesFile)
+{
+    // (attributes*, FILE_NETWORK_OPEN_INFORMATION*)
+    uint32_t root = 0;
+    std::string guest = ObjectAttributesName(ctx.r3.u32, &root);
+    if (root)
+    {
+        if (auto parent = GetFile(root))
+            guest = parent->guestPath + "\\" + guest;
+    }
+    fs::path host;
+    HostInfo h;
+    if (!VfsResolve(guest, host, nullptr) || !QueryHostInfo(host, h))
+    {
+        Return(ctx, X_STATUS_OBJECT_NAME_NOT_FOUND);
+        return;
+    }
+    WriteNetworkOpenInfo(ctx.r4.u32, h);
+    Return(ctx, X_STATUS_SUCCESS);
+}
+
+GUEST_EXPORT(NtQueryDirectoryFile)
+{
+    // (handle, event, apcRoutine, apcContext, iosb*, info*, length, class, mask ANSI_STRING*, restartScan)
+    auto file = GetFile(ctx.r3.u32);
+    const uint32_t iosb = ctx.r7.u32, info = ctx.r8.u32, length = ctx.r9.u32;
+    const uint32_t mask = StackArg(ctx, 9), restart = StackArg(ctx, 10);
+    if (!file || !file->directory)
+    {
+        Return(ctx, X_STATUS_INVALID_HANDLE);
+        return;
+    }
+    if (!file->listed || restart)
+    {
+        const std::string pattern = mask ? GuestAnsiString(mask) : "*";
+        file->entries.clear();
+        std::error_code ec;
+        for (auto& e : fs::directory_iterator(file->path, ec))
+        {
+            if (WildcardMatch(pattern.c_str(), e.path().filename().string().c_str()))
+                file->entries.push_back(e);
+        }
+        file->nextEntry = 0;
+        file->listed = true;
+    }
+    if (file->nextEntry >= file->entries.size())
+    {
+        SetIoStatus(iosb, X_STATUS_NO_MORE_FILES, 0);
+        Return(ctx, X_STATUS_NO_MORE_FILES);
+        return;
+    }
+
+    // FILE_DIRECTORY_INFORMATION with an ANSI name; one entry per call.
+    const auto& e = file->entries[file->nextEntry];
+    const std::string name = e.path().filename().string();
+    const uint32_t size = uint32_t(0x40 + name.size());
+    if (size > length)
+    {
+        SetIoStatus(iosb, X_STATUS_BUFFER_OVERFLOW, 0);
+        Return(ctx, X_STATUS_BUFFER_OVERFLOW);
+        return;
+    }
+    file->nextEntry++;
+    HostInfo h;
+    QueryHostInfo(e.path(), h);
+    StoreBE32(info + 0x00, 0);
+    StoreBE32(info + 0x04, uint32_t(file->nextEntry));
+    StoreBE64(info + 0x08, h.creation);
+    StoreBE64(info + 0x10, h.access);
+    StoreBE64(info + 0x18, h.write);
+    StoreBE64(info + 0x20, h.write);
+    StoreBE64(info + 0x28, h.size);
+    StoreBE64(info + 0x30, (h.size + 0xFFF) & ~0xFFFull);
+    StoreBE32(info + 0x38, h.attributes);
+    StoreBE32(info + 0x3C, uint32_t(name.size()));
+    memcpy(GuestPtr(info + 0x40), name.data(), name.size());
+    SetIoStatus(iosb, X_STATUS_SUCCESS, size);
+    SignalEventHandle(ctx.r4.u32);
+    Return(ctx, X_STATUS_SUCCESS);
+}
+
+GUEST_EXPORT(NtQueryVolumeInformationFile)
+{
+    // (handle, iosb*, info*, length, class)
+    const uint32_t iosb = ctx.r4.u32, info = ctx.r5.u32, cls = ctx.r7.u32;
+    uint32_t written = 0;
+    switch (cls)
+    {
+    case 1: // FileFsVolumeInformation
+        StoreBE64(info + 0x00, 0);
+        StoreBE32(info + 0x08, 0x12345678);
+        StoreBE32(info + 0x0C, 0);
+        *GuestPtr<uint8_t>(info + 0x10) = 0;
+        written = 0x14;
+        break;
+    case 3: // FileFsSizeInformation: plenty of space
+        StoreBE64(info + 0x00, 0x100000);
+        StoreBE64(info + 0x08, 0x80000);
+        StoreBE32(info + 0x10, 32);
+        StoreBE32(info + 0x14, 512);
+        written = 0x18;
+        break;
+    case 5: // FileFsAttributeInformation
+        StoreBE32(info + 0x00, 0);
+        StoreBE32(info + 0x04, 255);
+        StoreBE32(info + 0x08, 4);
+        memcpy(GuestPtr(info + 0x0C), "FATX", 4);
+        written = 0x10;
+        break;
+    default:
+        Log("NtQueryVolumeInformationFile: class %u not supported", cls);
+        SetIoStatus(iosb, X_STATUS_NOT_IMPLEMENTED, 0);
+        Return(ctx, X_STATUS_NOT_IMPLEMENTED);
+        return;
+    }
+    SetIoStatus(iosb, X_STATUS_SUCCESS, written);
+    Return(ctx, X_STATUS_SUCCESS);
+}
+
+GUEST_EXPORT(NtFlushBuffersFile)
+{
+    if (auto file = GetFile(ctx.r3.u32); file && file->host != INVALID_HANDLE_VALUE)
+        FlushFileBuffers(file->host);
+    Return(ctx, X_STATUS_SUCCESS);
+}
+
+GUEST_EXPORT(NtDeviceIoControlFile)
+{
+    LOG_ONCE("NtDeviceIoControlFile(code %08X) not supported", ctx.r6.u32);
+    Return(ctx, X_STATUS_NOT_SUPPORTED);
+}
+
+GUEST_EXPORT(IoDismountVolumeByFileHandle)
+{
+    Return(ctx, X_STATUS_SUCCESS);
+}
+
+GUEST_EXPORT(FscSetCacheElementCount)
+{
+    Return(ctx, X_STATUS_SUCCESS);
+}

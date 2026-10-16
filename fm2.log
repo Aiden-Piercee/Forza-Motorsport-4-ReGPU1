@@ -1,0 +1,60 @@
+[   0.0009] fm2: game folder F:\fm2\game
+[   0.2159] loader: 51036 recompiled functions mapped
+[   0.2160] loader: game\default.xex title 4D5307EA entry 8240D650 stack 0x10000 tls 64 slots + 0x180c bytes @82A79200
+[   0.2813] runtime: TSC 3792.800 MHz, user data in C:\Users\scott\Documents\fm2
+[   0.2816] thread 1 created: main 8240D650 param 00000000
+[   0.2868] thread 2 created: entry 82463300 param 40163000 (suspended)
+[   0.2882] XexGetModuleHandle("xam.xex"): module not available
+[   0.2882] XexGetModuleHandle("xam.xex"): module not available
+[   0.2883] XexGetModuleHandle("xboxkrnl.exe"): module not available
+[   0.2883] XexGetModuleHandle("xboxkrnl.exe"): module not available
+[   0.2883] XexGetModuleHandle("xboxkrnl.exe"): module not available
+[   0.2883] XexGetModuleHandle("xboxkrnl.exe"): module not available
+[   0.2883] XexGetModuleHandle("xboxkrnl.exe"): module not available
+[   0.2883] XexGetModuleHandle("xboxkrnl.exe"): module not available
+[   0.2883] XexGetModuleHandle("xboxkrnl.exe"): module not available
+[   0.2883] XexGetModuleHandle("xboxkrnl.exe"): module not available
+[   0.2903] ExGetXConfigSetting: unknown setting 0003/0001, returning 0
+[   0.2920] thread 3 created: entry 82266490 param 00000000 (suspended)
+[   0.3352] thread 4 created: entry 824A4FF8 param 00000000 (suspended)
+[   0.3353] thread 5 created: entry 824A5098 param 00000000 (suspended)
+[   0.3354] thread 6 created: entry 824A5138 param 00000000 (suspended)
+[   0.3356] thread 7 created: entry 82289640 param 4007C170 (suspended)
+[   0.4409] gpu: interrupt callback 82371FD8 data 400AD100
+[   0.4411] thread 8 created: gpu interrupts 00000000 param 00000000
+[   0.4411] gpu: ring buffer at B01712C0, 8192 dwords
+[   0.4411] gpu: rptr writeback at B627003C (from 1627003C), block log2 6
+[   0.4412] thread 9 created: entry 82381D60 param 400AFCF8
+[   0.4509] gpu: VdSwap #1
+[   0.4510] gpu: VdSwap #2
+[   0.4514] thread 10 created: entry 823E8250 param 00000000 (suspended)
+[   0.4515] thread 11 created: audio driver 00000000 param 00000000
+[   0.4517] thread 12 created: entry 8268A5F0 param 4255F038 (suspended)
+[   0.4521] thread 13 created: entry 8268A5F0 param 4255EEC0 (suspended)
+[   0.4527] thread 14 created: entry 8268A5F0 param 82A11448 (suspended)
+[   0.4618] thread 15 created: entry 8268A5F0 param 402037EC (suspended)
+[   0.4619] unimplemented import XMADisableContext (lr 82692B24)
+[   0.4619] unimplemented import XMAInitializeContext (lr 82692C8C)
+[   0.4619] unimplemented import XMASetOutputBufferValid (lr 82692C98)
+[   0.4619] unimplemented import XMAEnableContext (lr 82692CA4)
+[   0.4619] unimplemented import XMAIsInputBuffer0Valid (lr 82692D00)
+[   0.4619] unimplemented import XMASetInputBuffer0Valid (lr 82692DB0)
+[   0.4619] unimplemented import XMAIsInputBuffer1Valid (lr 82692DBC)
+[   0.4619] unimplemented import XMASetInputBuffer1Valid (lr 82692E34)
+[   0.4619] unimplemented import XMAGetInputBufferReadOffset (lr 82692E74)
+[   0.4619] unimplemented import XMAGetOutputBufferReadOffset (lr 82692E84)
+[   0.4619] unimplemented import XMAGetOutputBufferWriteOffset (lr 82692E94)
+[   0.4620] unimplemented import XMAIsOutputBufferValid (lr 82692EA4)
+[   0.4620] unimplemented import XMASetOutputBufferReadOffset (lr 82692ED0)
+[   0.4628] thread 16 created: entry 82441178 param 426EF480
+[   0.4630] thread 17 created: entry 82581AD8 param 40178850 (suspended)
+[   0.4733] thread 18 created: entry 82953FC0 param AC509D60 (suspended)
+[   0.4859] thread 19 created: entry 82953FC0 param ADCA43C0 (suspended)
+[   0.4924] gpu: VdSwap #4
+[   0.5354] gpu: VdSwap #8
+[   0.6677] gpu: VdSwap #16
+[   0.9346] gpu: VdSwap #32
+[   1.1959] thread 20 created: entry 824637E0 param 40174300 (suspended)
+[   1.2308] thread 21 created: entry 825890F8 param 82A00CF8 (suspended)
+[   1.2315] unimplemented import NetDll_XNetInAddrToString (lr 82783A20)
+[   1.4677] gpu: VdSwap #64
