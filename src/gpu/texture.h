@@ -17,6 +17,11 @@ struct TextureFetch
     uint32_t Height() const { return ((dwords[2] >> 13) & 0x1FFF) + 1; }
     uint32_t Swizzle() const { return (dwords[3] >> 1) & 0xFFF; }
     uint32_t Dimension() const { return (dwords[5] >> 9) & 3; } // 1 = 2D
+    int32_t ExpAdjust() const { return int32_t(dwords[3] << 13) >> 26; } // texels scaled by 2^n
+    uint32_t MipMinLevel() const { return (dwords[4] >> 2) & 15; }
+    uint32_t MipMaxLevel() const { return (dwords[4] >> 6) & 15; }
+    float LodBias() const { return float(int32_t(dwords[4] << 10) >> 22) / 32.0f; }
+    uint32_t MipAddress() const { return dwords[5] & 0xFFFFF000; } // physical, levels 1+
 };
 
 TextureFetch ReadTextureFetch(uint32_t slot);

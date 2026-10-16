@@ -171,6 +171,7 @@ struct Renderer
     std::unordered_map<std::string, ComPtr<ID3D12PipelineState>> pipelines;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, CachedTexture> textures;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, CachedTexture> cubes;
+    std::unordered_map<uint32_t, CachedTexture> mipChains; // resolved textures with their mips, by base
     std::unordered_map<uint32_t, ResolvedTexture> resolved; // by physical address
 
     // Active shaders: the last microcode loaded per stage.
@@ -1022,6 +1023,86 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
     return cached.resource.Get();
 }
 
+// A render target the title resolved together with its mip chain (it
+// downsamples and resolves each level itself): levels 1+ follow each other
+// from the fetch constant's mip address, each padded to 32x32 texels and
+// 4 KB. Assembled into one mipmapped host texture every frame it is used.
+ID3D12Resource* ResolvedMipChain(const TextureFetch& fetch, const ResolvedTexture& level0)
+{
+    const uint32_t w = std::min(fetch.Width(), level0.width), h = std::min(fetch.Height(), level0.height);
+    const UINT bpp = level0.format == DXGI_FORMAT_R8G8B8A8_UNORM ? 4 : 8;
+    std::vector<const ResolvedTexture*> levels{ &level0 };
+    uint32_t address = fetch.MipAddress();
+    for (uint32_t i = 1; i <= fetch.MipMaxLevel() && (w >> i || h >> i); i++)
+    {
+        const uint32_t lw = std::max(w >> i, 1u), lh = std::max(h >> i, 1u);
+        auto it = g_r.resolved.find(address & 0x1FFFFFFF);
+        if (it == g_r.resolved.end() || it->second.format != level0.format || it->second.width < lw || it->second.height < lh)
+            break;
+        levels.push_back(&it->second);
+        const uint32_t bytes = ((lw + 31) & ~31u) * ((lh + 31) & ~31u) * bpp;
+        address += std::max((bytes + 4095) & ~4095u, 4096u);
+    }
+    if (levels.size() < 2)
+        return nullptr;
+
+    auto& chain = g_r.mipChains[fetch.Address()];
+    if (chain.resource && chain.checkedFrame == g_r.frame)
+        return chain.resource.Get();
+    chain.checkedFrame = g_r.frame;
+    const UINT count = UINT(levels.size());
+    if (!chain.resource || chain.width != w || chain.height != h || chain.format != level0.format ||
+        chain.resource->GetDesc().MipLevels != count)
+    {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = w;
+        td.Height = h;
+        td.DepthOrArraySize = 1;
+        td.MipLevels = UINT16(count);
+        td.SampleDesc.Count = 1;
+        td.Format = level0.format;
+        if (chain.resource)
+            Frame().garbage.push_back(std::move(chain.resource));
+        Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                  IID_PPV_ARGS(&chain.resource)),
+            "CreateCommittedResource(mip chain)");
+        chain.width = w;
+        chain.height = h;
+        chain.format = level0.format;
+    }
+    std::vector<D3D12_RESOURCE_BARRIER> b(count + 1);
+    for (UINT i = 0; i <= count; i++)
+    {
+        b[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[i].Transition.pResource = i < count ? levels[i]->resource.Get() : chain.resource.Get();
+        b[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b[i].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        b[i].Transition.StateAfter = i < count ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    // Several levels can share one host texture only if the title resolved
+    // them to the same address, which it does not; still, transition each once.
+    g_r.list->ResourceBarrier(UINT(b.size()), b.data());
+    for (UINT i = 0; i < count; i++)
+    {
+        D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+        dst.pResource = chain.resource.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = i;
+        src.pResource = levels[i]->resource.Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        const D3D12_BOX box{ 0, 0, 0, std::max(w >> i, 1u), std::max(h >> i, 1u), 1 };
+        g_r.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    }
+    for (auto& x : b)
+        std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+    g_r.list->ResourceBarrier(UINT(b.size()), b.data());
+    return chain.resource.Get();
+}
+
 // Decodes (if changed) and uploads a texture; returns its resource.
 ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
 {
@@ -1029,6 +1110,9 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
     if (auto it = g_r.resolved.find(fetch.Address()); it != g_r.resolved.end())
     {
         format = it->second.format;
+        if (fetch.MipMaxLevel() > 0 && fetch.MipAddress())
+            if (ID3D12Resource* chain = ResolvedMipChain(fetch, it->second))
+                return chain;
         return it->second.resource.Get();
     }
     if (fetch.Type() != 2 || fetch.Dimension() != 1 || !TextureFormatSupported(fetch.Format()))
@@ -1556,6 +1640,7 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         uint32_t info[4];
         float info2[4];
         uint32_t tinfo[32][4];
+        float tbias[32][4];
     };
     const UINT64 vsOffset = RingAlloc(sizeof(VSConstants)), psOffset = RingAlloc(sizeof(PSConstants));
     if (vsOffset == ~0ull || psOffset == ~0ull)
@@ -1647,6 +1732,7 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     else
         g_r.device->CopyDescriptorsSimple(1, Cpu(g_r.srvHeap.Get(), table + 33, g_r.srvStride), Cpu(g_r.stagingHeap.Get(), 0, g_r.srvStride), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     memset(pc->tinfo, 0, sizeof(pc->tinfo));
+    memset(pc->tbias, 0, sizeof(pc->tbias));
     for (uint32_t slot = 0; slot < 32; slot++)
     {
         const auto dest = Cpu(g_r.srvHeap.Get(), table + 1 + slot, g_r.srvStride);
@@ -1699,13 +1785,14 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         else
         {
             srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            srv.Texture2D.MipLevels = 1;
+            srv.Texture2D.MipLevels = UINT(-1); // all levels (resolved mip chains)
         }
         g_r.device->CreateShaderResourceView(texture, &srv, cube ? destCube : dest);
         // Clamp X (dword 0 bits 10-12): 0 wrap, else clamp. Filter: dword 3 bits 19-20 (mag): 0 point.
         const bool clamp = ((fetch.dwords[0] >> 10) & 7) != 0;
         const bool point = ((fetch.dwords[3] >> 19) & 3) == 0;
-        pc->tinfo[slot][0] = point ? (clamp ? 2 : 3) : (clamp ? 1 : 0);
+        pc->tinfo[slot][0] = (point ? (clamp ? 2 : 3) : (clamp ? 1 : 0)) | ((uint32_t(fetch.ExpAdjust()) & 0x3F) << 8);
+        pc->tbias[slot][0] = fetch.LodBias();
         pc->tinfo[slot][1] = fetch.Width();
         pc->tinfo[slot][2] = fetch.Height();
     }

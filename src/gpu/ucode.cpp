@@ -215,6 +215,7 @@ Fetch DecodeFetch(const uint32_t* w)
         f.denormalized = Bits(w[0], 25, 1);
         f.srcSwizzle = Bits(w[0], 26, 6);
         f.dimension = Bits(w[2], 14, 2);
+        f.lodBias = float(int32_t(Bits(w[2], 2, 7) << 25) >> 25) / 16.0f;
     }
     return f;
 }

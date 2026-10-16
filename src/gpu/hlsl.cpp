@@ -26,6 +26,7 @@ cbuffer PSConstants : register(b1)
     uint4 pinfo;      // x alpha test function (7 = always), y generated-parameter register (0xFF none)
     float4 pinfo2;    // x alpha reference
     uint4 tinfo[32];  // x sampler (0 lin wrap, 1 lin clamp, 2 point clamp, 3 point wrap), y/z size, w dimension (3 cube)
+    float4 tbias[32]; // x fetch-constant LOD bias
 };
 ByteAddressBuffer gmem : register(t0);
 ByteAddressBuffer gphys : register(t33);  // guest physical memory (large vertex buffers)
@@ -155,13 +156,16 @@ float3 CubeDirection(float3 stf)
     }
 }
 
-float4 TFetchRaw(Texture2D<float4> t, TextureCube<float4> tc, uint slot, float3 coord, bool denorm, bool vertexStage);
+float4 TFetchRaw(Texture2D<float4> t, TextureCube<float4> tc, uint slot, float3 coord, bool denorm, bool vertexStage, float bias);
 
 // Fetch swizzle (3 bits per channel: 0-3 component, 4 zero, 5 one) for
 // textures that live on the GPU; CPU-decoded textures are swizzled already.
-float4 TFetch(Texture2D<float4> t, TextureCube<float4> tc, uint slot, float3 coord, bool denorm, bool vertexStage)
+float4 TFetch(Texture2D<float4> t, TextureCube<float4> tc, uint slot, float3 coord, bool denorm, bool vertexStage, float bias)
 {
-    float4 v = TFetchRaw(t, tc, slot, coord, denorm, vertexStage);
+    float4 v = TFetchRaw(t, tc, slot, coord, denorm, vertexStage, bias);
+    // Exponent adjust (fetch constant): texels scaled by 2^n, n in tinfo.x bits 8-13.
+    int expAdjust = int(tinfo[slot].x << 18) >> 26;
+    if (expAdjust != 0) v *= exp2(float(expAdjust));
     uint w = tinfo[slot].w;
     if (!(w >> 31))
         return v;
@@ -174,22 +178,22 @@ float4 TFetch(Texture2D<float4> t, TextureCube<float4> tc, uint slot, float3 coo
     return r;
 }
 
-float4 TFetchRaw(Texture2D<float4> t, TextureCube<float4> tc, uint slot, float3 coord, bool denorm, bool vertexStage)
+float4 TFetchRaw(Texture2D<float4> t, TextureCube<float4> tc, uint slot, float3 coord, bool denorm, bool vertexStage, float bias)
 {
     if ((tinfo[slot].w & 0xFFu) == 3)
     {
         float3 dir = CubeDirection(coord);
-        return vertexStage ? tc.SampleLevel(sLinearClamp, dir, 0) : tc.Sample(sLinearClamp, dir);
+        return vertexStage ? tc.SampleLevel(sLinearClamp, dir, max(bias, 0)) : tc.SampleBias(sLinearClamp, dir, bias);
     }
     float2 uv = coord.xy;
-    if (denorm) uv /= float2(max(tinfo[slot].yz, uint2(1, 1)));
-    uint mode = tinfo[slot].x;
+    if (denorm) uv /= float2(max(tinfo[slot].yz & 0xFFFFu, uint2(1, 1)));
+    uint mode = tinfo[slot].x & 3u;
     if (vertexStage)
-        return t.SampleLevel(sLinearClamp, uv, 0);
-    if (mode == 1) return t.Sample(sLinearClamp, uv);
-    if (mode == 2) return t.Sample(sPointClamp, uv);
-    if (mode == 3) return t.Sample(sPointWrap, uv);
-    return t.Sample(sLinearWrap, uv);
+        return t.SampleLevel(sLinearClamp, uv, max(bias, 0));
+    if (mode == 1) return t.SampleBias(sLinearClamp, uv, bias);
+    if (mode == 2) return t.SampleBias(sPointClamp, uv, bias);
+    if (mode == 3) return t.SampleBias(sPointWrap, uv, bias);
+    return t.SampleBias(sLinearWrap, uv, bias);
 }
 
 float4 CubeOp(float4 a, float4 b)
@@ -493,8 +497,8 @@ struct Emitter
             const std::string uv = "float3(" + reg + comp[f.srcSwizzle & 3] + ", " + reg + comp[(f.srcSwizzle >> 2) & 3] + ", " + reg +
                 comp[(f.srcSwizzle >> 4) & 3] + ")";
             char call[320];
-            snprintf(call, sizeof(call), "TFetch(tex[%u], texc[%u], %u, %s, %s, %s)", f.constIndex, f.constIndex, f.constIndex, uv.c_str(), f.denormalized ? "true" : "false",
-                pixel ? "false" : "true");
+            snprintf(call, sizeof(call), "TFetch(tex[%u], texc[%u], %u, %s, %s, %s, %.4f + tbias[%u].x)", f.constIndex, f.constIndex, f.constIndex, uv.c_str(),
+                f.denormalized ? "true" : "false", pixel ? "false" : "true", f.lodBias, f.constIndex);
             body = std::string("{ float4 t = ") + call + "; " + DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
             result.usedTextureSlots |= 1u << f.constIndex;
         }

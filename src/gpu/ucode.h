@@ -73,6 +73,7 @@ struct Fetch
     uint32_t srcSwizzle; // 6 bits for texture (3 x 2)
     bool denormalized;   // coordinates in texels
     uint32_t dimension;
+    float lodBias;       // texture fetch LOD bias (instruction)
     bool predicated, predCondition;
 };
 
