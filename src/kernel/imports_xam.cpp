@@ -11,6 +11,7 @@
 #include "kernel/thread.h"
 #include "kernel/vfs.h"
 #include "loader.h"
+#include "render/presenter.h"
 
 #include <windows.h>
 
@@ -323,7 +324,7 @@ uint16_t PadButtons()
     uint16_t buttons = 0;
     for (const Key& k : keys)
     {
-        if (GetAsyncKeyState(k.vk) & 0x8000)
+        if (PresenterHasFocus() && (GetAsyncKeyState(k.vk) & 0x8000))
             buttons |= k.button;
     }
     static const bool autoStart = getenv("FM2_AUTOSTART") != nullptr;

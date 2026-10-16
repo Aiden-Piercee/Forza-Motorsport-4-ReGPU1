@@ -72,6 +72,36 @@ Key decisions:
 
 \*For one experienced reverse engineer/graphics programmer, part time. The critical path is phases 2–3. That's where projects like this succeed or stall.
 
+## 4a. Phase 2 finding: render from the command stream (Oct 2026)
+
+Measured at the main menu: in 5 s the GPU executed ~9,600 draws, but only
+~600 calls went through the game's D3D draw function (`sub_8237D158`, the
+only code that builds draw packets besides one init path). FM2 renders
+mostly from **prerecorded D3D command buffers**, replayed by D3D's swap
+thread, and uses **predicated tiling** (each frame replayed per EDRAM tile).
+Hooking the D3D API alone would miss ~94% of the draws.
+
+Revised phase 2: a native renderer driven by the PM4 command stream the
+runtime already executes, designed around speed rather than emulation:
+
+- **One pass per frame, no tiles.** Predicated tile replays exist only
+  because of the 10 MB EDRAM. Render the first tile's pass at full
+  resolution into real render targets and skip the replays.
+- **No EDRAM emulation.** Map EDRAM render targets to D3D12 render targets
+  and resolves to copies (or aliasing) of real textures.
+- **Shaders translated ahead of time.** Xenos microcode found in the stream
+  (and on disc) is converted to DXIL once and cached; pipelines precompiled
+  from a recorded manifest. No runtime compile stutter.
+- **D3D API hooks where they pay off**: Present/VdSwap (pacing, ultrawide,
+  frame interpolation), render target and viewport setup (resolution
+  scaling, ultrawide HUD anchoring), and Bink/video upload paths.
+- Command translation runs on its own thread(s); the guest never waits on
+  host GPU work except at real fences.
+
+This keeps the performance goals: the reference port's costs (EDRAM
+emulation, tile replays, runtime shader compiles, logging) are exactly what
+this design removes.
+
 ## 5. Performance targets (vs reference)
 
 | Metric | hl360-Forza2 v0.3.0 | Target |

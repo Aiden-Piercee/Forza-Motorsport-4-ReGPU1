@@ -45,7 +45,8 @@ void D3DDebugLog()
 {
     if (const uint32_t dev = LoadBE32(LoadBE32(0x820009CC)))
         D3DDebugLogFlips(dev);
-    extern std::atomic<uint64_t> g_d3dSwaps, g_gamePresents;
+    extern std::atomic<uint64_t> g_d3dSwaps, g_gamePresents, g_apiDraws, g_apiDraws2;
+    Log("  d3d: draw calls via 8237D158 %llu, via 8236D830 %llu", (unsigned long long)g_apiDraws.load(), (unsigned long long)g_apiDraws2.load());
     Log("  d3d: game presents %llu, D3D swaps %llu", (unsigned long long)g_gamePresents.load(), (unsigned long long)g_d3dSwaps.load());
     if (!g_waiting || !g_waitDevice)
         return;
@@ -140,3 +141,20 @@ PPC_FUNC(sub_825ADE70)
     __imp__sub_825ADE70(ctx, base);
 }
 
+
+extern "C" PPC_FUNC(__imp__sub_8237D158);
+extern "C" PPC_FUNC(__imp__sub_8236D830);
+std::atomic<uint64_t> g_apiDraws{ 0 }, g_apiDraws2{ 0 };
+
+// The only two functions that build draw packets (DRAW_INDX / DRAW_INDX_2).
+PPC_FUNC(sub_8237D158)
+{
+    g_apiDraws++;
+    __imp__sub_8237D158(ctx, base);
+}
+
+PPC_FUNC(sub_8236D830)
+{
+    g_apiDraws2++;
+    __imp__sub_8236D830(ctx, base);
+}

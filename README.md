@@ -11,8 +11,9 @@ data is included; you need your own disc image. See
 Phase 1 (recompile and boot) is done. The game boots on our kernel layer,
 plays its intro sequence, passes the title screen (Start) and reaches the
 main menu, presenting at a steady 60 Hz with the menu videos and showcase car
-loaded. Nothing is drawn yet: a command-processor stand-in executes the GPU
-work without rendering. Phase 2 (native renderer) is next.
+loaded. A window with a D3D12 swap chain presents every frame (a placeholder
+clear for now; `FM2_HEADLESS=1` runs without it). Phase 2 is under way: the
+renderer will be driven by the PM4 command stream (see the scope, section 4a).
 
 Stand-ins until their phase: XMA decoding writes silence, audio output is
 discarded, user 0 is a keyboard-driven gamepad (Enter = Start, Space = A,

@@ -1,0 +1,203 @@
+// Native output: a window with a D3D12 flip-model swap chain. The guest's
+// VdSwap hands a frame over; a render thread presents it without blocking
+// the guest. Until the D3D hooks draw real content the frame is a clear
+// whose shade pulses with the frame count, proving the path end to end.
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+
+#include <d3d12.h>
+#include <dxgi1_6.h>
+#include <windows.h>
+#include <wrl/client.h>
+
+#include "log.h"
+#include "render/presenter.h"
+
+using Microsoft::WRL::ComPtr;
+
+namespace
+{
+constexpr UINT kBuffers = 3;
+constexpr UINT kWidth = 1280, kHeight = 720;
+
+struct Presenter
+{
+    HWND window = nullptr;
+    ComPtr<ID3D12Device> device;
+    ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<IDXGISwapChain3> swapChain;
+    ComPtr<ID3D12DescriptorHeap> rtvHeap;
+    UINT rtvStride = 0;
+    ComPtr<ID3D12Resource> backBuffers[kBuffers];
+    ComPtr<ID3D12CommandAllocator> allocators[kBuffers];
+    ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12Fence> fence;
+    UINT64 fenceValues[kBuffers] = {};
+    UINT64 nextFence = 1;
+    HANDLE fenceEvent = nullptr;
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    uint64_t pendingFrame = 0;
+    uint64_t presentedFrame = 0;
+    std::atomic<bool> ready{ false };
+};
+
+Presenter g_p;
+
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_CLOSE)
+    {
+        Log("presenter: window closed, exiting");
+        std::_Exit(0);
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+void Check(HRESULT hr, const char* what)
+{
+    if (FAILED(hr))
+        Fatal("presenter: %s failed (%08lX)", what, hr);
+}
+
+void CreateWindowAndDevice()
+{
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = WindowProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.lpszClassName = L"fm2";
+    RegisterClassW(&wc);
+    RECT r{ 0, 0, LONG(kWidth), LONG(kHeight) };
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    g_p.window = CreateWindowW(L"fm2", L"Forza Motorsport 2", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
+        r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+
+    ComPtr<IDXGIFactory4> factory;
+    Check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2");
+    Check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_p.device)), "D3D12CreateDevice");
+
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    Check(g_p.device->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_p.queue)), "CreateCommandQueue");
+
+    DXGI_SWAP_CHAIN_DESC1 sd{};
+    sd.Width = kWidth;
+    sd.Height = kHeight;
+    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = kBuffers;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    ComPtr<IDXGISwapChain1> sc1;
+    Check(factory->CreateSwapChainForHwnd(g_p.queue.Get(), g_p.window, &sd, nullptr, nullptr, &sc1), "CreateSwapChainForHwnd");
+    Check(sc1.As(&g_p.swapChain), "IDXGISwapChain3");
+    factory->MakeWindowAssociation(g_p.window, DXGI_MWA_NO_ALT_ENTER);
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    hd.NumDescriptors = kBuffers;
+    Check(g_p.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_p.rtvHeap)), "CreateDescriptorHeap");
+    g_p.rtvStride = g_p.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    for (UINT i = 0; i < kBuffers; i++)
+    {
+        Check(g_p.swapChain->GetBuffer(i, IID_PPV_ARGS(&g_p.backBuffers[i])), "GetBuffer");
+        D3D12_CPU_DESCRIPTOR_HANDLE h = g_p.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += SIZE_T(i) * g_p.rtvStride;
+        g_p.device->CreateRenderTargetView(g_p.backBuffers[i].Get(), nullptr, h);
+        Check(g_p.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_p.allocators[i])), "CreateCommandAllocator");
+    }
+    Check(g_p.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_p.allocators[0].Get(), nullptr, IID_PPV_ARGS(&g_p.list)),
+        "CreateCommandList");
+    g_p.list->Close();
+    Check(g_p.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_p.fence)), "CreateFence");
+    g_p.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+}
+
+void DrawFrame(uint64_t frame)
+{
+    const UINT i = g_p.swapChain->GetCurrentBackBufferIndex();
+    if (g_p.fence->GetCompletedValue() < g_p.fenceValues[i])
+    {
+        g_p.fence->SetEventOnCompletion(g_p.fenceValues[i], g_p.fenceEvent);
+        WaitForSingleObject(g_p.fenceEvent, INFINITE);
+    }
+    g_p.allocators[i]->Reset();
+    g_p.list->Reset(g_p.allocators[i].Get(), nullptr);
+
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = g_p.backBuffers[i].Get();
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    g_p.list->ResourceBarrier(1, &b);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_p.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += SIZE_T(i) * g_p.rtvStride;
+    const float pulse = 0.15f + 0.1f * float((frame % 120) < 60 ? frame % 60 : 60 - frame % 60) / 60.0f;
+    const float color[4] = { 0.05f, pulse, 0.12f, 1.0f };
+    g_p.list->ClearRenderTargetView(rtv, color, 0, nullptr);
+
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    g_p.list->ResourceBarrier(1, &b);
+    g_p.list->Close();
+    ID3D12CommandList* lists[] = { g_p.list.Get() };
+    g_p.queue->ExecuteCommandLists(1, lists);
+    g_p.swapChain->Present(0, DXGI_PRESENT_ALLOW_TEARING);
+    g_p.fenceValues[i] = g_p.nextFence++;
+    g_p.queue->Signal(g_p.fence.Get(), g_p.fenceValues[i]);
+}
+
+void RenderThread()
+{
+    SetThreadDescription(GetCurrentThread(), L"presenter");
+    CreateWindowAndDevice();
+    g_p.ready = true;
+    Log("presenter: window and D3D12 swap chain ready");
+    for (;;)
+    {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
+        {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        uint64_t frame;
+        {
+            std::unique_lock lock(g_p.mutex);
+            g_p.cv.wait_for(lock, std::chrono::milliseconds(16), [] { return g_p.pendingFrame != g_p.presentedFrame; });
+            frame = g_p.pendingFrame;
+            if (frame == g_p.presentedFrame)
+                continue;
+            g_p.presentedFrame = frame;
+        }
+        DrawFrame(frame);
+    }
+}
+}
+
+void PresenterInit()
+{
+    if (getenv("FM2_HEADLESS"))
+        return;
+    std::thread(RenderThread).detach();
+}
+
+void PresenterSubmitFrame(uint64_t frame)
+{
+    {
+        std::lock_guard lock(g_p.mutex);
+        g_p.pendingFrame = frame;
+    }
+    g_p.cv.notify_one();
+}
+
+bool PresenterHasFocus()
+{
+    return !g_p.window || GetForegroundWindow() == g_p.window;
+}

@@ -13,6 +13,7 @@
 
 #include "kernel/imports.h"
 #include "kernel/thread.h"
+#include "render/presenter.h"
 
 namespace
 {
@@ -581,6 +582,7 @@ GUEST_EXPORT(VdSwap)
     for (uint32_t i = 0; i < 64; i++)
         StoreBE32(buffer + i * 4, 0x80000000);
     const uint64_t n = ++g_gpu.swaps;
+    PresenterSubmitFrame(n);
     if (n == 1 || (n & (n - 1)) == 0 || n % 60 == 0)
         Log("gpu: VdSwap #%llu", (unsigned long long)n);
     Return(ctx, 0);

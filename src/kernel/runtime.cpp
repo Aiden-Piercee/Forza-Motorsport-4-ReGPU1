@@ -11,6 +11,7 @@
 #include "kernel/imports.h"
 #include "kernel/thread.h"
 #include "loader.h"
+#include "render/presenter.h"
 
 namespace
 {
@@ -74,6 +75,7 @@ void RuntimeInit(const std::filesystem::path& gameDir)
     Log("runtime: TSC %.3f MHz, user data in %s", g_tscFrequency / 1e6, g_userDir.string().c_str());
 
     std::thread(TimeStampThread).detach();
+    PresenterInit();
     GpuInit();
     AudioInit();
 }
