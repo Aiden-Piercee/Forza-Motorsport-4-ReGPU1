@@ -46,6 +46,8 @@ constexpr UINT kFrames = 3;
 constexpr UINT64 kRingSize = 64ull << 20;
 constexpr UINT kDescriptorsPerFrame = 34 * 8192; // 8192 draws
 constexpr UINT kTableSize = 34; // t0 upload ring, t1-t32 textures, t33 guest physical memory
+// The EDRAM colour target: half floats hold the title's HDR (7e3) range.
+constexpr DXGI_FORMAT kColorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 constexpr uint32_t kDirectFetchBytes = 64 * 1024;
 
 // Registers.
@@ -142,6 +144,7 @@ struct Renderer
     ComPtr<ID3D12DescriptorHeap> blitRtvHeap;             // one RTV, rewritten per depth resolve
     ComPtr<ID3D12RootSignature> blitRootSignature;
     ComPtr<ID3D12PipelineState> depthBlit;                // depth buffer -> R32_FLOAT
+    ComPtr<ID3D12PipelineState> colorBlit8, colorBlit16;  // colour -> 8888 / RGBA16F, scaled
     ComPtr<ID3D12Resource> color, depth, readback;
     D3D12_RESOURCE_STATES colorState = D3D12_RESOURCE_STATE_RENDER_TARGET;
 
@@ -241,14 +244,17 @@ void InitDepthBlit()
     D3D12_DESCRIPTOR_RANGE range{};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     range.NumDescriptors = 1;
-    D3D12_ROOT_PARAMETER param{};
-    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    param.DescriptorTable.NumDescriptorRanges = 1;
-    param.DescriptorTable.pDescriptorRanges = &range;
-    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[0].DescriptorTable.NumDescriptorRanges = 1;
+    params[0].DescriptorTable.pDescriptorRanges = &range;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[1].Constants.Num32BitValues = 1;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 1;
-    rs.pParameters = &param;
+    rs.NumParameters = 2;
+    rs.pParameters = params;
     ComPtr<ID3DBlob> blob, error;
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)))
         Fatal("renderer: blit root signature: %s", error ? static_cast<const char*>(error->GetBufferPointer()) : "?");
@@ -257,6 +263,8 @@ void InitDepthBlit()
 
     static const char kSource[] = R"(
 Texture2D<float> depthTex : register(t0);
+Texture2D<float4> colorTex : register(t0);
+cbuffer Blit : register(b0) { float scale; };
 float4 vs(uint id : SV_VertexID) : SV_Position
 {
     float2 uv = float2((id << 1) & 2, id & 2);
@@ -265,6 +273,10 @@ float4 vs(uint id : SV_VertexID) : SV_Position
 float ps(float4 pos : SV_Position) : SV_Target
 {
     return depthTex.Load(int3(int2(pos.xy), 0));
+}
+float4 psColor(float4 pos : SV_Position) : SV_Target
+{
+    return colorTex.Load(int3(int2(pos.xy), 0)) * scale;
 }
 )";
     ComPtr<ID3DBlob> vs, ps;
@@ -283,6 +295,13 @@ float ps(float4 pos : SV_Position) : SV_Target
     pd.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
     pd.SampleDesc.Count = 1;
     Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.depthBlit)), "CreateGraphicsPipelineState(depth blit)");
+    ComPtr<ID3DBlob> psColor;
+    Check(D3DCompile(kSource, sizeof(kSource) - 1, nullptr, nullptr, nullptr, "psColor", "ps_5_0", 0, 0, &psColor, &error), "D3DCompile(blit psColor)");
+    pd.PS = { psColor->GetBufferPointer(), psColor->GetBufferSize() };
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.colorBlit8)), "CreateGraphicsPipelineState(colour blit 8)");
+    pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.colorBlit16)), "CreateGraphicsPipelineState(colour blit 16)");
 }
 
 void Init()
@@ -387,7 +406,7 @@ void Init()
     td.DepthOrArraySize = 1;
     td.MipLevels = 1;
     td.SampleDesc.Count = 1;
-    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.Format = kColorFormat;
     td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     D3D12_CLEAR_VALUE cv{};
     cv.Format = td.Format;
@@ -709,7 +728,7 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC(((depth >> 4) & 7) + 1);
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.RTVFormats[0] = kColorFormat;
     pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
     pd.SampleDesc.Count = 1;
     ComPtr<ID3D12PipelineState> pso;
@@ -937,6 +956,91 @@ void TransitionColor(D3D12_RESOURCE_STATES to)
     g_r.colorState = to;
 }
 
+// Draws the resolve rectangle of the colour (or depth) buffer into the
+// destination's host texture at the same pixels, converting the format and
+// scaling colour by the resolve's exponent bias.
+void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXGI_FORMAT format, const D3D12_RECT& rect, float scale)
+{
+    ResolvedTexture& dest = g_r.resolved[base];
+    if (!dest.resource || dest.width != width || dest.height != height || dest.format != format)
+    {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = width;
+        td.Height = height;
+        td.DepthOrArraySize = 1;
+        td.MipLevels = 1;
+        td.SampleDesc.Count = 1;
+        td.Format = format;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (dest.resource)
+            Frame().garbage.push_back(std::move(dest.resource));
+        Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                  IID_PPV_ARGS(&dest.resource)),
+            "CreateCommittedResource(resolve)");
+        dest.width = width;
+        dest.height = height;
+        dest.format = format;
+    }
+    const D3D12_RECT sr{ rect.left, rect.top, std::min<LONG>(rect.right, width), std::min<LONG>(rect.bottom, height) };
+    FrameResources& f = Frame();
+    if (sr.right <= sr.left || sr.bottom <= sr.top || f.descriptorsUsed >= kDescriptorsPerFrame)
+        return;
+
+    const UINT slot = f.descriptorBase + f.descriptorsUsed++;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = depth ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : kColorFormat;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    g_r.device->CreateShaderResourceView(depth ? g_r.depth.Get() : g_r.color.Get(), &srv, Cpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
+    const auto rtv = g_r.blitRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    g_r.device->CreateRenderTargetView(dest.resource.Get(), nullptr, rtv);
+
+    D3D12_RESOURCE_BARRIER b[2]{};
+    UINT barriers = 1;
+    b[0].Type = b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[0].Transition.pResource = dest.resource.Get();
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    if (depth)
+    {
+        b[1].Transition.pResource = g_r.depth.Get();
+        b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barriers = 2;
+    }
+    else
+        TransitionColor(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    g_r.list->ResourceBarrier(barriers, b);
+
+    ID3D12PipelineState* pso = depth ? g_r.depthBlit.Get()
+        : format == DXGI_FORMAT_R8G8B8A8_UNORM ? g_r.colorBlit8.Get() : g_r.colorBlit16.Get();
+    g_r.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    g_r.list->SetGraphicsRootSignature(g_r.blitRootSignature.Get());
+    g_r.list->SetPipelineState(pso);
+    g_r.list->SetGraphicsRootDescriptorTable(0, Gpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
+    g_r.list->SetGraphicsRoot32BitConstants(1, 1, &scale, 0);
+    const D3D12_VIEWPORT vp{ 0, 0, float(width), float(height), 0, 1 };
+    g_r.list->RSSetViewports(1, &vp);
+    g_r.list->RSSetScissorRects(1, &sr);
+    g_r.list->DrawInstanced(3, 1, 0, 0);
+
+    std::swap(b[0].Transition.StateBefore, b[0].Transition.StateAfter);
+    std::swap(b[1].Transition.StateBefore, b[1].Transition.StateAfter);
+    g_r.list->ResourceBarrier(barriers, b);
+    TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
+    // Back to the main targets and root signature.
+    const auto mainRtv = g_r.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    const auto dsv = g_r.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+    g_r.list->OMSetRenderTargets(1, &mainRtv, FALSE, &dsv);
+    g_r.list->SetGraphicsRootSignature(g_r.rootSignature.Get());
+}
+
 // EDRAM resolve: copy a rectangle of the render target to the destination
 // (as a host texture), then optionally clear colour and depth.
 void Resolve()
@@ -980,80 +1084,7 @@ void Resolve()
     if (traceFrame && g_r.frame + 1 == traceFrame)
         Log("resolve: control %08X dest %08X pitch %08X info %08X rect %ld,%ld-%ld,%ld clear %08X", control, gpureg::Get(RB_COPY_DEST_BASE),
             gpureg::Get(RB_COPY_DEST_PITCH), gpureg::Get(RB_COPY_DEST_INFO), rect.left, rect.top, rect.right, rect.bottom, gpureg::Get(RB_COLOR_CLEAR));
-    if (command != 3 && sourceSelect == 4) // depth copy (shadow maps)
-    {
-        const uint32_t pitchReg = gpureg::Get(RB_COPY_DEST_PITCH);
-        const uint32_t pitch = pitchReg & 0x3FFF;
-        const uint32_t base = ((gpureg::Get(RB_COPY_DEST_BASE) & 0x1FFFFFFF) - uint32_t(rect.top) * pitch * 4) & 0x1FFFFFFF;
-        const uint32_t width = std::clamp<uint32_t>(pitch, 1, kWidth);
-        const uint32_t height = std::clamp<uint32_t>(((pitchReg >> 16) & 0x3FFF) + uint32_t(rect.top), 1, kHeight);
-        ResolvedTexture& dest = g_r.resolved[base];
-        if (!dest.resource || dest.width != width || dest.height != height || dest.format != DXGI_FORMAT_R32_FLOAT)
-        {
-            D3D12_HEAP_PROPERTIES hp{};
-            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-            D3D12_RESOURCE_DESC td{};
-            td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            td.Width = width;
-            td.Height = height;
-            td.DepthOrArraySize = 1;
-            td.MipLevels = 1;
-            td.SampleDesc.Count = 1;
-            td.Format = DXGI_FORMAT_R32_FLOAT;
-            td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-            if (dest.resource)
-                Frame().garbage.push_back(std::move(dest.resource));
-            Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
-                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
-                      IID_PPV_ARGS(&dest.resource)),
-                "CreateCommittedResource(depth resolve)");
-            dest.width = width;
-            dest.height = height;
-            dest.format = DXGI_FORMAT_R32_FLOAT;
-        }
-        FrameResources& f = Frame();
-        if (f.descriptorsUsed < kDescriptorsPerFrame)
-        {
-            const UINT slot = f.descriptorBase + f.descriptorsUsed++;
-            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-            srv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            srv.Texture2D.MipLevels = 1;
-            g_r.device->CreateShaderResourceView(g_r.depth.Get(), &srv, Cpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
-            const auto rtv = g_r.blitRtvHeap->GetCPUDescriptorHandleForHeapStart();
-            g_r.device->CreateRenderTargetView(dest.resource.Get(), nullptr, rtv);
-
-            D3D12_RESOURCE_BARRIER b[2]{};
-            b[0].Type = b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            b[0].Transition.pResource = g_r.depth.Get();
-            b[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-            b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            b[1].Transition.pResource = dest.resource.Get();
-            b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            g_r.list->ResourceBarrier(2, b);
-            g_r.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-            g_r.list->SetGraphicsRootSignature(g_r.blitRootSignature.Get());
-            g_r.list->SetPipelineState(g_r.depthBlit.Get());
-            g_r.list->SetGraphicsRootDescriptorTable(0, Gpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
-            const D3D12_VIEWPORT vp{ 0, 0, float(width), float(height), 0, 1 };
-            const D3D12_RECT sr{ rect.left, rect.top, std::min<LONG>(rect.right, width), std::min<LONG>(rect.bottom, height) };
-            g_r.list->RSSetViewports(1, &vp);
-            g_r.list->RSSetScissorRects(1, &sr);
-            g_r.list->DrawInstanced(3, 1, 0, 0);
-            std::swap(b[0].Transition.StateBefore, b[0].Transition.StateAfter);
-            std::swap(b[1].Transition.StateBefore, b[1].Transition.StateAfter);
-            g_r.list->ResourceBarrier(2, b);
-            // Back to the main targets and root signature.
-            const auto mainRtv = g_r.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-            const auto dsv = g_r.dsvHeap->GetCPUDescriptorHandleForHeapStart();
-            g_r.list->OMSetRenderTargets(1, &mainRtv, FALSE, &dsv);
-            g_r.list->SetGraphicsRootSignature(g_r.rootSignature.Get());
-        }
-    }
-    if (command != 3 && sourceSelect < 4) // colour copy
+    if (command != 3 && sourceSelect <= 4)
     {
         // Each tile resolves to the destination row it starts at; key the
         // host texture by the image's own base so the tiles land together.
@@ -1062,50 +1093,15 @@ void Resolve()
         const uint32_t base = ((gpureg::Get(RB_COPY_DEST_BASE) & 0x1FFFFFFF) - uint32_t(rect.top) * pitch * 4) & 0x1FFFFFFF;
         const uint32_t width = std::clamp<uint32_t>(pitch, 1, kWidth);
         const uint32_t height = std::clamp<uint32_t>(((pitchReg >> 16) & 0x3FFF) + uint32_t(rect.top), 1, kHeight);
-        ResolvedTexture& dest = g_r.resolved[base];
-        if (!dest.resource || dest.width != width || dest.height != height || dest.format != DXGI_FORMAT_R8G8B8A8_UNORM)
-        {
-            D3D12_HEAP_PROPERTIES hp{};
-            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-            D3D12_RESOURCE_DESC td{};
-            td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            td.Width = width;
-            td.Height = height;
-            td.DepthOrArraySize = 1;
-            td.MipLevels = 1;
-            td.SampleDesc.Count = 1;
-            td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-            if (dest.resource)
-                Frame().garbage.push_back(std::move(dest.resource));
-            Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
-                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
-                      IID_PPV_ARGS(&dest.resource)),
-                "CreateCommittedResource(resolve)");
-            dest.width = width;
-            dest.height = height;
-            dest.format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        }
-        const D3D12_BOX box{ UINT(rect.left), UINT(rect.top), 0, UINT(std::min<LONG>(rect.right, width)), UINT(std::min<LONG>(rect.bottom, height)), 1 };
-        if (box.right > box.left && box.bottom > box.top)
-        {
-            TransitionColor(D3D12_RESOURCE_STATE_COPY_SOURCE);
-            D3D12_RESOURCE_BARRIER b{};
-            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            b.Transition.pResource = dest.resource.Get();
-            b.Transition.Subresource = 0;
-            b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-            g_r.list->ResourceBarrier(1, &b);
-            D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
-            dst.pResource = dest.resource.Get();
-            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            src.pResource = g_r.color.Get();
-            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            g_r.list->CopyTextureRegion(&dst, box.left, box.top, 0, &src, &box);
-            std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
-            g_r.list->ResourceBarrier(1, &b);
-            TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
-        }
+        const uint32_t info = gpureg::Get(RB_COPY_DEST_INFO);
+        const bool depth = sourceSelect == 4;
+        // Destination: 8888 stays 8-bit (clamped, as the hardware does); other
+        // formats keep the HDR range. The exponent bias scales colour copies.
+        const uint32_t destFormat = (info >> 7) & 0x3F;
+        const DXGI_FORMAT format = depth ? DXGI_FORMAT_R32_FLOAT
+            : destFormat == 6 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
+        const int bias = int32_t(info << 10) >> 26; // bits 16-21, signed
+        BlitResolve(depth, base, width, height, format, rect, depth ? 1.0f : std::ldexp(1.0f, bias));
     }
     if ((control >> 8) & 1) // colour clear (ARGB)
     {
@@ -1384,7 +1380,8 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
     ID3D12Resource* image = g_r.color.Get();
     D3D12_RESOURCE_STATES imageState = D3D12_RESOURCE_STATE_COPY_SOURCE;
     auto it = g_r.resolved.find(frontBuffer);
-    const bool fromResolve = it != g_r.resolved.end() && it->second.width == kWidth && it->second.height == kHeight;
+    const bool fromResolve = it != g_r.resolved.end() && it->second.width == kWidth && it->second.height == kHeight &&
+        it->second.format == DXGI_FORMAT_R8G8B8A8_UNORM;
     if (fromResolve)
     {
         image = it->second.resource.Get();
@@ -1396,9 +1393,9 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
         g_r.list->ResourceBarrier(1, &b);
     }
-    else
-        TransitionColor(D3D12_RESOURCE_STATE_COPY_SOURCE);
-    const bool presenting = PresenterRecordCopy(g_r.list.Get(), image);
+    // The render target is half float; without an 8-bit resolve there is
+    // nothing presentable this frame.
+    const bool presenting = fromResolve && PresenterRecordCopy(g_r.list.Get(), image);
     {
         static const uint64_t traceFrame = getenv("FM2_TRACE_DRAWS") ? strtoull(getenv("FM2_TRACE_DRAWS"), nullptr, 10) : 0;
         if (traceFrame && g_r.frame + 1 == traceFrame)
@@ -1407,7 +1404,7 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
 
     static const uint64_t dumpFrame = getenv("FM2_DUMP_FRAME") ? strtoull(getenv("FM2_DUMP_FRAME"), nullptr, 10) : 0;
     ++g_r.frame;
-    const bool dump = dumpFrame && g_r.frame == dumpFrame;
+    const bool dump = fromResolve && dumpFrame && g_r.frame == dumpFrame;
     if (dump)
     {
         D3D12_TEXTURE_COPY_LOCATION dst{};

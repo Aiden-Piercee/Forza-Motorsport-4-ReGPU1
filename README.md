@@ -27,7 +27,9 @@ frames instead of stalling the game) and are cached in
 screen, main menu and the race-setup menus (class select, starting grid with
 the 3D track behind it) render correctly. Races load and draw: the track is
 lit and textured (DXT5A textures, depth-only passes and depth resolves for the
-shadow maps); HDR render targets are still 8-bit, so bright surfaces clip.
+shadow maps). The EDRAM colour target is half float; resolves are shader
+passes that apply the exponent bias and keep HDR range unless the destination
+is 8888.
 
 ## Building
 
