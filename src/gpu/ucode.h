@@ -48,6 +48,10 @@ struct Alu
     uint32_t vectorDest, scalarDest;
     uint32_t vectorMask, scalarMask;
     bool exportData;
+    bool scalarDestRelative;
+    uint32_t src3RawReg; // for the constant/temp scalar ops (mulsc etc.)
+    bool src3IsTemp;
+    uint32_t src3RawSwizzle;
     bool vectorClamp, scalarClamp;
     bool predicated, predCondition;
     Source src[3];
@@ -64,6 +68,7 @@ struct Fetch
     bool isSigned, isNormalized, isMini;
     // Texture fetch.
     uint32_t srcSwizzle; // 6 bits for texture (3 x 2)
+    bool denormalized;   // coordinates in texels
     uint32_t dimension;
     bool predicated, predCondition;
 };
@@ -84,7 +89,8 @@ struct Shader
 };
 
 Shader Parse(const uint32_t* microcodeBE, uint32_t dwords, bool pixel);
-Instruction DecodeInstruction(const Shader& shader, uint32_t index);
+Alu DecodeAlu(const uint32_t* words);
+Fetch DecodeFetch(const uint32_t* words);
 std::string Disassemble(const Shader& shader);
 const char* VectorOpName(uint32_t op);
 const char* ScalarOpName(uint32_t op);

@@ -55,7 +55,13 @@ struct Gpu
     // Physical addresses of VdSwap's blocks not yet reached by the command
     // processor; reaching one ends the frame for the renderer.
     std::mutex swapMutex;
-    std::deque<std::pair<uint32_t, uint64_t>> pendingSwaps;
+    struct PendingSwap
+    {
+        uint32_t block;      // physical address of VdSwap's 64 dwords
+        uint64_t frame;
+        uint32_t frontBuffer; // physical address of the front buffer
+    };
+    std::deque<PendingSwap> pendingSwaps;
     // Predicated tiling: type-3 packets with the predicate bit run only
     // when (binSelect & binMask) != 0. D3D replays each frame per tile and
     // predicates its once-per-frame packets (swap callbacks, fences).
@@ -198,11 +204,11 @@ uint32_t ExecutePacket(uint32_t ptr)
         std::lock_guard lock(g_gpu.swapMutex);
         for (size_t i = 0; i < g_gpu.pendingSwaps.size(); i++)
         {
-            if (g_gpu.pendingSwaps[i].first == (ptr & 0x1FFFFFFF))
+            if (g_gpu.pendingSwaps[i].block == (ptr & 0x1FFFFFFF))
             {
-                const uint64_t frame = g_gpu.pendingSwaps[i].second;
+                const auto swap = g_gpu.pendingSwaps[i];
                 g_gpu.pendingSwaps.erase(g_gpu.pendingSwaps.begin(), g_gpu.pendingSwaps.begin() + i + 1);
-                FrameOnSwap(frame);
+                FrameOnSwap(swap.frame, swap.frontBuffer);
                 break;
             }
         }
@@ -217,6 +223,11 @@ uint32_t ExecutePacket(uint32_t ptr)
     const uint32_t opcode = (header >> 8) & 0x7F;
     const uint32_t data = ptr + 4;
     auto arg = [&](uint32_t i) { return LoadBE32(data + i * 4); };
+    static const bool tracePredication = getenv("FM2_TRACE_PRED") != nullptr;
+    static std::atomic<int> predLogged{ 0 };
+    if (tracePredication && (header & 1) && (g_gpu.binSelect != 0xFFFFFFFFull || g_gpu.binMask != 0xFFFFFFFFull) && predLogged++ < 400)
+        Log("pred: op %02X mask %016llX select %016llX -> %s", opcode, (unsigned long long)g_gpu.binMask, (unsigned long long)g_gpu.binSelect,
+            (g_gpu.binSelect & g_gpu.binMask) ? "run" : "skip");
     if ((header & 1) && !(g_gpu.binSelect & g_gpu.binMask))
     {
         g_gpu.skippedPredicated++;
@@ -243,9 +254,35 @@ uint32_t ExecutePacket(uint32_t ptr)
         WriteBack(arg(1), value);
         break;
     }
-    case 0x59: // EVENT_WRITE_EXT: initiator, address, extents...
-        WriteBack(arg(1), 0);
+    case 0x59: // EVENT_WRITE_CFL
         break;
+    case 0x5A: // EVENT_WRITE_EXT: screen extents of the previous draws.
+    {
+        // D3D's predicated tiling turns these into the bins each draw
+        // touches. Report the whole screen: every draw may touch every tile.
+        const uint16_t extents[6] = { 0, 8192 >> 3, 0, 8192 >> 3, 0, 1 };
+        const uint32_t address = GpuPhysToGuest(arg(1) & ~3u);
+        for (int i = 0; i < 6; i++)
+            *GuestPtr<uint16_t>(address + i * 2) = __builtin_bswap16(extents[i]);
+        break;
+    }
+    case 0x5B: // EVENT_WRITE_ZPD: occlusion query sample counts.
+    {
+        // At a query's end D3D has written 0xFFFFFEED to the counters;
+        // answer with a fixed number of visible samples.
+        const uint32_t counts = GpuPhysToGuest(gpureg::Get(0x2325) & ~3u); // RB_SAMPLE_COUNT_ADDR
+        auto* c = GuestPtr<uint32_t>(counts);
+        const uint32_t finished = __builtin_bswap32(0xFFFFFEED);
+        // Layout (little-endian dwords): Total A/B, ZFail A/B, ZPass A/B, StencilFail A/B.
+        const bool end = (c[4] == finished && c[5] == finished) || (c[2] == finished && c[3] == finished);
+        memset(c, 0, 8 * 4);
+        if (end)
+        {
+            c[4] = 1000; // ZPass_A
+            c[0] = 1000; // Total_A
+        }
+        break;
+    }
     case 0x45: // COND_WRITE: wait info, poll addr, ref, mask, write addr, write data
     {
         const uint32_t info = arg(0);
@@ -375,11 +412,11 @@ uint32_t ExecutePacket(uint32_t ptr)
     }
     case 0x22: // DRAW_INDX: viz query, initiator, [index base, index size]
         g_gpu.draws++;
-        FrameOnDraw(arg(1));
+        FrameOnDraw(arg(1), count > 2 ? arg(2) : 0, count > 3 ? arg(3) : 0);
         break;
     case 0x36: // DRAW_INDX_2: initiator, [inline indices]
         g_gpu.draws++;
-        FrameOnDraw(arg(0));
+        FrameOnDraw(arg(0), 0, 0);
         break;
     case 0x46: // EVENT_WRITE
     case 0x48: // ME_INIT
@@ -646,7 +683,9 @@ GUEST_EXPORT(VdSwap)
     const uint64_t n = ++g_gpu.swaps;
     {
         std::lock_guard lock(g_gpu.swapMutex);
-        g_gpu.pendingSwaps.push_back({ buffer & 0x1FFFFFFF, n });
+        // r4: the front buffer's texture fetch constant (6 dwords).
+        const uint32_t frontBuffer = ctx.r4.u32 ? (LoadBE32(ctx.r4.u32 + 4) & 0x1FFFF000) : 0;
+        g_gpu.pendingSwaps.push_back({ buffer & 0x1FFFFFFF, n, frontBuffer });
         if (g_gpu.pendingSwaps.size() > 16)
             g_gpu.pendingSwaps.pop_front();
     }

@@ -13,6 +13,7 @@
 #include <unordered_set>
 
 #include "gpu/regs.h"
+#include "gpu/renderer.h"
 #include "gpu/texture.h"
 #include "kernel/runtime.h"
 #include "log.h"
@@ -100,7 +101,7 @@ void CompositorLoop()
                 Blit(canvas, image, textures[i].Width(), textures[i].Height(), uint32_t(i % cols) * cellW + 2,
                     uint32_t(i / cols) * cellH + 2, cellW - 4, cellH - 4);
         }
-        static const uint64_t dumpFrame = getenv("FM2_DUMP_FRAME") ? strtoull(getenv("FM2_DUMP_FRAME"), nullptr, 10) : 0;
+        static const uint64_t dumpFrame = getenv("FM2_DUMP_TEXVIEW") ? strtoull(getenv("FM2_DUMP_FRAME"), nullptr, 10) : 0;
         static uint64_t composed = 0;
         if (++composed == dumpFrame)
         {
@@ -112,10 +113,13 @@ void CompositorLoop()
 }
 }
 
+const bool g_textureView = getenv("FM2_TEXVIEW") != nullptr;
+
 void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwords, uint32_t guestAddress)
 {
     if (!dwords || dwords > 0x10000)
         return;
+    RendererOnShaderLoad(uint32_t(type), microcodeBE, dwords);
     const uint64_t hash = Fnv1a(microcodeBE, dwords) ^ uint64_t(type);
     if (!g_shaders.insert(hash).second)
         return;
@@ -131,9 +135,14 @@ void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dw
     }
 }
 
-void FrameOnDraw(uint32_t initiator)
+void FrameOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
     g_frameDraws++;
+    if (!g_textureView)
+    {
+        RendererOnDraw(initiator, dmaBase, dmaSize);
+        return;
+    }
     for (uint32_t slot = 0; slot < 32; slot++)
     {
         const TextureFetch f = ReadTextureFetch(slot);
@@ -143,8 +152,14 @@ void FrameOnDraw(uint32_t initiator)
     }
 }
 
-void FrameOnSwap(uint64_t frame)
+void FrameOnSwap(uint64_t frame, uint32_t frontBuffer)
 {
+    if (!g_textureView)
+    {
+        RendererOnSwap(frame, frontBuffer);
+        g_frameDraws = 0;
+        return;
+    }
     static std::once_flag started;
     std::call_once(started, [] { std::thread(CompositorLoop).detach(); });
     {

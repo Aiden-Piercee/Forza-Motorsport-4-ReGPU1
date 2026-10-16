@@ -1,0 +1,35 @@
+#pragma once
+// Xenos microcode to HLSL (Shader Model 5.1).
+//
+// Vertex shaders fetch their own vertices: the host draws a non-indexed
+// triangle list whose vertex IDs index a per-draw list of guest indices
+// (already endian-swapped and expanded from fans, strips, quads and
+// rectangles). Rectangle corners are marked and computed as v1 + v2 - v0.
+//
+// Bindings (one root signature for everything):
+//   b0  per-draw constants for the vertex shader: c[256], bool constants,
+//       vertex fetch table, index list offset, viewport mode
+//   b1  per-draw constants for the pixel shader: c[256], bool constants,
+//       alpha test, texture sizes / sampler modes
+//   t0  guest data (vertex buffers and index lists) as a raw buffer
+//   t1+ textures for fetch slots 0-31
+//   s0 linear wrap, s1 linear clamp, s2 point clamp, s3 point wrap
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "gpu/ucode.h"
+
+struct TranslatedShader
+{
+    bool ok = false;
+    std::string error;
+    std::string hlsl;
+    uint32_t usedTextureSlots = 0;  // bit per fetch slot (pixel shaders)
+    std::vector<uint32_t> vertexFetchConstants; // vertex shaders
+};
+
+TranslatedShader TranslateShader(const ucode::Shader& shader);
+
+// Shared HLSL declarations both stages compile against.
+const char* HlslPreamble();

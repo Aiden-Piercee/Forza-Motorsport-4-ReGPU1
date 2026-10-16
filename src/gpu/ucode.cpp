@@ -141,22 +141,13 @@ Shader Parse(const uint32_t* microcodeBE, uint32_t dwords, bool pixel)
     return shader;
 }
 
-Instruction DecodeInstruction(const Shader& shader, uint32_t index)
-{
-    Instruction ins{};
-    const uint32_t* w = &shader.words[index * 3];
-    (void)w;
-    return ins;
-}
-
-namespace
-{
 Alu DecodeAlu(const uint32_t* w)
 {
     Alu a{};
     a.vectorDest = Bits(w[0], 0, 6);
     const bool absConstants = Bits(w[0], 7, 1);
     a.scalarDest = Bits(w[0], 8, 6);
+    a.scalarDestRelative = Bits(w[0], 14, 1);
     a.exportData = Bits(w[0], 15, 1);
     a.vectorMask = Bits(w[0], 16, 4);
     a.scalarMask = Bits(w[0], 20, 4);
@@ -172,6 +163,9 @@ Alu DecodeAlu(const uint32_t* w)
     const bool temp[3] = { bool(Bits(w[2], 31, 1)), bool(Bits(w[2], 30, 1)), bool(Bits(w[2], 29, 1)) };
     for (int i = 0; i < 3; i++)
         a.src[i] = DecodeSource(reg[i], temp[i], swz[i], neg[i], absConstants);
+    a.src3RawReg = reg[2];
+    a.src3IsTemp = temp[2];
+    a.src3RawSwizzle = swz[2];
     return a;
 }
 
@@ -187,6 +181,7 @@ Fetch DecodeFetch(const uint32_t* w)
     if (f.opcode == 0)
     {
         f.constIndex = Bits(w[0], 20, 5) * 3 + Bits(w[0], 25, 2);
+        f.srcSwizzle = Bits(w[0], 30, 2);
         f.isSigned = Bits(w[1], 12, 1);
         f.isNormalized = Bits(w[1], 13, 1) == 0;
         f.format = Bits(w[1], 16, 6);
@@ -197,12 +192,15 @@ Fetch DecodeFetch(const uint32_t* w)
     else
     {
         f.constIndex = Bits(w[0], 20, 5);
+        f.denormalized = Bits(w[0], 25, 1);
         f.srcSwizzle = Bits(w[0], 26, 6);
         f.dimension = Bits(w[2], 14, 2);
     }
     return f;
 }
 
+namespace
+{
 std::string FetchSwizzleText(uint32_t swz)
 {
     std::string s;

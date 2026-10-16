@@ -14,15 +14,13 @@ main menu, presenting at a steady 60 Hz with the menu videos and showcase car
 loaded. A window with a D3D12 swap chain presents every frame (a placeholder
 clear for now; `FM2_HEADLESS=1` runs without it).
 
-Renderer progress: the command stream is tracked (constants, shader loads,
-draws), Xenos textures decode correctly (tiling, endianness, DXT1/3/5,
-8888, 565, 8-bit), and the window shows the textures each frame draws with.
-Shader microcode decodes and disassembles; translation to HLSL is next. Phase 2 is under way: the
-renderer will be driven by the PM4 command stream (see the scope, section 4a).
-
-Stand-ins until their phase: XMA decoding writes silence, audio output is
-discarded, user 0 is a keyboard-driven gamepad (Enter = Start, Space = A,
-Backspace = B, arrows = D-pad).
+Renderer progress: the native D3D12 renderer draws the game. Xenos shaders
+are translated to HLSL (all menu/title shaders so far), vertices and indices
+are fetched in the translated vertex shader, textures are decoded and cached
+by content, EDRAM resolves become GPU copies into host textures, and
+predicated tiling is drawn tile by tile in screen space. The title screen,
+the attract video and the loading screen render correctly. After Start the
+game stays on the loading screen; that is the next thing to chase.
 
 ## Building
 
@@ -56,10 +54,16 @@ code (`out/ppc`, ~131 MB) is generated from your own copy and never committed.
 | `FM2_TRACE_FILES=1` | Log file opens and misses |
 | `FM2_AUTOSTART=1` | Tap Start + A every 3 s |
 | `FM2_DUMP_SHADERS=1` | Save every distinct shader's microcode to `Documentsm2\shaders` |
-| `FM2_DUMP_FRAME=<n>` | Write the n-th composed frame to `frame.png` |
+| `FM2_DUMP_FRAME=<n>` | Write the n-th rendered frame to `frame.png` |
+| `FM2_TRACE_DRAWS=<n>` | Log every draw, skip and resolve of frame n |
+| `FM2_DUMP_TEXTURE=<hex address>` | Write that texture, decoded, to `texture.png` |
+| `FM2_DUMP_HLSL=1` | Log each translated shader |
+| `FM2_TRACE_PRED=1` | Log predicated packets under tiling |
+| `FM2_TEXVIEW=1` | Show decoded textures instead of rendering |
 | `FM2_HEADLESS=1` | No window |
 
-`build/rel/xenos_dis.exe <shaders...>` disassembles captured Xenos microcode.
+`build/rel/xenos_dis.exe <shaders...>` disassembles captured Xenos microcode;
+`--hlsl` translates and compiles them instead.
 
 `tools/callgraph.py` indexes the generated code (`build`, `callers sub_X`,
 `at <address>`); `build/tools/dis.exe <xex> <address> <count>` disassembles.

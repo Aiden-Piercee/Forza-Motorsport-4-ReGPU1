@@ -65,6 +65,28 @@ void Check(HRESULT hr, const char* what)
         Fatal("presenter: %s failed (%08lX)", what, hr);
 }
 
+std::mutex g_deviceMutex;
+ComPtr<ID3D12Device> g_device;
+ComPtr<ID3D12CommandQueue> g_queue;
+std::atomic<bool> g_rendererActive{ false };
+
+void EnsureDevice()
+{
+    std::lock_guard lock(g_deviceMutex);
+    if (g_device)
+        return;
+    if (getenv("FM2_D3D12_DEBUG"))
+    {
+        ComPtr<ID3D12Debug> debug;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))
+            debug->EnableDebugLayer();
+    }
+    Check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_device)), "D3D12CreateDevice");
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    Check(g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_queue)), "CreateCommandQueue");
+}
+
 void CreateWindowAndDevice()
 {
     WNDCLASSW wc{};
@@ -80,11 +102,9 @@ void CreateWindowAndDevice()
 
     ComPtr<IDXGIFactory4> factory;
     Check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2");
-    Check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_p.device)), "D3D12CreateDevice");
-
-    D3D12_COMMAND_QUEUE_DESC qd{};
-    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    Check(g_p.device->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_p.queue)), "CreateCommandQueue");
+    EnsureDevice();
+    g_p.device = g_device;
+    g_p.queue = g_queue;
 
     DXGI_SWAP_CHAIN_DESC1 sd{};
     sd.Width = kWidth;
@@ -222,7 +242,7 @@ void RenderThread()
             std::unique_lock lock(g_p.mutex);
             g_p.cv.wait_for(lock, std::chrono::milliseconds(16), [] { return g_p.pendingFrame != g_p.presentedFrame; });
             frame = g_p.pendingFrame;
-            if (frame == g_p.presentedFrame)
+            if (frame == g_p.presentedFrame || g_rendererActive)
                 continue;
             g_p.presentedFrame = frame;
         }
@@ -262,4 +282,46 @@ void PresenterSubmitImage(uint32_t width, uint32_t height, std::vector<uint8_t> 
         g_p.pendingFrame++;
     }
     g_p.cv.notify_one();
+}
+
+ID3D12Device* RenderDevice()
+{
+    EnsureDevice();
+    return g_device.Get();
+}
+
+ID3D12CommandQueue* RenderQueue()
+{
+    EnsureDevice();
+    return g_queue.Get();
+}
+
+void PresenterUseRenderer()
+{
+    g_rendererActive = true;
+}
+
+bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src)
+{
+    if (!g_p.ready)
+        return false;
+    const UINT i = g_p.swapChain->GetCurrentBackBufferIndex();
+    ID3D12Resource* backBuffer = g_p.backBuffers[i].Get();
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = backBuffer;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    list->ResourceBarrier(1, &b);
+    list->CopyResource(backBuffer, src);
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    list->ResourceBarrier(1, &b);
+    return true;
+}
+
+void PresenterPresent()
+{
+    if (g_p.ready)
+        g_p.swapChain->Present(0, DXGI_PRESENT_ALLOW_TEARING);
 }

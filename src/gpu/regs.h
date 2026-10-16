@@ -28,5 +28,5 @@ enum class ShaderType
     Pixel = 1,
 };
 void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwords, uint32_t guestAddress);
-void FrameOnDraw(uint32_t initiator);
-void FrameOnSwap(uint64_t frame);
+void FrameOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize);
+void FrameOnSwap(uint64_t frame, uint32_t frontBuffer);

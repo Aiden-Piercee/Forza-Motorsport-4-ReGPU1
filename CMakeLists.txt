@@ -27,12 +27,13 @@ target_compile_options(fm2_ppc PRIVATE -gline-tables-only "/FI${CMAKE_SOURCE_DIR
 file(GLOB_RECURSE FM2_SOURCES CONFIGURE_DEPENDS src/*.cpp)
 add_executable(fm2 ${FM2_SOURCES})
 target_include_directories(fm2 PRIVATE src)
-target_link_libraries(fm2 PRIVATE fm2_ppc XenonUtils synchronization winmm onecore d3d12 dxgi)
+target_link_libraries(fm2 PRIVATE fm2_ppc XenonUtils synchronization winmm onecore d3d12 dxgi d3dcompiler)
 target_compile_definitions(fm2 PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 target_compile_options(fm2 PRIVATE -gline-tables-only)
 target_link_options(fm2 PRIVATE /STACK:0x1000000 /DEBUG)
 target_link_libraries(fm2 PRIVATE dbghelp)
 
 # Xenos shader disassembler for captured microcode.
-add_executable(xenos_dis tools/xenos_dis.cpp src/gpu/ucode.cpp)
+add_executable(xenos_dis tools/xenos_dis.cpp src/gpu/ucode.cpp src/gpu/hlsl.cpp)
 target_include_directories(xenos_dis PRIVATE src)
+target_link_libraries(xenos_dis PRIVATE d3dcompiler)
