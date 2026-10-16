@@ -332,3 +332,32 @@ void TlsFreeSlot(uint32_t slot)
     if (slot < g_tlsUsed.size())
         g_tlsUsed[slot] = false;
 }
+
+// Per-thread CPU use since the previous call, as a percentage of wall time.
+std::string GuestThreadCpuUsage(double wallSeconds)
+{
+    static std::unordered_map<uint32_t, uint64_t> last;
+    std::string out;
+    std::lock_guard lock(g_threadsMutex);
+    for (auto& [kthread, weak] : g_threadsByKthread)
+    {
+        auto object = weak.lock();
+        if (!object || object->exited || !object->thread->hostHandle)
+            continue;
+        GuestThread& t = *object->thread;
+        FILETIME c, e, k, u;
+        if (!GetThreadTimes(t.hostHandle, &c, &e, &k, &u))
+            continue;
+        const uint64_t total = (uint64_t(k.dwHighDateTime) << 32 | k.dwLowDateTime) + (uint64_t(u.dwHighDateTime) << 32 | u.dwLowDateTime);
+        const uint64_t delta = total - last[t.id];
+        last[t.id] = total;
+        const double pct = delta / 1e7 / wallSeconds * 100.0;
+        if (pct >= 5.0)
+        {
+            char s[48];
+            snprintf(s, sizeof(s), " t%u:%.0f%%", t.id, pct);
+            out += s;
+        }
+    }
+    return out;
+}

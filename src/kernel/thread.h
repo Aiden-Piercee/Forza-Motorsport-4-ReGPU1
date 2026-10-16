@@ -88,6 +88,7 @@ int SuspendGuestThread(GuestThread& thread);
 
 GuestThread* CurrentGuestThread();
 void LogGuestThreads(); // debugging: last call site of every thread
+std::string GuestThreadCpuUsage(double wallSeconds); // " t3:85% t7:40%" since the last call
 std::shared_ptr<ThreadObject> FindThreadByKthread(uint32_t kthread);
 
 // Calls guest code at address with the current thread's registers.

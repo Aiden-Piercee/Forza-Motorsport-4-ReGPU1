@@ -4,6 +4,7 @@
 // draw. Vblank interrupts run at 60 Hz. Phase 2 replaces drawing with a
 // native renderer hooked at the D3D level.
 #include <atomic>
+#include <map>
 #include <deque>
 #include <chrono>
 #include <thread>
@@ -337,6 +338,23 @@ uint32_t ExecutePacket(uint32_t ptr)
             const auto us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count();
             g_gpu.waits++;
             g_gpu.waitMicros += us;
+            static const bool perf = getenv("FM2_PERF") != nullptr;
+            if (perf)
+            {
+                // Time per wait target, logged every 2 s.
+                static std::map<std::pair<uint32_t, uint32_t>, uint64_t> byTarget;
+                static auto lastLog = Clock::now();
+                byTarget[{ arg(1) | ((info & 0x10) ? 0x80000000u : 0), info & 7 }] += uint64_t(us);
+                if (Clock::now() - lastLog > std::chrono::seconds(2))
+                {
+                    lastLog = Clock::now();
+                    for (auto& [key, total] : byTarget)
+                        if (total > 20000)
+                            Log("perf: CP waited %llu ms on %s %08X (fn %u)", (unsigned long long)(total / 1000), (key.first >> 31) ? "mem" : "reg",
+                                key.first & 0x7FFFFFFF, key.second);
+                    byTarget.clear();
+                }
+            }
             if (us > 1000)
                 g_gpu.slowWaits++;
         }
@@ -485,6 +503,12 @@ void CommandProcessorLoop(PPCContext& ctx)
                 used = ExecutePacket(scratch);
             }
             g_gpu.rptr = (g_gpu.rptr + used) % size;
+            // Publish progress packet by packet: the title waits for ring
+            // space by polling this, and only publishing once the ring is
+            // drained made it and the CP take turns instead of overlapping.
+            SetReg(CP_RB_RPTR, g_gpu.rptr);
+            if (const uint32_t wb = g_gpu.rptrWriteback)
+                StoreBE32(wb, g_gpu.rptr);
         }
         SetReg(CP_RB_RPTR, g_gpu.rptr);
         if (const uint32_t wb = g_gpu.rptrWriteback)

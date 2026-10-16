@@ -9,6 +9,7 @@
 // next.
 
 #include <algorithm>
+#include <immintrin.h>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -33,6 +34,7 @@
 #include "gpu/texture.h"
 #include "gpu/ucode.h"
 #include "kernel/runtime.h"
+#include "kernel/thread.h"
 #include "log.h"
 #include "png.h"
 #include "render/presenter.h"
@@ -45,8 +47,9 @@ namespace
 constexpr UINT kWidth = 1280, kHeight = 720;
 constexpr UINT kFrames = 3;
 constexpr UINT64 kRingSize = 64ull << 20;
-constexpr UINT kDescriptorsPerFrame = 34 * 8192; // 8192 draws
-constexpr UINT kTableSize = 66; // t0 upload ring, t1-t32 2D textures, t33 guest memory, t34-t65 cube textures
+constexpr UINT kDescriptorsPerFrame = 8192; // per frame: ring + guest memory views, then resolve-blit views
+constexpr UINT kBindless = 1u << 16;      // permanent texture descriptors (0 null 2D, 1 null cube)
+constexpr UINT kBindlessBase = kDescriptorsPerFrame * 3;
 // The EDRAM colour target: half floats hold the title's HDR (7e3) range.
 constexpr DXGI_FORMAT kColorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 constexpr UINT kMaxSurfaces = 64; // EDRAM bases with host surfaces
@@ -128,6 +131,30 @@ struct FrameResources
     std::vector<ComPtr<ID3D12Resource>> garbage; // released once this frame's work completes
 };
 
+struct PipelineKey
+{
+    uint64_t vs, ps;
+    uint32_t blend, depth, stencilMaskMode, flags;
+    bool operator==(const PipelineKey&) const = default;
+};
+struct PipelineKeyHash
+{
+    size_t operator()(const PipelineKey& k) const
+    {
+        uint64_t h = k.vs * 0x9E3779B97F4A7C15ull ^ k.ps;
+        h ^= (uint64_t(k.blend) << 32 | k.depth) * 0xC2B2AE3D27D4EB4Full;
+        h ^= (uint64_t(k.stencilMaskMode) << 32 | k.flags) * 0x165667B19E3779F9ull;
+        return size_t(h ^ (h >> 29));
+    }
+};
+
+struct BoundTexture
+{
+    ID3D12Resource* texture;
+    DXGI_FORMAT format;
+    bool cube;
+};
+
 struct Renderer
 {
     ID3D12Device* device = nullptr;
@@ -168,10 +195,20 @@ struct Renderer
     D3D12_RESOURCE_STATES colorState = D3D12_RESOURCE_STATE_RENDER_TARGET;
 
     std::unordered_map<uint64_t, std::unique_ptr<CompiledShader>> shaders;
-    std::unordered_map<std::string, ComPtr<ID3D12PipelineState>> pipelines;
+    std::unordered_map<PipelineKey, ComPtr<ID3D12PipelineState>, PipelineKeyHash> pipelines;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, CachedTexture> textures;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, CachedTexture> cubes;
     std::unordered_map<uint32_t, CachedTexture> mipChains; // resolved textures with their mips, by base
+    // Bindless texture descriptors.
+    struct BindlessEntry
+    {
+        UINT index;
+        ComPtr<ID3D12Resource> resource; // kept alive while the descriptor may be used
+        uint64_t lastFrame;
+    };
+    std::unordered_map<uint64_t, BindlessEntry> bindless; // by resource pointer, format, cube
+    std::vector<UINT> bindlessFree;
+    UINT bindlessNext = 2;
     std::unordered_map<uint32_t, ResolvedTexture> resolved; // by physical address
 
     // Active shaders: the last microcode loaded per stage.
@@ -334,8 +371,17 @@ void Init()
     // Root signature: b0, b1 root CBVs; one table t0-t32; four static samplers.
     D3D12_DESCRIPTOR_RANGE range{};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    range.NumDescriptors = kTableSize;
-    D3D12_ROOT_PARAMETER params[3]{};
+    range.NumDescriptors = 2; // t0 upload ring, t1 guest memory
+    D3D12_DESCRIPTOR_RANGE bindless[2]{};
+    for (UINT i = 0; i < 2; i++)
+    {
+        // 2D textures in space1, cubes in space2, over the same descriptors.
+        bindless[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        bindless[i].NumDescriptors = kBindless;
+        bindless[i].RegisterSpace = 1 + i;
+        bindless[i].OffsetInDescriptorsFromTableStart = 0;
+    }
+    D3D12_ROOT_PARAMETER params[4]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -346,6 +392,10 @@ void Init()
     params[2].DescriptorTable.NumDescriptorRanges = 1;
     params[2].DescriptorTable.pDescriptorRanges = &range;
     params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[3].DescriptorTable.NumDescriptorRanges = 2;
+    params[3].DescriptorTable.pDescriptorRanges = bindless;
+    params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_STATIC_SAMPLER_DESC samplers[4]{};
     const D3D12_FILTER filters[4] = { D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_FILTER_MIN_MAG_MIP_POINT,
         D3D12_FILTER_MIN_MAG_MIP_POINT };
@@ -360,7 +410,7 @@ void Init()
         samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     }
     D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 3;
+    rs.NumParameters = 4;
     rs.pParameters = params;
     rs.NumStaticSamplers = 4;
     rs.pStaticSamplers = samplers;
@@ -371,11 +421,11 @@ void Init()
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kDescriptorsPerFrame * kFrames;
+    hd.NumDescriptors = kBindlessBase + kBindless;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     Check(d->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_r.srvHeap)), "CreateDescriptorHeap(srv)");
     g_r.srvStride = d->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    hd.NumDescriptors = 2;
+    hd.NumDescriptors = 2 + 2 * kFrames; // null 2D, null cube, per frame: ring and guest-memory raw views
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     Check(d->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_r.stagingHeap)), "CreateDescriptorHeap(staging)");
     hd.NumDescriptors = 1;
@@ -388,6 +438,8 @@ void Init()
     nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
     nullSrv.TextureCube.MipLevels = 1;
     d->CreateShaderResourceView(nullptr, &nullSrv, Cpu(g_r.stagingHeap.Get(), 1, g_r.srvStride));
+    d->CopyDescriptorsSimple(2, Cpu(g_r.srvHeap.Get(), kBindlessBase, g_r.srvStride), Cpu(g_r.stagingHeap.Get(), 0, g_r.srvStride),
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     // Guest physical memory for the GPU, in place: vertex fetches read it
     // without copies.
@@ -450,6 +502,8 @@ void Init()
     g_r.ok = true;
     Log("renderer: D3D12 renderer ready");
 }
+
+double g_gpuWaitSeconds = 0; // CP thread blocked on the host GPU (frame resources)
 
 FrameResources& Frame() { return g_r.frames[g_r.frameIndex]; }
 
@@ -530,6 +584,64 @@ void SelectSurfaces(bool force)
     g_r.list->OMSetRenderTargets(1, &g_r.rtv, FALSE, &g_r.dsv);
 }
 
+// Bindless texture descriptors: one per (resource, format, dimension), kept
+// while the texture is in use. Entries unused for a few frames (replaced or
+// dropped textures) go back to the free list; their resources are released
+// once the GPU is done with the frame that last used them.
+UINT BindlessIndex(ID3D12Resource* resource, DXGI_FORMAT format, bool cube)
+{
+    const uint64_t key = uint64_t(reinterpret_cast<uintptr_t>(resource)) << 8 ^ uint64_t(format) << 1 ^ uint64_t(cube);
+    auto it = g_r.bindless.find(key);
+    if (it != g_r.bindless.end())
+    {
+        it->second.lastFrame = g_r.frame;
+        return it->second.index;
+    }
+    UINT index;
+    if (!g_r.bindlessFree.empty())
+    {
+        index = g_r.bindlessFree.back();
+        g_r.bindlessFree.pop_back();
+    }
+    else if (g_r.bindlessNext < kBindless)
+        index = g_r.bindlessNext++;
+    else
+        return cube ? 1u : 0u; // full: draw with a null texture
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = format;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    if (cube)
+    {
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+        srv.TextureCube.MipLevels = UINT(-1);
+    }
+    else
+    {
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Texture2D.MipLevels = UINT(-1); // all levels (resolved mip chains)
+    }
+    g_r.device->CreateShaderResourceView(resource, &srv, Cpu(g_r.srvHeap.Get(), kBindlessBase + index, g_r.srvStride));
+    g_r.bindless[key] = { index, resource, g_r.frame };
+    return index;
+}
+
+void EvictBindless()
+{
+    if (g_r.frame % 16 != 0)
+        return;
+    for (auto it = g_r.bindless.begin(); it != g_r.bindless.end();)
+    {
+        if (it->second.lastFrame + kFrames + 2 < g_r.frame)
+        {
+            Frame().garbage.push_back(std::move(it->second.resource));
+            g_r.bindlessFree.push_back(it->second.index);
+            it = g_r.bindless.erase(it);
+        }
+        else
+            ++it;
+    }
+}
+
 void BeginFrameIfNeeded()
 {
     if (g_r.listOpen)
@@ -537,15 +649,35 @@ void BeginFrameIfNeeded()
     FrameResources& f = Frame();
     if (g_r.fence->GetCompletedValue() < f.fence)
     {
+        const auto w0 = std::chrono::steady_clock::now();
         g_r.fence->SetEventOnCompletion(f.fence, g_r.fenceEvent);
         WaitForSingleObject(g_r.fenceEvent, INFINITE);
+        g_gpuWaitSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
     }
     f.garbage.clear();
     f.allocator->Reset();
     g_r.list->Reset(f.allocator.Get(), nullptr);
     f.ringUsed = 0;
     f.uploads.clear();
-    f.descriptorsUsed = 0;
+    // Per-frame table: t0 this frame's ring, t1 guest physical memory.
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC raw{};
+        raw.Format = DXGI_FORMAT_R32_TYPELESS;
+        raw.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        raw.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        raw.Buffer.NumElements = UINT(kRingSize / 4);
+        raw.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        g_r.device->CreateShaderResourceView(f.ring.Get(), &raw, Cpu(g_r.srvHeap.Get(), f.descriptorBase, g_r.srvStride));
+        if (g_r.physical)
+        {
+            raw.Buffer.NumElements = UINT(g_r.physical->GetDesc().Width / 4);
+            g_r.device->CreateShaderResourceView(g_r.physical.Get(), &raw, Cpu(g_r.srvHeap.Get(), f.descriptorBase + 1, g_r.srvStride));
+        }
+        else
+            g_r.device->CreateShaderResourceView(f.ring.Get(), &raw, Cpu(g_r.srvHeap.Get(), f.descriptorBase + 1, g_r.srvStride));
+    }
+    f.descriptorsUsed = 2;
+    EvictBindless();
     ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get() };
     g_r.list->SetDescriptorHeaps(1, heaps);
     g_r.list->SetGraphicsRootSignature(g_r.rootSignature.Get());
@@ -663,7 +795,7 @@ struct ShaderCompiler
         // larger translated shaders.
         const auto start = std::chrono::steady_clock::now();
         const HRESULT hr = D3DCompile(cs.info.hlsl.data(), cs.info.hlsl.size(), nullptr, nullptr, nullptr, "main",
-            cs.pixel ? "ps_5_1" : "vs_5_1", D3DCOMPILE_SKIP_OPTIMIZATION, 0, &cs.code, &errors);
+            cs.pixel ? "ps_5_1" : "vs_5_1", D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0, &cs.code, &errors);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         if (FAILED(hr))
         {
@@ -815,9 +947,8 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     const uint32_t stencil = gpureg::Get(RB_STENCILREFMASK) & 0xFFFF00, mode = gpureg::Get(PA_SU_SC_MODE_CNTL) & 7;
     // Alpha-to-mask (RB_COLORCONTROL bit 4): cut-out foliage and fences.
     const bool alphaToMask = (gpureg::Get(RB_COLORCONTROL) >> 4) & 1;
-    char key[112];
-    snprintf(key, sizeof(key), "%016llx%016llx%08x%08x%x%06x%x%d%d", (unsigned long long)g_r.vsHash, (unsigned long long)g_r.psHash, blend, depth, mask,
-        stencil, mode, alphaToMask, cullable);
+    PipelineKey key{ g_r.vsHash, g_r.psHash, blend, depth, stencil | (mask << 24) | (mode << 28),
+        uint32_t(alphaToMask) | (uint32_t(cullable) << 1) };
     auto it = g_r.pipelines.find(key);
     if (it != g_r.pipelines.end())
         return it->second.Get();
@@ -881,7 +1012,7 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     ComPtr<ID3D12PipelineState> pso;
     if (FAILED(g_r.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso))))
     {
-        Log("renderer: pipeline %s failed", key);
+        Log("renderer: pipeline %016llx/%016llx failed", (unsigned long long)key.vs, (unsigned long long)key.ps);
         g_r.pipelines[key] = nullptr;
         return nullptr;
     }
@@ -1558,8 +1689,42 @@ void TraceSkip(const char* why, uint32_t initiator)
 }
 }
 
+namespace
+{
+// Performance counters (FM2_PERF=1 logs them once a second).
+struct Perf
+{
+    std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
+    double drawSeconds = 0, swapSeconds = 0;
+    double section[8] = {};
+    uint64_t tablesBuilt = 0, tablesReused = 0;
+    std::chrono::steady_clock::time_point mark;
+    uint64_t frames = 0, draws = 0;
+} g_perf;
+void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize);
+}
+
 void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
+    const auto t0 = std::chrono::steady_clock::now();
+    DrawImpl(initiator, dmaBase, dmaSize);
+    g_perf.drawSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    g_perf.draws++;
+}
+
+namespace
+{
+void Section(int i)
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (i > 0)
+        g_perf.section[i - 1] += std::chrono::duration<double>(now - g_perf.mark).count();
+    g_perf.mark = now;
+}
+
+void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
+{
+    Section(0);
     static const bool noRender = getenv("FM2_NO_RENDER") != nullptr;
     if (noRender)
         return;
@@ -1580,19 +1745,29 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     const CompiledShader& vs = GetShader(g_r.vsHash, g_r.vsCode, false);
     const CompiledShader& ps = GetShader(g_r.psHash, g_r.psCode, true);
+    Section(1);
     if (!vs.IsReady() || !ps.IsReady())
     {
         TraceSkip(vs.state == CompiledShader::Failed || ps.state == CompiledShader::Failed ? "shader" : "compiling", initiator);
         g_r.skippedThisFrame++;
         return;
     }
+    // Triangle lists and restart-free strips read their indices on the GPU;
+    // everything else is expanded here.
+    const uint32_t prim = initiator & 0x3F, indexSource = (initiator >> 6) & 3, indexCount = initiator >> 16;
+    const bool restartOn = (gpureg::Get(PA_SU_SC_MODE_CNTL) >> 21) & 1;
+    static const bool noDirectIndex = getenv("FM2_NO_DIRECT_INDEX") != nullptr;
+    const bool directIndex = g_r.physical && !noDirectIndex && (indexSource == 0 || indexSource == 2) &&
+        (prim == 4 || prim == 13 || (prim == 6 && !restartOn));
+    const uint32_t directVertices = prim == 4 ? indexCount / 3 * 3 : prim == 13 ? indexCount / 4 * 6 : (indexCount >= 3 ? (indexCount - 2) * 3 : 0);
     std::vector<uint32_t> list;
-    if (!BuildIndexList(initiator, dmaBase, dmaSize, list) || list.empty())
+    if (directIndex ? directVertices == 0 : (!BuildIndexList(initiator, dmaBase, dmaSize, list) || list.empty()))
     {
         TraceSkip("primitive", initiator);
         g_r.skippedThisFrame++;
         return;
     }
+    Section(2);
     {
         // Debug bisection: FM2_SKIP_DRAWS=a-b drops draws a..b-1 of the FM2_DUMP_FRAME frame.
         static uint32_t skipFrom = 0, skipTo = 0;
@@ -1629,14 +1804,16 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     FrameResources& f = Frame();
 
+    Section(3);
     // Index list.
-    const UINT64 listOffset = RingAlloc(list.size() * 4, 16);
+    const UINT64 listOffset = directIndex ? 0 : RingAlloc(list.size() * 4, 16);
     if (listOffset == ~0ull)
     {
         TraceSkip("ring full", initiator);
         return;
     }
-    memcpy(f.ringCpu + listOffset, list.data(), list.size() * 4);
+    if (!directIndex)
+        memcpy(f.ringCpu + listOffset, list.data(), list.size() * 4);
 
     // Vertex constants: c[256], bools, fetch table, info.
     struct VSConstants
@@ -1666,11 +1843,17 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     auto* vc = reinterpret_cast<VSConstants*>(f.ringCpu + vsOffset);
     auto* pc = reinterpret_cast<PSConstants*>(f.ringCpu + psOffset);
-    for (uint32_t i = 0; i < 256 * 4; i++)
     {
-        const uint32_t v = gpureg::Get(gpureg::AluConstants + i), p = gpureg::Get(gpureg::AluConstants + 1024 + i);
-        memcpy(&vc->c[i / 4][i % 4], &v, 4);
-        memcpy(&pc->c[i / 4][i % 4], &p, 4);
+        // Byte-swapped block copy of both constant banks (1024 dwords each).
+        const __m128i swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+        const auto* src = GuestPtr<const __m128i>(gpureg::kBase + gpureg::AluConstants * 4);
+        auto* dv = reinterpret_cast<__m128i*>(vc->c);
+        auto* dp = reinterpret_cast<__m128i*>(pc->c);
+        for (uint32_t i = 0; i < 256; i++)
+        {
+            _mm_storeu_si128(dv + i, _mm_shuffle_epi8(_mm_loadu_si128(src + i), swap));
+            _mm_storeu_si128(dp + i, _mm_shuffle_epi8(_mm_loadu_si128(src + 256 + i), swap));
+        }
     }
     for (uint32_t i = 0; i < 8; i++)
         vc->b[i] = pc->b[i] = gpureg::Get(gpureg::BoolConstants + i);
@@ -1711,6 +1894,13 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     vc->voffset[3] = 0;
     vc->vte[0] = gpureg::Get(PA_CL_VTE_CNTL);
     vc->vte[1] = vc->vte[2] = vc->vte[3] = 0;
+    if (directIndex)
+    {
+        const bool is32 = (initiator >> 11) & 1;
+        vc->vte[1] = 1u | (prim == 6 ? 2u : 0u) | (prim == 13 ? 64u : 0u) | (is32 ? 4u : 0u) | (indexSource == 2 ? 8u : 0u) | ((dmaSize >> 30) << 4);
+        vc->vte[2] = dmaBase & 0x1FFFFFFF & ~(is32 ? 3u : 1u);
+        vc->vte[3] = gpureg::Get(VGT_INDX_OFFSET);
+    }
     vc->info[2] = kWidth;
     vc->info[3] = kHeight;
     // Point sizes are 12.4 fixed-point radii.
@@ -1725,94 +1915,49 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     pc->info[0] = (colorControl >> 3) & 1 ? (colorControl & 7) : 7;
     pc->info2[0] = RegFloat(RB_ALPHA_REF);
 
-    // Descriptor table: t0 = upload ring (raw), t1+ = textures.
-    if (f.descriptorsUsed + kTableSize > kDescriptorsPerFrame)
-    {
-        TraceSkip("descriptors", initiator);
-        return;
-    }
-    const UINT table = f.descriptorBase + f.descriptorsUsed;
-    f.descriptorsUsed += kTableSize;
-    D3D12_SHADER_RESOURCE_VIEW_DESC raw{};
-    raw.Format = DXGI_FORMAT_R32_TYPELESS;
-    raw.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-    raw.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    raw.Buffer.NumElements = UINT(kRingSize / 4);
-    raw.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-    g_r.device->CreateShaderResourceView(f.ring.Get(), &raw, Cpu(g_r.srvHeap.Get(), table, g_r.srvStride));
-    if (g_r.physical)
-    {
-        raw.Buffer.NumElements = UINT(g_r.physical->GetDesc().Width / 4);
-        g_r.device->CreateShaderResourceView(g_r.physical.Get(), &raw, Cpu(g_r.srvHeap.Get(), table + 33, g_r.srvStride));
-    }
-    else
-        g_r.device->CopyDescriptorsSimple(1, Cpu(g_r.srvHeap.Get(), table + 33, g_r.srvStride), Cpu(g_r.stagingHeap.Get(), 0, g_r.srvStride), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    Section(4);
+    // Textures are bindless: each one has a permanent descriptor in the heap's
+    // bindless region, and the draw passes its index in the constants.
     memset(pc->tinfo, 0, sizeof(pc->tinfo));
     memset(pc->tbias, 0, sizeof(pc->tbias));
-    for (uint32_t slot = 0; slot < 32; slot++)
+    const uint32_t usedSlots = ps.info.usedTextureSlots | vs.info.usedTextureSlots;
+    for (uint32_t m = usedSlots; m; m &= m - 1)
     {
-        const auto dest = Cpu(g_r.srvHeap.Get(), table + 1 + slot, g_r.srvStride);
-        const auto destCube = Cpu(g_r.srvHeap.Get(), table + 34 + slot, g_r.srvStride);
-        ID3D12Resource* texture = nullptr;
-        DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        TextureFetch fetch{};
-        bool cube = false;
-        if (((ps.info.usedTextureSlots | vs.info.usedTextureSlots) >> slot) & 1)
+        const uint32_t slot = uint32_t(__builtin_ctz(m));
+        const TextureFetch fetch = ReadTextureFetch(slot);
+        const bool cube = fetch.Dimension() == 3;
+        static const uint64_t dumpPs = getenv("FM2_DUMP_PS_TEXTURES") ? strtoull(getenv("FM2_DUMP_PS_TEXTURES"), nullptr, 16) : 0;
+        if (dumpPs && g_r.psHash == dumpPs && !cube)
         {
-            fetch = ReadTextureFetch(slot);
-            cube = fetch.Dimension() == 3;
-            static const uint64_t dumpPs = getenv("FM2_DUMP_PS_TEXTURES") ? strtoull(getenv("FM2_DUMP_PS_TEXTURES"), nullptr, 16) : 0;
             static std::set<uint32_t> dumped;
-            if (dumpPs && g_r.psHash == dumpPs && !cube && dumped.insert(fetch.Address()).second)
+            std::vector<uint8_t> rgba;
+            if (dumped.insert(fetch.Address()).second && DecodeTexture(fetch, rgba))
             {
-                std::vector<uint8_t> rgba;
-                if (DecodeTexture(fetch, rgba))
-                {
-                    char name[80];
-                    std::filesystem::create_directories("out/tex");
-                    snprintf(name, sizeof(name), "out/tex/t%u_%08X_%s_%ux%u_sw%03X.png", slot, fetch.Address(), TextureFormatName(fetch.Format()), fetch.Width(),
-                        fetch.Height(), fetch.Swizzle());
-                    WritePng(name, fetch.Width(), fetch.Height(), rgba);
-                }
+                char name[80];
+                std::filesystem::create_directories("out/tex");
+                snprintf(name, sizeof(name), "out/tex/t%u_%08X_%s_%ux%u_sw%03X.png", slot, fetch.Address(), TextureFormatName(fetch.Format()), fetch.Width(),
+                    fetch.Height(), fetch.Swizzle());
+                WritePng(name, fetch.Width(), fetch.Height(), rgba);
             }
-            texture = cube ? GetCubeTexture(fetch, format) : GetTexture(fetch, format);
         }
+        DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        ID3D12Resource* texture = cube ? GetCubeTexture(fetch, format) : GetTexture(fetch, format);
+        const uint32_t index = texture ? BindlessIndex(texture, format, cube) : (cube ? 1u : 0u);
         // w: dimension (1 2D, 3 cube); bit 31 + bits 8-19: the fetch swizzle, applied in the
         // shader for textures that live on the GPU (resolves). Decoded ones are swizzled already.
         const bool onGpu = fetch.Type() == 2 && g_r.resolved.count(fetch.Address() & 0x1FFFFFFF);
         pc->tinfo[slot][3] = (cube ? 3 : 1) | (onGpu ? (1u << 31) | (fetch.Swizzle() << 8) : 0);
-        // The unused view of this slot gets a null descriptor of its kind.
-        g_r.device->CopyDescriptorsSimple(1, cube ? dest : destCube, Cpu(g_r.stagingHeap.Get(), cube ? 0 : 1, g_r.srvStride),
-            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        if (!texture)
-        {
-            g_r.device->CopyDescriptorsSimple(1, cube ? destCube : dest, Cpu(g_r.stagingHeap.Get(), cube ? 1 : 0, g_r.srvStride),
-                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            continue;
-        }
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-        srv.Format = format;
-        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        if (cube)
-        {
-            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-            srv.TextureCube.MipLevels = 1;
-        }
-        else
-        {
-            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            srv.Texture2D.MipLevels = UINT(-1); // all levels (resolved mip chains)
-        }
-        g_r.device->CreateShaderResourceView(texture, &srv, cube ? destCube : dest);
         // Clamp X (dword 0 bits 10-12): 0 wrap, else clamp. Filter: dword 3 bits 19-20 (mag): 0 point.
         const bool clamp = ((fetch.dwords[0] >> 10) & 7) != 0;
         const bool point = ((fetch.dwords[3] >> 19) & 3) == 0;
         pc->tinfo[slot][0] = (point ? (clamp ? 2 : 3) : (clamp ? 1 : 0)) | ((uint32_t(fetch.ExpAdjust()) & 0x3F) << 8);
         pc->tbias[slot][0] = fetch.LodBias();
+        memcpy(&pc->tbias[slot][1], &index, 4);
         pc->tinfo[slot][1] = fetch.Width();
         pc->tinfo[slot][2] = fetch.Height();
     }
 
+    Section(5);
     // Viewport.
     // The viewport transform happens in the vertex shader; D3D maps 1:1.
     const D3D12_VIEWPORT vp{ 0, 0, float(kWidth), float(kHeight), 0, 1 };
@@ -1834,7 +1979,8 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     g_r.list->SetPipelineState(pso);
     g_r.list->SetGraphicsRootConstantBufferView(0, f.ring->GetGPUVirtualAddress() + vsOffset);
     g_r.list->SetGraphicsRootConstantBufferView(1, f.ring->GetGPUVirtualAddress() + psOffset);
-    g_r.list->SetGraphicsRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), table, g_r.srvStride));
+    g_r.list->SetGraphicsRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), f.descriptorBase, g_r.srvStride));
+    g_r.list->SetGraphicsRootDescriptorTable(3, Gpu(g_r.srvHeap.Get(), kBindlessBase, g_r.srvStride));
     static const uint64_t traceFrame = getenv("FM2_TRACE_DRAWS") ? strtoull(getenv("FM2_TRACE_DRAWS"), nullptr, 10) : 0;
     if (traceFrame && g_r.frame + 1 == traceFrame)
     {
@@ -1886,11 +2032,45 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         for (uint32_t c : { 0u, 1u, 5u, 6u, 7u, 14u, 22u, 254u, 255u })
             Log("    pc%u = %g %g %g %g", c, pc->c[c][0], pc->c[c][1], pc->c[c][2], pc->c[c][3]);
     }
-    g_r.list->DrawInstanced(UINT(list.size()), 1, 0, 0);
+    g_r.list->DrawInstanced(directIndex ? directVertices : UINT(list.size()), 1, 0, 0);
+    Section(6);
     g_r.drawsThisFrame++;
 }
 
+}
+
+void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer);
 void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    RendererOnSwapImpl(frameNumber, frontBuffer);
+    const auto now = std::chrono::steady_clock::now();
+    g_perf.swapSeconds += std::chrono::duration<double>(now - t0).count();
+    g_perf.frames++;
+    static const bool perf = getenv("FM2_PERF") != nullptr;
+    const double window = std::chrono::duration<double>(now - g_perf.windowStart).count();
+    if (window >= 1.0)
+    {
+        if (perf && g_perf.frames)
+            Log("perf: %.1f fps, %.2f ms/frame | renderer draw %.2f ms, swap %.2f ms per frame | %.0f draws/frame", g_perf.frames / window,
+                window * 1000.0 / g_perf.frames, g_perf.drawSeconds * 1000.0 / g_perf.frames, g_perf.swapSeconds * 1000.0 / g_perf.frames,
+                double(g_perf.draws) / g_perf.frames);
+        if (perf && g_perf.frames)
+            Log("perf:   shaders %.2f | indices %.2f | pipeline %.2f | constants %.2f | textures %.2f | submit %.2f ms/frame",
+                g_perf.section[0] * 1000.0 / g_perf.frames, g_perf.section[1] * 1000.0 / g_perf.frames, g_perf.section[2] * 1000.0 / g_perf.frames,
+                g_perf.section[3] * 1000.0 / g_perf.frames, g_perf.section[4] * 1000.0 / g_perf.frames, g_perf.section[5] * 1000.0 / g_perf.frames);
+        if (perf)
+            Log("perf:   cpu%s", GuestThreadCpuUsage(window).c_str());
+        if (perf && g_perf.frames)
+            Log("perf:   waiting on host GPU %.2f ms/frame", g_gpuWaitSeconds * 1000.0 / g_perf.frames);
+        if (perf && g_perf.frames)
+            Log("perf:   descriptor tables built %.0f, reused %.0f per frame", double(g_perf.tablesBuilt) / g_perf.frames, double(g_perf.tablesReused) / g_perf.frames);
+        g_gpuWaitSeconds = 0;
+        g_perf = Perf{};
+    }
+}
+
+void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
 {
     if (!g_r.ok)
         return;

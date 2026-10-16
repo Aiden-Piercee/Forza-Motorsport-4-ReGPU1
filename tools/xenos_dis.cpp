@@ -52,7 +52,7 @@ int main(int argc, char** argv)
         ID3DBlob* code = nullptr;
         ID3DBlob* errors = nullptr;
         const HRESULT hr = D3DCompile(t.hlsl.data(), t.hlsl.size(), argv[i], nullptr, nullptr, "main", pixel ? "ps_5_1" : "vs_5_1",
-            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
+            D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0, &code, &errors);
         if (FAILED(hr))
         {
             printf("FAIL compile %s:\n%s\n", argv[i], errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
