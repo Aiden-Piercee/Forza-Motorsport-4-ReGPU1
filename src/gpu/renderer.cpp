@@ -712,6 +712,25 @@ const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& code
             if (size_t at = cs.info.hlsl.find(marker); at != std::string::npos)
                 cs.info.hlsl.insert(marker[0] == '}' ? at : at + marker.size(), "            " + s + "\n");
         }
+    // Debug: FM2_TINT_PS=h1,h2,... paints those pixel shaders in distinct flat
+    // colours (red, green, blue, yellow, magenta, cyan, white, orange, ...).
+    if (const char* list = getenv("FM2_TINT_PS"); list && pixel)
+    {
+        static const char* kTints[] = { "1,0,0", "0,1,0", "0,0,1", "1,1,0", "1,0,1", "0,1,1", "1,1,1", "1,0.5,0", "0.5,0,1", "0,0.5,0.3",
+            "0.5,0.5,0.5", "0.3,0.15,0" };
+        int n = 0;
+        for (const char* s = list; *s && n < 12; n++)
+        {
+            char* end;
+            const uint64_t h = strtoull(s, &end, 16);
+            if (h == hash)
+                if (size_t at = cs.info.hlsl.rfind("return oC[0];"); at != std::string::npos)
+                    cs.info.hlsl.replace(at, 13, std::string("return float4(") + kTints[n] + ", 1);");
+            s = *end == ',' ? end + 1 : end;
+            if (end == s && *end != ',')
+                break;
+        }
+    }
     // Debug: FM2_DEBUG_PS=<hash>:<expr> replaces that pixel shader's output, e.g.
     // "a62c809452fcc71b:float4(input.o[4].xyz, 1)".
     if (const char* dbg = getenv("FM2_DEBUG_PS"); dbg && pixel && strtoull(dbg, nullptr, 16) == hash)
@@ -1656,7 +1675,10 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             }
             texture = cube ? GetCubeTexture(fetch, format) : GetTexture(fetch, format);
         }
-        pc->tinfo[slot][3] = cube ? 3 : 1;
+        // w: dimension (1 2D, 3 cube); bit 31 + bits 8-19: the fetch swizzle, applied in the
+        // shader for textures that live on the GPU (resolves). Decoded ones are swizzled already.
+        const bool onGpu = fetch.Type() == 2 && g_r.resolved.count(fetch.Address() & 0x1FFFFFFF);
+        pc->tinfo[slot][3] = (cube ? 3 : 1) | (onGpu ? (1u << 31) | (fetch.Swizzle() << 8) : 0);
         // The unused view of this slot gets a null descriptor of its kind.
         g_r.device->CopyDescriptorsSimple(1, cube ? dest : destCube, Cpu(g_r.stagingHeap.Get(), cube ? 0 : 1, g_r.srvStride),
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);

@@ -155,9 +155,28 @@ float3 CubeDirection(float3 stf)
     }
 }
 
+float4 TFetchRaw(Texture2D<float4> t, TextureCube<float4> tc, uint slot, float3 coord, bool denorm, bool vertexStage);
+
+// Fetch swizzle (3 bits per channel: 0-3 component, 4 zero, 5 one) for
+// textures that live on the GPU; CPU-decoded textures are swizzled already.
 float4 TFetch(Texture2D<float4> t, TextureCube<float4> tc, uint slot, float3 coord, bool denorm, bool vertexStage)
 {
-    if (tinfo[slot].w == 3)
+    float4 v = TFetchRaw(t, tc, slot, coord, denorm, vertexStage);
+    uint w = tinfo[slot].w;
+    if (!(w >> 31))
+        return v;
+    float4 r;
+    [unroll] for (uint c = 0; c < 4; c++)
+    {
+        uint sel = (w >> (8 + 3 * c)) & 7u;
+        r[c] = sel < 4u ? v[sel] : (sel == 5u ? 1.0 : 0.0);
+    }
+    return r;
+}
+
+float4 TFetchRaw(Texture2D<float4> t, TextureCube<float4> tc, uint slot, float3 coord, bool denorm, bool vertexStage)
+{
+    if ((tinfo[slot].w & 0xFFu) == 3)
     {
         float3 dir = CubeDirection(coord);
         return vertexStage ? tc.SampleLevel(sLinearClamp, dir, 0) : tc.Sample(sLinearClamp, dir);
