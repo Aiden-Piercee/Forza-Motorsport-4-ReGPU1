@@ -22,7 +22,8 @@ ID3D12CommandQueue* RenderQueue();
 // Records copying src (COPY_SOURCE, 1280x720 RGBA8) into the current back
 // buffer; returns false when there is no window. Call PresenterPresent()
 // after executing the list.
-bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src);
+// overlay (COPY_SOURCE RGBA8, overlayW x overlayH) is copied over the top-left corner when given.
+bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, ID3D12Resource* overlay = nullptr, uint32_t overlayW = 0, uint32_t overlayH = 0);
 void PresenterPresent();
 // Called by the renderer: the presenter stops drawing its own frames.
 void PresenterUseRenderer();

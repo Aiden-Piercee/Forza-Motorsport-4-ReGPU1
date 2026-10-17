@@ -301,7 +301,7 @@ void PresenterUseRenderer()
     g_rendererActive = true;
 }
 
-bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src)
+bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, ID3D12Resource* overlay, uint32_t overlayW, uint32_t overlayH)
 {
     if (!g_p.ready)
         return false;
@@ -315,6 +315,15 @@ bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src)
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     list->ResourceBarrier(1, &b);
     list->CopyResource(backBuffer, src);
+    if (overlay)
+    {
+        D3D12_TEXTURE_COPY_LOCATION dst{}, from{};
+        dst.pResource = backBuffer;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        from.pResource = overlay;
+        from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        list->CopyTextureRegion(&dst, 24, 24, 0, &from, nullptr);
+    }
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
     list->ResourceBarrier(1, &b);
     return true;

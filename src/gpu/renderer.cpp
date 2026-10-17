@@ -24,6 +24,7 @@
 #include <cmath>
 #include <map>
 #include <set>
+#include <unordered_set>
 #include <unordered_map>
 
 #include <d3d12.h>
@@ -776,6 +777,100 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
     return offset;
 }
 
+// Compile activity, for the on-screen overlay and FM2_PERF.
+struct CompileStats
+{
+    std::atomic<int> busy{ 0 };            // jobs (shader compiles, pipeline builds) in flight
+    std::atomic<uint32_t> shadersBuilt{ 0 }, shadersCached{ 0 }, pipelinesBuilt{ 0 }, pipelinesLoaded{ 0 };
+    std::atomic<uint64_t> lastColdMs{ 0 };  // steady-clock ms of the last real compile
+    std::atomic<uint32_t> warmTotal{ 0 }, warmDone{ 0 };
+    std::mutex mutex;
+    std::string current;                    // what the oldest in-flight job is
+    std::chrono::steady_clock::time_point currentSince;
+    void Begin(const std::string& what)
+    {
+        std::lock_guard lock(mutex);
+        if (busy.load() == 0)
+            currentSince = std::chrono::steady_clock::now();
+        current = what;
+        busy++;
+    }
+    void End(bool cold)
+    {
+        busy--;
+        if (cold)
+            lastColdMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+} g_stats;
+
+// Everything the title has ever bound is recorded (shader microcode as files in
+// shadercache/, pipeline states in pipelines.manifest) so later runs rebuild all of
+// it in the background at boot instead of stalling the first time a race needs it.
+struct Manifest
+{
+    std::mutex mutex;
+    std::unordered_set<PipelineKey, PipelineKeyHash> known;
+    std::vector<PipelineKey> pending; // loaded at start, not built yet
+    size_t next = 0;
+    std::unordered_set<uint64_t> shaderFiles;
+
+    static std::filesystem::path Path() { return UserDir() / "pipelines.manifest"; }
+    static std::filesystem::path UcodePath(bool pixel, uint64_t hash)
+    {
+        char name[48];
+        snprintf(name, sizeof(name), "%s_%016llx.ucode", pixel ? "ps" : "vs", (unsigned long long)hash);
+        return UserDir() / "shadercache" / name;
+    }
+    void Load()
+    {
+        std::ifstream in(Path());
+        std::string line;
+        while (std::getline(in, line))
+        {
+            PipelineKey k{};
+            unsigned long long vs, ps;
+            if (sscanf(line.c_str(), "P %llx %llx %x %x %x %x", &vs, &ps, &k.blend, &k.depth, &k.stencilMaskMode, &k.flags) == 6)
+            {
+                k.vs = vs;
+                k.ps = ps;
+                if (known.insert(k).second)
+                    pending.push_back(k);
+            }
+        }
+        g_stats.warmTotal = uint32_t(pending.size());
+        Log("renderer: manifest lists %zu pipelines to rebuild", pending.size());
+    }
+    void RecordPipeline(const PipelineKey& k)
+    {
+        std::lock_guard lock(mutex);
+        if (!known.insert(k).second)
+            return;
+        std::ofstream(Path(), std::ios::app) << "P " << std::hex << k.vs << ' ' << k.ps << ' ' << k.blend << ' ' << k.depth << ' ' << k.stencilMaskMode
+                                              << ' ' << k.flags << '\n';
+    }
+    void RecordShader(bool pixel, uint64_t hash, const std::vector<uint32_t>& codeBE)
+    {
+        std::lock_guard lock(mutex);
+        if (!shaderFiles.insert(hash).second)
+            return;
+        const auto path = UcodePath(pixel, hash);
+        std::error_code ec;
+        if (std::filesystem::exists(path, ec))
+            return;
+        std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(codeBE.data()), std::streamsize(codeBE.size() * 4));
+    }
+    static bool LoadShader(bool pixel, uint64_t hash, std::vector<uint32_t>& out)
+    {
+        std::ifstream in(UcodePath(pixel, hash), std::ios::binary | std::ios::ate);
+        if (!in)
+            return false;
+        out.resize(size_t(in.tellg()) / 4);
+        in.seekg(0);
+        in.read(reinterpret_cast<char*>(out.data()), std::streamsize(out.size() * 4));
+        return !out.empty();
+    }
+} g_manifest;
+
 // Shader compilation runs on worker threads so the command processor never
 // stalls on fxc: a draw whose shaders are still compiling is skipped. The
 // bytecode is cached on disk by HLSL hash, so later runs start warm.
@@ -824,7 +919,11 @@ struct ShaderCompiler
                 cs = queue.front();
                 queue.pop_front();
             }
+            char label[64];
+            snprintf(label, sizeof(label), "%s %08llx", cs->pixel ? "pixel shader" : "vertex shader", (unsigned long long)(cs->hash >> 32));
+            g_stats.Begin(label);
             Compile(*cs);
+            g_stats.End(true);
         }
     }
 
@@ -844,6 +943,7 @@ struct ShaderCompiler
             cs.state.store(CompiledShader::Failed, std::memory_order_release);
             return;
         }
+        g_stats.shadersBuilt++;
         if (ms > 200)
             Log("renderer: %s %016llx compiled in %.0f ms (background)", cs.pixel ? "ps" : "vs", (unsigned long long)cs.hash, ms);
         std::ofstream(ShaderCachePath(cs.cacheKey), std::ios::binary)
@@ -864,6 +964,7 @@ const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& code
     CompiledShader& cs = *slot;
     cs.hash = hash;
     cs.pixel = pixel;
+    g_manifest.RecordShader(pixel, hash, codeBE);
     const ucode::Shader parsed = ucode::Parse(codeBE.data(), uint32_t(codeBE.size()), pixel);
     cs.info = TranslateShader(parsed);
     if (!cs.info.ok)
@@ -937,6 +1038,7 @@ const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& code
             in.seekg(0);
             in.read(static_cast<char*>(cs.code->GetBufferPointer()), std::streamsize(size));
             cs.state = CompiledShader::Ready;
+            g_stats.shadersCached++;
             return cs;
         }
     }
@@ -1031,13 +1133,17 @@ struct PipelineLibrary
         return name;
     }
 
-    HRESULT CreateOrLoad(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd, const PipelineKey& key, ComPtr<ID3D12PipelineState>& pso)
+    HRESULT CreateOrLoad(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd, const PipelineKey& key, ComPtr<ID3D12PipelineState>& pso, bool* hit)
     {
+        *hit = false;
         if (library)
         {
             const std::wstring name = Name(key);
             if (SUCCEEDED(library->LoadGraphicsPipeline(name.c_str(), &pd, IID_PPV_ARGS(&pso))))
+            {
+                *hit = true;
                 return S_OK;
+            }
             const HRESULT hr = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
             if (SUCCEEDED(hr) && SUCCEEDED(library->StorePipeline(name.c_str(), pso.Get())))
                 stored++;
@@ -1068,7 +1174,11 @@ struct PipelineLibrary
     }
 } g_pipelineLibrary;
 
-void InitPipelineLibrary(ID3D12Device* device) { g_pipelineLibrary.Init(device); }
+void InitPipelineLibrary(ID3D12Device* device)
+{
+    g_pipelineLibrary.Init(device);
+    g_manifest.Load();
+}
 
 struct PipelinePool
 {
@@ -1107,31 +1217,13 @@ struct PipelinePool
     }
 };
 
-ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable)
+std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const CompiledShader& ps, const PipelineKey& key)
 {
-    const uint32_t blend = gpureg::Get(RB_BLENDCONTROL0);
-    uint32_t depth = gpureg::Get(RB_DEPTHCONTROL);
-    // Debug: FM2_NO_ZTEST=a-b turns the depth test off for draws a..b-1 of the FM2_DUMP_FRAME frame.
-    static uint32_t noZFrom = 0, noZTo = 0;
-    static const bool noZParsed = [] { if (const char* s = getenv("FM2_NO_ZTEST")) sscanf(s, "%u-%u", &noZFrom, &noZTo); return true; }();
-    static const uint64_t noZFrame = getenv("FM2_DUMP_FRAME") ? strtoull(getenv("FM2_DUMP_FRAME"), nullptr, 10) : 0;
-    (void)noZParsed;
-    if (noZTo && g_r.frame + 1 == noZFrame && g_r.drawsThisFrame >= noZFrom && g_r.drawsThisFrame < noZTo)
-        depth &= ~(getenv("FM2_NO_ZWRITE") ? 4u : 2u);
-    static const bool zFuncAlways = getenv("FM2_ZFUNC_ALWAYS") != nullptr;
-    if (zFuncAlways)
-        depth |= 0x70; // debug: depth func ALWAYS for every draw
-    const uint32_t mask = depthOnly ? 0 : gpureg::Get(RB_COLOR_MASK) & 0xF;
-    // Stencil masks (not the reference, which is dynamic) and culling are pipeline state.
-    const uint32_t stencil = gpureg::Get(RB_STENCILREFMASK) & 0xFFFF00, mode = gpureg::Get(PA_SU_SC_MODE_CNTL) & 7;
-    // Alpha-to-mask (RB_COLORCONTROL bit 4): cut-out foliage and fences.
-    const bool alphaToMask = (gpureg::Get(RB_COLORCONTROL) >> 4) & 1;
-    PipelineKey key{ g_r.vsHash, g_r.psHash, blend, depth, stencil | (mask << 24) | (mode << 28),
-        uint32_t(alphaToMask) | (uint32_t(cullable) << 1) };
-    auto it = g_r.pipelines.find(key);
-    if (it != g_r.pipelines.end())
-        return it->second->state.load(std::memory_order_acquire) == 1 ? it->second->pso.Get() : nullptr;
-
+    if (auto it = g_r.pipelines.find(key); it != g_r.pipelines.end())
+        return it->second;
+    const uint32_t blend = key.blend, depth = key.depth;
+    const uint32_t mask = (key.stencilMaskMode >> 24) & 0xF, mode = (key.stencilMaskMode >> 28) & 7, stencil = key.stencilMaskMode & 0xFFFFFF;
+    const bool alphaToMask = key.flags & 1, cullable = (key.flags >> 1) & 1;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = g_r.rootSignature.Get();
     pd.VS = { vs.code->GetBufferPointer(), vs.code->GetBufferSize() };
@@ -1191,26 +1283,65 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     pd.SampleDesc.Count = 1;
     auto entry = std::make_shared<PipelineEntry>();
     g_r.pipelines[key] = entry;
+    g_manifest.RecordPipeline(key);
     static PipelinePool pool;
+    char label[64];
+    snprintf(label, sizeof(label), "pipeline %08llx/%08llx", (unsigned long long)(key.vs >> 32), (unsigned long long)(key.ps >> 32));
+    g_stats.Begin(label);
     pool.Push([entry, pd, vsKeep = vs.code, psKeep = ps.code, key]() mutable {
         const auto createStart = std::chrono::steady_clock::now();
-        const HRESULT hr = g_pipelineLibrary.CreateOrLoad(g_r.device, pd, key, entry->pso);
+        bool hit = false;
+        const HRESULT hr = g_pipelineLibrary.CreateOrLoad(g_r.device, pd, key, entry->pso, &hit);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - createStart).count();
         if (ms > 30.0 && getenv("FM2_PERF"))
             Log("perf: pipeline %016llx/%016llx took %.1f ms to create (background)", (unsigned long long)key.vs, (unsigned long long)key.ps, ms);
         if (FAILED(hr))
             Log("renderer: pipeline %016llx/%016llx failed", (unsigned long long)key.vs, (unsigned long long)key.ps);
+        (hit ? g_stats.pipelinesLoaded : g_stats.pipelinesBuilt)++;
         entry->state.store(FAILED(hr) ? 2 : 1, std::memory_order_release);
+        g_stats.End(!hit);
     });
     g_pipelinesCreated++;
-    static const bool syncPipelines = getenv("FM2_ASYNC_PIPELINES") == nullptr;
-    if (syncPipelines)
-    {
-        while (entry->state.load(std::memory_order_acquire) == 0)
-            Sleep(1);
-        return entry->state.load() == 1 ? entry->pso.Get() : nullptr;
-    }
-    return nullptr; // draws wait for the build
+    return entry;
+}
+
+// Waits for the build (draws are never dropped: a missing pipeline used to leave
+// shadow passes undrawn). Cold builds can take 100+ ms; the overlay says so.
+ID3D12PipelineState* WaitForPipeline(const std::shared_ptr<PipelineEntry>& entry)
+{
+    static const bool async = getenv("FM2_ASYNC_PIPELINES") != nullptr;
+    if (async && entry->state.load(std::memory_order_acquire) == 0)
+        return nullptr;
+    while (entry->state.load(std::memory_order_acquire) == 0)
+        Sleep(1);
+    return entry->state.load() == 1 ? entry->pso.Get() : nullptr;
+}
+
+ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable)
+{
+    const uint32_t blend = gpureg::Get(RB_BLENDCONTROL0);
+    uint32_t depth = gpureg::Get(RB_DEPTHCONTROL);
+    // Debug: FM2_NO_ZTEST=a-b turns the depth test off for draws a..b-1 of the FM2_DUMP_FRAME frame.
+    static uint32_t noZFrom = 0, noZTo = 0;
+    static const bool noZParsed = [] { if (const char* s = getenv("FM2_NO_ZTEST")) sscanf(s, "%u-%u", &noZFrom, &noZTo); return true; }();
+    static const uint64_t noZFrame = getenv("FM2_DUMP_FRAME") ? strtoull(getenv("FM2_DUMP_FRAME"), nullptr, 10) : 0;
+    (void)noZParsed;
+    if (noZTo && g_r.frame + 1 == noZFrame && g_r.drawsThisFrame >= noZFrom && g_r.drawsThisFrame < noZTo)
+        depth &= ~(getenv("FM2_NO_ZWRITE") ? 4u : 2u);
+    static const bool zFuncAlways = getenv("FM2_ZFUNC_ALWAYS") != nullptr;
+    if (zFuncAlways)
+        depth |= 0x70; // debug: depth func ALWAYS for every draw
+    const uint32_t mask = depthOnly ? 0 : gpureg::Get(RB_COLOR_MASK) & 0xF;
+    // Stencil masks (not the reference, which is dynamic) and culling are pipeline state.
+    const uint32_t stencil = gpureg::Get(RB_STENCILREFMASK) & 0xFFFF00, mode = gpureg::Get(PA_SU_SC_MODE_CNTL) & 7;
+    // Alpha-to-mask (RB_COLORCONTROL bit 4): cut-out foliage and fences.
+    const bool alphaToMask = (gpureg::Get(RB_COLORCONTROL) >> 4) & 1;
+    PipelineKey key{ g_r.vsHash, g_r.psHash, blend, depth, stencil | (mask << 24) | (mode << 28),
+        uint32_t(alphaToMask) | (uint32_t(cullable) << 1) };
+    auto it = g_r.pipelines.find(key);
+    if (it != g_r.pipelines.end() && it->second->state.load(std::memory_order_acquire) == 1)
+        return it->second->pso.Get();
+    return WaitForPipeline(EnsurePipeline(vs, ps, key));
 }
 
 // Cube textures: six faces, each a padded 2D slice. Faces the title rendered
@@ -1919,6 +2050,223 @@ void Resolve()
 }
 }
 
+namespace
+{
+// ---- Warm-up: rebuilds every shader/pipeline recorded in the manifest in the
+// background (on this thread a few ms per frame) while the game boots and sits in menus.
+void WarmupStep()
+{
+    static const bool off = getenv("FM2_NO_WARMUP") != nullptr;
+    if (off || g_manifest.next >= g_manifest.pending.size())
+        return;
+    const auto start = std::chrono::steady_clock::now();
+    int skipped = 0;
+    while (g_manifest.next < g_manifest.pending.size() && g_stats.busy.load() < 12)
+    {
+        if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > 4.0)
+            break;
+        const PipelineKey key = g_manifest.pending[g_manifest.next];
+        if (g_r.pipelines.count(key))
+        {
+            g_manifest.next++;
+            g_stats.warmDone++;
+            continue;
+        }
+        std::vector<uint32_t> vsCode, psCode;
+        if (!Manifest::LoadShader(false, key.vs, vsCode) || !Manifest::LoadShader(true, key.ps, psCode))
+        {
+            g_manifest.next++;
+            g_stats.warmDone++;
+            continue;
+        }
+        const CompiledShader& vs = GetShader(key.vs, vsCode, false);
+        const CompiledShader& ps = GetShader(key.ps, psCode, true);
+        if (vs.state.load() == CompiledShader::Pending || ps.state.load() == CompiledShader::Pending)
+        {
+            // Still compiling: look further ahead instead of waiting on it.
+            std::rotate(g_manifest.pending.begin() + g_manifest.next, g_manifest.pending.begin() + g_manifest.next + 1, g_manifest.pending.end());
+            if (++skipped > 64)
+                break;
+            continue;
+        }
+        g_manifest.next++;
+        g_stats.warmDone++;
+        if (vs.IsReady() && ps.IsReady())
+            EnsurePipeline(vs, ps, key);
+    }
+}
+
+// ---- Overlay: a small panel in the corner while shaders are compiling.
+constexpr UINT kOverlayW = 520, kOverlayH = 140;
+struct Overlay
+{
+    ComPtr<ID3D12Resource> texture;
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
+    std::chrono::steady_clock::time_point lastRender{};
+    std::string lastText;
+    bool visible = false;
+} g_overlay;
+
+bool OverlayWanted(std::vector<std::string>& lines)
+{
+    static const bool disabled = getenv("FM2_NO_OVERLAY") != nullptr;
+    if (disabled)
+        return false;
+    const uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    const bool recentCold = g_stats.lastColdMs.load() && nowMs - g_stats.lastColdMs.load() < 4000;
+    const bool warming = g_stats.warmTotal.load() && g_stats.warmDone.load() < g_stats.warmTotal.load();
+    if (g_stats.busy.load() == 0 && !recentCold && !warming)
+        return false;
+    char l[160];
+    lines.push_back("FM2  shader compiler");
+    if (g_stats.busy.load() > 0)
+    {
+        std::lock_guard lock(g_stats.mutex);
+        const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_stats.currentSince).count();
+        snprintf(l, sizeof(l), "Compiling %s  (%.1f s, %d in progress)", g_stats.current.c_str(), sec, g_stats.busy.load());
+        lines.push_back(l);
+    }
+    else
+        lines.push_back("Idle");
+    snprintf(l, sizeof(l), "Shaders    %u compiled, %u from cache", g_stats.shadersBuilt.load(), g_stats.shadersCached.load());
+    lines.push_back(l);
+    snprintf(l, sizeof(l), "Pipelines  %u built, %u from cache", g_stats.pipelinesBuilt.load(), g_stats.pipelinesLoaded.load());
+    lines.push_back(l);
+    if (g_stats.warmTotal.load())
+    {
+        snprintf(l, sizeof(l), "Warm-up    %u / %u pipelines", std::min(g_stats.warmDone.load(), g_stats.warmTotal.load()), g_stats.warmTotal.load());
+        lines.push_back(l);
+    }
+    return true;
+}
+
+// Renders the lines with GDI into RGBA pixels.
+void RenderOverlayPixels(const std::vector<std::string>& lines, std::vector<uint32_t>& pixels)
+{
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = kOverlayW;
+    bi.bmiHeader.biHeight = -int(kOverlayH);
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    HDC dc = CreateCompatibleDC(nullptr);
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HGDIOBJ oldBitmap = SelectObject(dc, bitmap);
+    RECT all{ 0, 0, LONG(kOverlayW), LONG(kOverlayH) };
+    HBRUSH bg = CreateSolidBrush(RGB(14, 16, 22)), border = CreateSolidBrush(RGB(255, 140, 0));
+    FillRect(dc, &all, border);
+    RECT inner{ 2, 2, LONG(kOverlayW) - 2, LONG(kOverlayH) - 2 };
+    FillRect(dc, &inner, bg);
+    HFONT font = CreateFontW(19, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        FIXED_PITCH | FF_MODERN, L"Consolas");
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    for (size_t i = 0; i < lines.size(); i++)
+    {
+        SetTextColor(dc, i == 0 ? RGB(255, 170, 40) : RGB(235, 235, 235));
+        TextOutA(dc, 12, 8 + int(i) * 22, lines[i].c_str(), int(lines[i].size()));
+    }
+    GdiFlush();
+    pixels.resize(size_t(kOverlayW) * kOverlayH);
+    const uint32_t* src = static_cast<const uint32_t*>(bits);
+    for (size_t i = 0; i < pixels.size(); i++)
+    {
+        const uint32_t p = src[i]; // 0x00RRGGBB
+        pixels[i] = 0xFF000000u | ((p & 0xFF) << 16) | (p & 0xFF00) | ((p >> 16) & 0xFF);
+    }
+    SelectObject(dc, oldFont);
+    SelectObject(dc, oldBitmap);
+    DeleteObject(font);
+    DeleteObject(bg);
+    DeleteObject(border);
+    DeleteObject(bitmap);
+    DeleteDC(dc);
+}
+
+// Records the overlay upload (when its text changed) and returns the texture to
+// copy onto the back buffer, or null when nothing is showing.
+ID3D12Resource* PrepareOverlay()
+{
+    std::vector<std::string> lines;
+    g_overlay.visible = OverlayWanted(lines);
+    if (!g_overlay.visible)
+        return nullptr;
+    std::string text;
+    for (auto& l : lines)
+        text += l + "\n";
+    const auto now = std::chrono::steady_clock::now();
+    const bool stale = !g_overlay.texture || (text != g_overlay.lastText && now - g_overlay.lastRender > std::chrono::milliseconds(200));
+    if (stale)
+    {
+        if (!g_overlay.texture)
+        {
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC td{};
+            td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            td.Width = kOverlayW;
+            td.Height = kOverlayH;
+            td.DepthOrArraySize = 1;
+            td.MipLevels = 1;
+            td.SampleDesc.Count = 1;
+            td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            if (FAILED(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                    IID_PPV_ARGS(&g_overlay.texture))))
+                return nullptr;
+            g_overlay.state = D3D12_RESOURCE_STATE_COPY_DEST;
+        }
+        std::vector<uint32_t> pixels;
+        RenderOverlayPixels(lines, pixels);
+        static const bool dumpOverlay = getenv("FM2_OVERLAY_DUMP") != nullptr;
+        if (dumpOverlay)
+        {
+            std::vector<uint8_t> rgba(pixels.size() * 4);
+            memcpy(rgba.data(), pixels.data(), rgba.size());
+            WritePng("overlay.png", kOverlayW, kOverlayH, rgba);
+        }
+        const UINT pitch = kOverlayW * 4;
+        const UINT alignedPitch = (pitch + 255) & ~255u;
+        const UINT64 offset = RingAlloc(UINT64(alignedPitch) * kOverlayH, 512);
+        if (offset == ~0ull)
+            return nullptr;
+        FrameResources& f = Frame();
+        for (UINT y = 0; y < kOverlayH; y++)
+            memcpy(f.ringCpu + offset + UINT64(y) * alignedPitch, pixels.data() + size_t(y) * kOverlayW, pitch);
+        if (g_overlay.state != D3D12_RESOURCE_STATE_COPY_DEST)
+        {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = g_overlay.texture.Get();
+            b.Transition.Subresource = 0;
+            b.Transition.StateBefore = g_overlay.state;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            g_r.list->ResourceBarrier(1, &b);
+        }
+        D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+        dst.pResource = g_overlay.texture.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.pResource = f.ring.Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Offset = offset;
+        src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, kOverlayW, kOverlayH, 1, alignedPitch };
+        g_r.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = g_overlay.texture.Get();
+        b.Transition.Subresource = 0;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        g_r.list->ResourceBarrier(1, &b);
+        g_overlay.state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        g_overlay.lastText = text;
+        g_overlay.lastRender = now;
+    }
+    return g_overlay.state == D3D12_RESOURCE_STATE_COPY_SOURCE ? g_overlay.texture.Get() : nullptr;
+}
+}
+
 void RendererOnShaderLoad(uint32_t type, const uint32_t* microcodeBE, uint32_t dwords)
 {
     std::vector<uint32_t>& code = type == 0 ? g_r.vsCode : g_r.psCode;
@@ -1995,6 +2343,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     const CompiledShader& vs = GetShader(g_r.vsHash, g_r.vsCode, false);
     const CompiledShader& ps = GetShader(g_r.psHash, g_r.psCode, true);
     Section(1);
+    static const bool asyncShaders = getenv("FM2_ASYNC_SHADERS") != nullptr;
+    if (!asyncShaders)
+        while (vs.state.load(std::memory_order_acquire) == CompiledShader::Pending || ps.state.load(std::memory_order_acquire) == CompiledShader::Pending)
+            Sleep(1);
     if (!vs.IsReady() || !ps.IsReady())
     {
         TraceSkip(vs.state == CompiledShader::Failed || ps.state == CompiledShader::Failed ? "shader" : "compiling", initiator);
@@ -2449,6 +2801,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
 {
     if (!g_r.ok)
         return;
+    WarmupStep();
     BeginFrameIfNeeded();
     // Show the front buffer the title resolved to; fall back to the render
     // target if it was never resolved.
@@ -2470,7 +2823,8 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     }
     // The render target is half float; without an 8-bit resolve there is
     // nothing presentable this frame.
-    const bool presenting = fromResolve && PresenterRecordCopy(g_r.list.Get(), image);
+    ID3D12Resource* overlay = fromResolve ? PrepareOverlay() : nullptr;
+    const bool presenting = fromResolve && PresenterRecordCopy(g_r.list.Get(), image, overlay, kOverlayW, kOverlayH);
     {
         static const uint64_t traceFrame = getenv("FM2_TRACE_DRAWS") ? strtoull(getenv("FM2_TRACE_DRAWS"), nullptr, 10) : 0;
         if (traceFrame && g_r.frame + 1 == traceFrame)
