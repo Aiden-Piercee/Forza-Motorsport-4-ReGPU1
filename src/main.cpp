@@ -21,6 +21,15 @@ int main(int argc, char** argv)
 
     MemoryInit();
     LoadTitle(gameDir / "default.xex");
+    if (const char* dump = getenv("FM2_DUMP_IMAGE")) // writes the loaded executable image (0x82000000..0x83000000)
+    {
+        if (FILE* f = fopen(dump, "wb"))
+        {
+            fwrite(GuestPtr(0x82000000), 1, 0x1000000, f);
+            fclose(f);
+            Log("wrote the loaded image to %s", dump);
+        }
+    }
     RuntimeInit(gameDir);
     ThreadSystemInit(g_title.tlsTemplate, g_title.tlsDataSize, g_title.tlsSlotCount);
 
