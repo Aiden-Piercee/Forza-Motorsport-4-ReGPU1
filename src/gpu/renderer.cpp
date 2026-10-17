@@ -42,6 +42,7 @@
 #include "png.h"
 #include "render/presenter.h"
 #include "gpu/renderer.h"
+#include "gpu/shader_scan.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -1178,6 +1179,7 @@ void InitPipelineLibrary(ID3D12Device* device)
 {
     g_pipelineLibrary.Init(device);
     g_manifest.Load();
+    ShaderScanStart();
 }
 
 struct PipelinePool
@@ -1305,6 +1307,8 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     return entry;
 }
 
+void WaitHoldingImpl(const std::function<bool()>& done);
+
 // Waits for the build (draws are never dropped: a missing pipeline used to leave
 // shadow passes undrawn). Cold builds can take 100+ ms; the overlay says so.
 ID3D12PipelineState* WaitForPipeline(const std::shared_ptr<PipelineEntry>& entry)
@@ -1312,8 +1316,7 @@ ID3D12PipelineState* WaitForPipeline(const std::shared_ptr<PipelineEntry>& entry
     static const bool async = getenv("FM2_ASYNC_PIPELINES") != nullptr;
     if (async && entry->state.load(std::memory_order_acquire) == 0)
         return nullptr;
-    while (entry->state.load(std::memory_order_acquire) == 0)
-        Sleep(1);
+    WaitHoldingImpl([&] { return entry->state.load(std::memory_order_acquire) != 0; });
     return entry->state.load() == 1 ? entry->pso.Get() : nullptr;
 }
 
@@ -2052,10 +2055,75 @@ void Resolve()
 
 namespace
 {
+// Shaders the memory scan found (by renderer hash), to see how much of a race it covers.
+std::unordered_set<uint64_t> g_scanKnown;
+uint32_t g_scanPrefound = 0, g_scanMissed = 0;
+
+// Hands shaders the scanner found to the compile queue (translation runs here, on the
+// command processor thread, so the budget keeps it from eating a frame).
+void DrainScan(double budgetMs)
+{
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<ScannedShader> found;
+    while (true)
+    {
+        found.clear();
+        if (!ShaderScanTake(found, 8))
+            return;
+        for (ScannedShader& s : found)
+        {
+            const uint64_t hash = Fnv(s.code.data(), s.code.size() * 4) ^ (s.pixel ? 1 : 0);
+            g_scanKnown.insert(hash);
+            GetShader(hash, s.code, s.pixel);
+        }
+        if (budgetMs > 0 && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > budgetMs)
+            return;
+    }
+}
+
+// ---- Hold: while the command processor waits for a compile it keeps presenting the
+// last frame with the overlay on top, so the screen doesn't just freeze.
+struct Hold
+{
+    bool active = false;
+    ComPtr<ID3D12Resource> image; // last frame shown (kept alive here)
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12Resource> upload;
+    uint8_t* uploadCpu = nullptr;
+    std::chrono::steady_clock::time_point lastPresent{};
+} g_hold;
+
+void HoldPresent();
+
+// Spins until done() is true. Presents the overlay roughly 8 times a second once the wait
+// has lasted 150 ms.
+void WaitHoldingImpl(const std::function<bool()>& done)
+{
+    const auto start = std::chrono::steady_clock::now();
+    bool announced = false;
+    while (!done())
+    {
+        const auto waited = std::chrono::steady_clock::now() - start;
+        if (waited > std::chrono::milliseconds(150))
+        {
+            g_hold.active = true;
+            announced = true;
+            DrainScan(0);
+            if (std::chrono::steady_clock::now() - g_hold.lastPresent > std::chrono::milliseconds(120))
+                HoldPresent();
+        }
+        Sleep(1);
+    }
+    if (announced)
+        g_hold.active = false;
+}
+
 // ---- Warm-up: rebuilds every shader/pipeline recorded in the manifest in the
 // background (on this thread a few ms per frame) while the game boots and sits in menus.
 void WarmupStep()
 {
+    DrainScan(3.0);
     static const bool off = getenv("FM2_NO_WARMUP") != nullptr;
     if (off || g_manifest.next >= g_manifest.pending.size())
         return;
@@ -2115,10 +2183,10 @@ bool OverlayWanted(std::vector<std::string>& lines)
     const uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
     const bool recentCold = g_stats.lastColdMs.load() && nowMs - g_stats.lastColdMs.load() < 4000;
     const bool warming = g_stats.warmTotal.load() && g_stats.warmDone.load() < g_stats.warmTotal.load();
-    if (g_stats.busy.load() == 0 && !recentCold && !warming)
+    if (g_stats.busy.load() == 0 && !recentCold && !warming && !g_hold.active)
         return false;
     char l[160];
-    lines.push_back("FM2  shader compiler");
+    lines.push_back(g_hold.active ? "FM2  preparing shaders - please wait" : "FM2  shader compiler");
     if (g_stats.busy.load() > 0)
     {
         std::lock_guard lock(g_stats.mutex);
@@ -2187,7 +2255,15 @@ void RenderOverlayPixels(const std::vector<std::string>& lines, std::vector<uint
 
 // Records the overlay upload (when its text changed) and returns the texture to
 // copy onto the back buffer, or null when nothing is showing.
-ID3D12Resource* PrepareOverlay()
+struct OverlayUpload
+{
+    ID3D12Resource* resource = nullptr;
+    uint8_t* cpu = nullptr;
+    UINT64 offset = 0;
+};
+
+// upload(bytes) returns staging space (resource + CPU pointer + offset) or a null resource.
+ID3D12Resource* PrepareOverlayOn(ID3D12GraphicsCommandList* list, const std::function<OverlayUpload(UINT64)>& upload, bool force)
 {
     std::vector<std::string> lines;
     g_overlay.visible = OverlayWanted(lines);
@@ -2197,7 +2273,7 @@ ID3D12Resource* PrepareOverlay()
     for (auto& l : lines)
         text += l + "\n";
     const auto now = std::chrono::steady_clock::now();
-    const bool stale = !g_overlay.texture || (text != g_overlay.lastText && now - g_overlay.lastRender > std::chrono::milliseconds(200));
+    const bool stale = !g_overlay.texture || (text != g_overlay.lastText && (force || now - g_overlay.lastRender > std::chrono::milliseconds(200)));
     if (stale)
     {
         if (!g_overlay.texture)
@@ -2228,12 +2304,11 @@ ID3D12Resource* PrepareOverlay()
         }
         const UINT pitch = kOverlayW * 4;
         const UINT alignedPitch = (pitch + 255) & ~255u;
-        const UINT64 offset = RingAlloc(UINT64(alignedPitch) * kOverlayH, 512);
-        if (offset == ~0ull)
+        const OverlayUpload staging = upload(UINT64(alignedPitch) * kOverlayH);
+        if (!staging.resource)
             return nullptr;
-        FrameResources& f = Frame();
         for (UINT y = 0; y < kOverlayH; y++)
-            memcpy(f.ringCpu + offset + UINT64(y) * alignedPitch, pixels.data() + size_t(y) * kOverlayW, pitch);
+            memcpy(staging.cpu + staging.offset + UINT64(y) * alignedPitch, pixels.data() + size_t(y) * kOverlayW, pitch);
         if (g_overlay.state != D3D12_RESOURCE_STATE_COPY_DEST)
         {
             D3D12_RESOURCE_BARRIER b{};
@@ -2242,28 +2317,97 @@ ID3D12Resource* PrepareOverlay()
             b.Transition.Subresource = 0;
             b.Transition.StateBefore = g_overlay.state;
             b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-            g_r.list->ResourceBarrier(1, &b);
+            list->ResourceBarrier(1, &b);
         }
         D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
         dst.pResource = g_overlay.texture.Get();
         dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src.pResource = f.ring.Get();
+        src.pResource = staging.resource;
         src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        src.PlacedFootprint.Offset = offset;
+        src.PlacedFootprint.Offset = staging.offset;
         src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, kOverlayW, kOverlayH, 1, alignedPitch };
-        g_r.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition.pResource = g_overlay.texture.Get();
         b.Transition.Subresource = 0;
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        g_r.list->ResourceBarrier(1, &b);
+        list->ResourceBarrier(1, &b);
         g_overlay.state = D3D12_RESOURCE_STATE_COPY_SOURCE;
         g_overlay.lastText = text;
         g_overlay.lastRender = now;
     }
     return g_overlay.state == D3D12_RESOURCE_STATE_COPY_SOURCE ? g_overlay.texture.Get() : nullptr;
+}
+
+// The frame path stages through the frame's upload ring.
+ID3D12Resource* PrepareOverlay()
+{
+    return PrepareOverlayOn(g_r.list.Get(), [](UINT64 bytes) {
+        OverlayUpload u;
+        const UINT64 offset = RingAlloc(bytes, 512);
+        if (offset == ~0ull)
+            return u;
+        u.resource = Frame().ring.Get();
+        u.cpu = Frame().ringCpu;
+        u.offset = offset;
+        return u;
+    }, false);
+}
+
+// Presents the last frame again with the overlay on top, on a separate command list
+// (the frame's own list is mid-recording while the command processor waits).
+void HoldPresent()
+{
+    g_hold.lastPresent = std::chrono::steady_clock::now();
+    if (!g_hold.image || !g_r.device)
+        return;
+    if (!g_hold.list)
+    {
+        if (FAILED(g_r.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_hold.allocator))) ||
+            FAILED(g_r.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_hold.allocator.Get(), nullptr, IID_PPV_ARGS(&g_hold.list))))
+            return;
+        g_hold.list->Close();
+        const UINT64 bytes = UINT64((kOverlayW * 4 + 255) & ~255u) * kOverlayH + 1024;
+        g_hold.upload = CreateBuffer(bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* mapped = nullptr;
+        g_hold.upload->Map(0, nullptr, &mapped);
+        g_hold.uploadCpu = static_cast<uint8_t*>(mapped);
+    }
+    // Everything the main queue still runs must be done before this list reuses its allocator.
+    g_hold.allocator->Reset();
+    g_hold.list->Reset(g_hold.allocator.Get(), nullptr);
+    ID3D12Resource* overlay = PrepareOverlayOn(g_hold.list.Get(), [](UINT64) {
+        OverlayUpload u;
+        u.resource = g_hold.upload.Get();
+        u.cpu = g_hold.uploadCpu;
+        return u;
+    }, true);
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = g_hold.image.Get();
+    b.Transition.Subresource = 0;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    g_hold.list->ResourceBarrier(1, &b);
+    const bool ok = PresenterRecordCopy(g_hold.list.Get(), g_hold.image.Get(), overlay, kOverlayW, kOverlayH);
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    g_hold.list->ResourceBarrier(1, &b);
+    g_hold.list->Close();
+    if (!ok)
+        return;
+    ID3D12CommandList* lists[] = { g_hold.list.Get() };
+    g_r.queue->ExecuteCommandLists(1, lists);
+    PresenterPresent();
+    // Wait for it: the allocator and upload buffer are reused at the next hold.
+    const UINT64 value = g_r.nextFence++;
+    g_r.queue->Signal(g_r.fence.Get(), value);
+    if (g_r.fence->GetCompletedValue() < value)
+    {
+        g_r.fence->SetEventOnCompletion(value, g_r.fenceEvent);
+        WaitForSingleObject(g_r.fenceEvent, 500);
+    }
 }
 }
 
@@ -2352,13 +2496,39 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         g_r.skippedThisFrame++;
         return;
     }
+    {
+        // A draw reached a shader we have not seen: a new race or car has loaded. Scan guest
+        // memory for all of its shader objects now and queue every unseen one for compiling
+        // in parallel, instead of meeting them one stall at a time.
+        const bool unseen = g_r.shaders.find(g_r.vsHash) == g_r.shaders.end() || g_r.shaders.find(g_r.psHash) == g_r.shaders.end();
+        static auto lastScan = std::chrono::steady_clock::time_point{};
+        static const bool noScan = getenv("FM2_NO_SHADER_SCAN") != nullptr;
+        if (unseen && !noScan)
+        {
+            if (g_scanKnown.count(g_r.vsHash) || g_scanKnown.count(g_r.psHash))
+                g_scanPrefound++;
+            else
+                g_scanMissed++;
+            if (std::chrono::steady_clock::now() - lastScan > std::chrono::milliseconds(300))
+            {
+                const auto t0 = std::chrono::steady_clock::now();
+                ShaderScanNow(std::max(2u, std::thread::hardware_concurrency() / 2));
+                lastScan = std::chrono::steady_clock::now();
+                DrainScan(0);
+                if (getenv("FM2_PERF"))
+                    Log("perf: shader scan took %.0f ms, %llu shaders found in total", std::chrono::duration<double, std::milli>(lastScan - t0).count(),
+                        (unsigned long long)ShaderScanTotal());
+            }
+        }
+    }
     const CompiledShader& vs = GetShader(g_r.vsHash, g_r.vsCode, false);
     const CompiledShader& ps = GetShader(g_r.psHash, g_r.psCode, true);
     Section(1);
     static const bool asyncShaders = getenv("FM2_ASYNC_SHADERS") != nullptr;
     if (!asyncShaders)
-        while (vs.state.load(std::memory_order_acquire) == CompiledShader::Pending || ps.state.load(std::memory_order_acquire) == CompiledShader::Pending)
-            Sleep(1);
+        WaitHoldingImpl([&] {
+            return vs.state.load(std::memory_order_acquire) != CompiledShader::Pending && ps.state.load(std::memory_order_acquire) != CompiledShader::Pending;
+        });
     if (!vs.IsReady() || !ps.IsReady())
     {
         TraceSkip(vs.state == CompiledShader::Failed || ps.state == CompiledShader::Failed ? "shader" : "compiling", initiator);
@@ -2797,6 +2967,9 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
         }
         if (perf && g_pipelinesCreated)
             Log("perf:   pipelines started %u", g_pipelinesCreated);
+        if (perf && (g_scanPrefound || g_scanMissed))
+            Log("perf:   new shaders at draw time: %u already found by scan, %u not", g_scanPrefound, g_scanMissed);
+        g_scanPrefound = g_scanMissed = 0;
         if (perf && g_skippedPipeline)
             Log("perf:   draws skipped waiting for pipelines: %u", g_skippedPipeline);
         g_skippedPipeline = 0;
@@ -2835,6 +3008,8 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     }
     // The render target is half float; without an 8-bit resolve there is
     // nothing presentable this frame.
+    if (fromResolve)
+        g_hold.image = it->second.resource;
     ID3D12Resource* overlay = fromResolve ? PrepareOverlay() : nullptr;
     const bool presenting = fromResolve && PresenterRecordCopy(g_r.list.Get(), image, overlay, kOverlayW, kOverlayH);
     {
