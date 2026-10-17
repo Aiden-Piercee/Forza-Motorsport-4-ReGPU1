@@ -157,13 +157,14 @@ float3 CubeDirection(float3 stf)
     }
 }
 
-float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float bias);
+float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel);
 
 // Fetch swizzle (3 bits per channel: 0-3 component, 4 zero, 5 one) for
 // textures that live on the GPU; CPU-decoded textures are swizzled already.
-float4 TFetch(uint slot, float3 coord, bool denorm, bool vertexStage, float bias)
+// texel: the instruction's texel offset (PCF taps in shadow filters), in texels.
+float4 TFetch(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel)
 {
-    float4 v = TFetchRaw(slot, coord, denorm, vertexStage, bias);
+    float4 v = TFetchRaw(slot, coord, denorm, vertexStage, bias, texel);
     // Exponent adjust (fetch constant): texels scaled by 2^n, n in tinfo.x bits 8-13.
     int expAdjust = int(tinfo[slot].x << 18) >> 26;
     if (expAdjust != 0) v *= exp2(float(expAdjust));
@@ -179,7 +180,7 @@ float4 TFetch(uint slot, float3 coord, bool denorm, bool vertexStage, float bias
     return r;
 }
 
-float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float bias)
+float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel)
 {
     uint index = asuint(tbias[slot].y);
     Texture2D<float4> t = gtex[index];
@@ -190,7 +191,9 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
         return vertexStage ? tc.SampleLevel(sLinearClamp, dir, max(bias, 0)) : tc.SampleBias(sLinearClamp, dir, bias);
     }
     float2 uv = coord.xy;
-    if (denorm) uv /= float2(max(tinfo[slot].yz & 0xFFFFu, uint2(1, 1)));
+    const float2 texelSize = float2(max(tinfo[slot].yz & 0xFFFFu, uint2(1, 1)));
+    if (denorm) uv = (uv + texel) / texelSize;
+    else uv += texel / texelSize;
     uint mode = tinfo[slot].x & 3u;
     if (vertexStage)
         return t.SampleLevel(sLinearClamp, uv, max(bias, 0));
@@ -504,8 +507,8 @@ struct Emitter
             const std::string uv = "float3(" + reg + comp[f.srcSwizzle & 3] + ", " + reg + comp[(f.srcSwizzle >> 2) & 3] + ", " + reg +
                 comp[(f.srcSwizzle >> 4) & 3] + ")";
             char call[320];
-            snprintf(call, sizeof(call), "TFetch(%u, %s, %s, %s, %.4f + tbias[%u].x)", f.constIndex, uv.c_str(),
-                f.denormalized ? "true" : "false", pixel ? "false" : "true", f.lodBias, f.constIndex);
+            snprintf(call, sizeof(call), "TFetch(%u, %s, %s, %s, %.4f + tbias[%u].x, float2(%.1f, %.1f))", f.constIndex, uv.c_str(),
+                f.denormalized ? "true" : "false", pixel ? "false" : "true", f.lodBias, f.constIndex, f.offsetX, f.offsetY);
             body = std::string("{ float4 t = ") + call + "; " + DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
             result.usedTextureSlots |= 1u << f.constIndex;
         }

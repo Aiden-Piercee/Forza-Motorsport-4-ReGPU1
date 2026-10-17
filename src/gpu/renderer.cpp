@@ -2307,6 +2307,19 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
             snprintf(name, sizeof(name), "out/frames/%05llu.png", (unsigned long long)g_r.frame);
             WritePng(name, kWidth, kHeight, rgba);
         }
+        else if (sweepDump && getenv("FM2_SWEEP_STAT"))
+        {
+            // FM2_SWEEP_STAT="x,y,w,h": log the region's mean colour instead of writing a PNG.
+            uint32_t x0 = 0, y0 = 0, w = 1, h = 1;
+            sscanf(getenv("FM2_SWEEP_STAT"), "%u,%u,%u,%u", &x0, &y0, &w, &h);
+            uint64_t sum[3] = {};
+            for (uint32_t y = y0; y < y0 + h && y < kHeight; y++)
+                for (uint32_t x = x0; x < x0 + w && x < kWidth; x++)
+                    for (int c = 0; c < 3; c++)
+                        sum[c] += rgba[(size_t(y) * kWidth + x) * 4 + c];
+            Log("sweep %llu: %llu %llu %llu", (unsigned long long)(g_r.frame - dumpFrame), (unsigned long long)(sum[0] / (w * h)),
+                (unsigned long long)(sum[1] / (w * h)), (unsigned long long)(sum[2] / (w * h)));
+        }
         else if (sweepDump)
         {
             std::filesystem::create_directories("out/sweep");
