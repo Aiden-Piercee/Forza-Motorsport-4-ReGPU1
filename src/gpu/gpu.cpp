@@ -315,6 +315,7 @@ uint32_t ExecutePacket(uint32_t ptr)
         // Usually satisfied within microseconds by an interrupt handler:
         // spin, then yield, then sleep.
         const auto start = Clock::now();
+        static const int spinMs = getenv("FM2_CP_SPIN_MS") ? atoi(getenv("FM2_CP_SPIN_MS")) : 100;
         for (int tries = 0;; tries++)
         {
             const uint32_t value = (info & 0x10) ? ReadBack(arg(1)) : Reg(arg(1));
@@ -328,7 +329,7 @@ uint32_t ExecutePacket(uint32_t ptr)
             }
             if (tries < 200)
                 _mm_pause();
-            else if (waited < std::chrono::milliseconds(2))
+            else if (waited < std::chrono::milliseconds(spinMs))
                 SwitchToThread();
             else
                 Sleep(1);

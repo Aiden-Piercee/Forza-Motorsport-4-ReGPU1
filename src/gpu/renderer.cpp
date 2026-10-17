@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -172,6 +173,15 @@ struct BoundTexture
     bool cube;
 };
 
+// A pipeline state being (or already) built. The driver compiles the translated
+// shaders to GPU code inside CreateGraphicsPipelineState, which takes 40-700 ms for
+// the larger ones: that is done on worker threads and draws wait until it is ready.
+struct PipelineEntry
+{
+    ComPtr<ID3D12PipelineState> pso;
+    std::atomic<int> state{ 0 }; // 0 building, 1 ready, 2 failed
+};
+
 struct Renderer
 {
     ID3D12Device* device = nullptr;
@@ -212,7 +222,7 @@ struct Renderer
     D3D12_RESOURCE_STATES colorState = D3D12_RESOURCE_STATE_RENDER_TARGET;
 
     std::unordered_map<uint64_t, std::unique_ptr<CompiledShader>> shaders;
-    std::unordered_map<PipelineKey, ComPtr<ID3D12PipelineState>, PipelineKeyHash> pipelines;
+    std::unordered_map<PipelineKey, std::shared_ptr<PipelineEntry>, PipelineKeyHash> pipelines;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, CachedTexture> textures;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, CachedTexture> cubes;
     std::unordered_map<uint32_t, CachedTexture> mipChains; // resolved textures with their mips, by base
@@ -258,6 +268,9 @@ void LogDebugMessages()
     }
     queue->ClearStoredMessages();
 }
+double g_pipelineMs = 0; // FM2_PERF: time spent creating pipeline states this second
+uint32_t g_pipelinesCreated = 0;
+uint32_t g_skippedPipeline = 0;
 std::map<std::string, uint64_t> g_created; // FM2_PERF: committed resources created, by kind
 void CountCreate(const char* what) { g_created[what]++; }
 
@@ -386,6 +399,8 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
     Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.colorBlit16)), "CreateGraphicsPipelineState(colour blit 16)");
 }
 
+void InitPipelineLibrary(ID3D12Device* device);
+
 void Init()
 {
     g_r.device = RenderDevice();
@@ -465,6 +480,7 @@ void Init()
     d->CopyDescriptorsSimple(2, Cpu(g_r.srvHeap.Get(), kBindlessBase, g_r.srvStride), Cpu(g_r.stagingHeap.Get(), 0, g_r.srvStride),
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
+    InitPipelineLibrary(d);
     // Guest physical memory for the GPU, in place: vertex fetches read it
     // without copies.
     ComPtr<ID3D12Device13> d13;
@@ -976,6 +992,121 @@ D3D12_BLEND_OP BlendOp(uint32_t op)
     }
 }
 
+// Persistent pipeline library: compiled GPU code survives between runs
+// (Documents/fm2/pipelines.bin; keyed by the driver, so a driver update just misses).
+struct PipelineLibrary
+{
+    ComPtr<ID3D12PipelineLibrary> library;
+    std::atomic<int> stored{ 0 };
+    std::mutex saveMutex;
+    std::chrono::steady_clock::time_point lastSave = std::chrono::steady_clock::now();
+    std::vector<char> loaded;
+
+    static std::filesystem::path Path() { return UserDir() / "pipelines.bin"; }
+
+    void Init(ID3D12Device* device)
+    {
+        ComPtr<ID3D12Device1> d1;
+        if (FAILED(device->QueryInterface(IID_PPV_ARGS(&d1))))
+            return;
+        if (std::ifstream in{ Path(), std::ios::binary | std::ios::ate })
+        {
+            loaded.resize(size_t(in.tellg()));
+            in.seekg(0);
+            in.read(loaded.data(), std::streamsize(loaded.size()));
+        }
+        if (FAILED(d1->CreatePipelineLibrary(loaded.data(), loaded.size(), IID_PPV_ARGS(&library))))
+        {
+            loaded.clear();
+            if (FAILED(d1->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&library))))
+                library.Reset();
+        }
+        Log("renderer: pipeline library %s (%zu bytes loaded)", library ? "ready" : "unavailable", loaded.size());
+    }
+
+    static std::wstring Name(const PipelineKey& k)
+    {
+        wchar_t name[96];
+        swprintf(name, 96, L"%016llx_%016llx_%08x_%08x_%08x_%08x", (unsigned long long)k.vs, (unsigned long long)k.ps, k.blend, k.depth, k.stencilMaskMode, k.flags);
+        return name;
+    }
+
+    HRESULT CreateOrLoad(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd, const PipelineKey& key, ComPtr<ID3D12PipelineState>& pso)
+    {
+        if (library)
+        {
+            const std::wstring name = Name(key);
+            if (SUCCEEDED(library->LoadGraphicsPipeline(name.c_str(), &pd, IID_PPV_ARGS(&pso))))
+                return S_OK;
+            const HRESULT hr = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+            if (SUCCEEDED(hr) && SUCCEEDED(library->StorePipeline(name.c_str(), pso.Get())))
+                stored++;
+            return hr;
+        }
+        return device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+    }
+
+    // Writes the library out when new pipelines were stored (at most every 10 s).
+    void MaybeSave(bool force = false)
+    {
+        if (!library || !stored.load())
+            return;
+        if (!force && std::chrono::steady_clock::now() - lastSave < std::chrono::seconds(10))
+            return;
+        std::lock_guard lock(saveMutex);
+        lastSave = std::chrono::steady_clock::now();
+        stored = 0;
+        std::vector<char> blob(library->GetSerializedSize());
+        if (blob.empty() || FAILED(library->Serialize(blob.data(), blob.size())))
+            return;
+        const auto tmp = Path().string() + ".tmp";
+        { std::ofstream(tmp, std::ios::binary).write(blob.data(), std::streamsize(blob.size())); }
+        std::error_code ec;
+        std::filesystem::rename(tmp, Path(), ec);
+        if (ec)
+            std::filesystem::remove(tmp, ec);
+    }
+} g_pipelineLibrary;
+
+void InitPipelineLibrary(ID3D12Device* device) { g_pipelineLibrary.Init(device); }
+
+struct PipelinePool
+{
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<std::function<void()>> queue;
+
+    PipelinePool()
+    {
+        const unsigned n = std::clamp(std::thread::hardware_concurrency() * 3 / 4, 2u, 12u);
+        for (unsigned i = 0; i < n; i++)
+            std::thread([this] { Run(); }).detach();
+    }
+    void Push(std::function<void()> job)
+    {
+        {
+            std::lock_guard lock(mutex);
+            queue.push_back(std::move(job));
+        }
+        cv.notify_one();
+    }
+    void Run()
+    {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        for (;;)
+        {
+            std::function<void()> job;
+            {
+                std::unique_lock lock(mutex);
+                cv.wait(lock, [this] { return !queue.empty(); });
+                job = std::move(queue.front());
+                queue.pop_front();
+            }
+            job();
+        }
+    }
+};
+
 ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable)
 {
     const uint32_t blend = gpureg::Get(RB_BLENDCONTROL0);
@@ -999,7 +1130,7 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
         uint32_t(alphaToMask) | (uint32_t(cullable) << 1) };
     auto it = g_r.pipelines.find(key);
     if (it != g_r.pipelines.end())
-        return it->second.Get();
+        return it->second->state.load(std::memory_order_acquire) == 1 ? it->second->pso.Get() : nullptr;
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = g_r.rootSignature.Get();
@@ -1058,15 +1189,28 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     pd.RTVFormats[0] = kColorFormat;
     pd.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     pd.SampleDesc.Count = 1;
-    ComPtr<ID3D12PipelineState> pso;
-    if (FAILED(g_r.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso))))
+    auto entry = std::make_shared<PipelineEntry>();
+    g_r.pipelines[key] = entry;
+    static PipelinePool pool;
+    pool.Push([entry, pd, vsKeep = vs.code, psKeep = ps.code, key]() mutable {
+        const auto createStart = std::chrono::steady_clock::now();
+        const HRESULT hr = g_pipelineLibrary.CreateOrLoad(g_r.device, pd, key, entry->pso);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - createStart).count();
+        if (ms > 30.0 && getenv("FM2_PERF"))
+            Log("perf: pipeline %016llx/%016llx took %.1f ms to create (background)", (unsigned long long)key.vs, (unsigned long long)key.ps, ms);
+        if (FAILED(hr))
+            Log("renderer: pipeline %016llx/%016llx failed", (unsigned long long)key.vs, (unsigned long long)key.ps);
+        entry->state.store(FAILED(hr) ? 2 : 1, std::memory_order_release);
+    });
+    g_pipelinesCreated++;
+    static const bool syncPipelines = getenv("FM2_ASYNC_PIPELINES") == nullptr;
+    if (syncPipelines)
     {
-        Log("renderer: pipeline %016llx/%016llx failed", (unsigned long long)key.vs, (unsigned long long)key.ps);
-        g_r.pipelines[key] = nullptr;
-        return nullptr;
+        while (entry->state.load(std::memory_order_acquire) == 0)
+            Sleep(1);
+        return entry->state.load() == 1 ? entry->pso.Get() : nullptr;
     }
-    g_r.pipelines[key] = pso;
-    return pso.Get();
+    return nullptr; // draws wait for the build
 }
 
 // Cube textures: six faces, each a padded 2D slice. Faces the title rendered
@@ -1920,6 +2064,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (!pso)
     {
         TraceSkip("pipeline", initiator);
+        g_skippedPipeline++;
         return;
     }
     FrameResources& f = Frame();
@@ -2286,6 +2431,14 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
                 s += " " + what + ":" + std::to_string(n);
             Log("perf:   resources created this second:%s", s.c_str());
         }
+        if (perf && g_pipelinesCreated)
+            Log("perf:   pipelines started %u", g_pipelinesCreated);
+        if (perf && g_skippedPipeline)
+            Log("perf:   draws skipped waiting for pipelines: %u", g_skippedPipeline);
+        g_skippedPipeline = 0;
+        g_pipelineMs = 0;
+        g_pipelinesCreated = 0;
+        g_pipelineLibrary.MaybeSave();
         g_created.clear();
         g_gpuWaitSeconds = 0;
         g_perf = Perf{};
