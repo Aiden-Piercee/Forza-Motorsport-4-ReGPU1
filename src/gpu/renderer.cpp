@@ -2008,10 +2008,25 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     vc->vscale[1] = RegFloat(PA_CL_VPORT_YSCALE);
     vc->vscale[2] = RegFloat(PA_CL_VPORT_ZSCALE);
     vc->vscale[3] = 0;
+    vc->voffset[3] = 0;
+    // The title clears its (non-MSAA) shadow depth maps through views of the same EDRAM
+    // with MSAA on: a pixel of a 4x surface covers 2x2 samples of the linear layout we
+    // render in, a pixel of a 2x surface 1x2. Scale those clear rectangles to match.
+    static const bool noMsaaScale = getenv("FM2_NO_MSAA_SCALE") != nullptr;
+    if (!noMsaaScale && (initiator & 0x3F) == 8 && (gpureg::Get(RB_COLOR_MASK) & 0xF) == 0 && (gpureg::Get(RB_SURFACE_INFO) & 0x3FFF) < 1000)
+    {
+        const uint32_t msaa = (gpureg::Get(RB_SURFACE_INFO) >> 16) & 3;
+        if (msaa == 2)
+            vc->vscale[3] = vc->voffset[3] = 2.0f;
+        else if (msaa == 1)
+        {
+            vc->vscale[3] = 1.0f;
+            vc->voffset[3] = 2.0f;
+        }
+    }
     vc->voffset[0] = RegFloat(PA_CL_VPORT_XOFFSET);
     vc->voffset[1] = RegFloat(PA_CL_VPORT_YOFFSET);
     vc->voffset[2] = RegFloat(PA_CL_VPORT_ZOFFSET);
-    vc->voffset[3] = 0;
     vc->vte[0] = gpureg::Get(PA_CL_VTE_CNTL);
     vc->vte[1] = vc->vte[2] = vc->vte[3] = 0;
     if (directIndex)
@@ -2183,6 +2198,22 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             const uint32_t* v = GuestPtr<uint32_t>(GpuPhysToGuest(d0 & 0xFFFFFFFC));
             Log("    vf%u: %08X size %u endian %u: %08X %08X %08X %08X %08X %08X %08X %08X", k, d0 & 0xFFFFFFFC, ((d1 >> 2) & 0xFFFFFF) * 4, d1 & 3,
                 v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+            if ((initiator & 0x3F) == 8)
+            {
+                // Rectangle lists: print the corners as floats (big-endian vertex data).
+                std::string corners;
+                for (uint32_t i = 0; i < 3 && (i * 7 + 1) * 4 < ((d1 >> 2) & 0xFFFFFF) * 4; i++)
+                {
+                    uint32_t xb = __builtin_bswap32(v[i * 7]), yb = __builtin_bswap32(v[i * 7 + 1]);
+                    float x, y;
+                    memcpy(&x, &xb, 4);
+                    memcpy(&y, &yb, 4);
+                    char t[48];
+                    snprintf(t, sizeof(t), " (%g,%g)", x, y);
+                    corners += t;
+                }
+                Log("    rect corners:%s", corners.c_str());
+            }
             std::string nz;
             for (uint32_t i = 0; i * 8 + 5 < ((d1 >> 2) & 0xFFFFFF) && i < 24; i++)
             {
