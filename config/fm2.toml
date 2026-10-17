@@ -34,6 +34,9 @@ longjmp_address = 0x82418210
 # Leaf functions without .pdata entries whose jump tables XenonAnalyse's size
 # guess cut off. Each runs to the next .pdata function (minus padding/EH data).
 functions = [
+    # memset: its 1-3 byte tail (0x824145C0..) was split off into separate functions,
+    # so lengths of 2 or 3 mod 4 lost their last bytes (Bink block types -> Arcade crash).
+    { address = 0x82414530, size = 0xA0 },
     { address = 0x821DDD60, size = 0xE8 },
     { address = 0x821DEC80, size = 0xC0 },
     { address = 0x82293DE0, size = 0x7C },
