@@ -285,5 +285,27 @@ PPC_FUNC(sub_8272F650)
         Log("patch %llu: lr %08llX r3 %08X r4 %08X r5 %08X r6 %08X r7 %08X r8 %08X r9 %08X r10 %08X r22 %08X r24 %08X r25 %08X r26 %08X r27 %08X r28 %08X r29 %08X r30 %08X r31 %08X",
             (unsigned long long)calls.load(), (unsigned long long)ctx.lr, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32,
             ctx.r9.u32, ctx.r10.u32, ctx.r22.u32, ctx.r24.u32, ctx.r25.u32, ctx.r26.u32, ctx.r27.u32, ctx.r28.u32, ctx.r29.u32, ctx.r30.u32, ctx.r31.u32);
+    static const bool mem = getenv("FM2_TRACE_PATCH_MEM") != nullptr;
+    static std::atomic<int> dumps{ 0 };
+    if (mem && dumps++ < 40)
+    {
+        auto words = [&](uint32_t a) {
+            std::string s;
+            for (int i = 0; i < 16; i++)
+            {
+                char t[12];
+                snprintf(t, sizeof(t), " %08X", __builtin_bswap32(*GuestPtr<uint32_t>(a + i * 4)));
+                s += t;
+            }
+            return s;
+        };
+        const uint32_t r5 = ctx.r5.u32, r6 = ctx.r6.u32;
+        Log("patchmem before: r5 %08X:%s | r6 %08X:%s", r5, words(r5).c_str(), r6, words(r6).c_str());
+        __imp__sub_8272F650(ctx, base);
+        Log("patchmem after:  r5 %08X:%s | r6 %08X:%s", r5, words(r5).c_str(), r6, words(r6).c_str());
+        return;
+    }
     __imp__sub_8272F650(ctx, base);
 }
+
+// FM2_TRACE_PATCH_MEM=1: dumps 16 words at r5 and r6 before and after each patcher call.
