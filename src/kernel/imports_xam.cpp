@@ -6,6 +6,7 @@
 #include <deque>
 #include <filesystem>
 
+#include "gpu/renderer.h"
 #include "kernel/imports.h"
 #include "kernel/runtime.h"
 #include "kernel/thread.h"
@@ -410,6 +411,85 @@ bool ReadPad(uint32_t user, PadState& s)
             }
             return v;
         }();
+        // FM2_TOUR=<steps>: hands-off route through the menus and races (shader tour).
+        // Steps (comma separated): a button name (A, B, X, Y, START, BACK, UP, DOWN, LEFT,
+        // RIGHT, LB, RB), "WAIT:<seconds>", "IDLE" (wait until the renderer has no compile
+        // running; at least 2 s), "RT:<seconds>" (hold the right trigger), "QUIT" (save
+        // caches and exit). Each button press lasts 150 ms followed by a 600 ms gap.
+        {
+            static const char* tourEnv = getenv("FM2_TOUR");
+            struct Tour
+            {
+                std::vector<std::string> steps;
+                size_t index = 0;
+                Clock::time_point stepStart{};
+                bool started = false;
+                std::string Step() const { return index < steps.size() ? steps[index] : std::string(); }
+            };
+            static Tour tour = [&] {
+                Tour t;
+                for (const char* p = tourEnv ? tourEnv : ""; p && *p;)
+                {
+                    const size_t len = strcspn(p, ",");
+                    if (len)
+                        t.steps.emplace_back(p, len);
+                    p += len + (p[len] == ',' ? 1 : 0);
+                }
+                return t;
+            }();
+            static std::mutex tourMutex;
+            if (!tour.steps.empty())
+            {
+                std::lock_guard lock(tourMutex);
+                const auto now = Clock::now();
+                if (!tour.started)
+                {
+                    tour.started = true;
+                    tour.stepStart = now;
+                }
+                static const std::pair<const char*, uint16_t> names[] = { { "A", XINPUT_GAMEPAD_A }, { "B", XINPUT_GAMEPAD_B },
+                    { "X", XINPUT_GAMEPAD_X }, { "Y", XINPUT_GAMEPAD_Y }, { "START", XINPUT_GAMEPAD_START }, { "BACK", XINPUT_GAMEPAD_BACK },
+                    { "UP", XINPUT_GAMEPAD_DPAD_UP }, { "DOWN", XINPUT_GAMEPAD_DPAD_DOWN }, { "LEFT", XINPUT_GAMEPAD_DPAD_LEFT },
+                    { "RIGHT", XINPUT_GAMEPAD_DPAD_RIGHT }, { "LB", XINPUT_GAMEPAD_LEFT_SHOULDER }, { "RB", XINPUT_GAMEPAD_RIGHT_SHOULDER } };
+                const double elapsed = std::chrono::duration<double>(now - tour.stepStart).count();
+                const std::string step = tour.Step();
+                bool advance = false;
+                if (step.empty() || step == "QUIT")
+                {
+                    if (step == "QUIT")
+                    {
+                        RendererSaveCaches();
+                        Log("tour: finished, caches saved");
+                        fflush(nullptr);
+                        ExitProcess(0);
+                    }
+                }
+                else if (step.rfind("WAIT:", 0) == 0)
+                    advance = elapsed >= atof(step.c_str() + 5);
+                else if (step == "IDLE")
+                {
+                    advance = elapsed >= 2.0 && RendererCompileIdle();
+                }
+                else if (step.rfind("RT:", 0) == 0)
+                {
+                    s.rightTrigger = 255;
+                    advance = elapsed >= atof(step.c_str() + 3);
+                }
+                else
+                {
+                    for (auto& [n, b] : names)
+                        if (step == n && elapsed < 0.15)
+                            s.buttons |= b;
+                    advance = elapsed >= 0.75;
+                }
+                if (advance)
+                {
+                    tour.index++;
+                    tour.stepStart = now;
+                    Log("tour: step %zu/%zu %s", tour.index, tour.steps.size(), tour.Step().c_str());
+                }
+            }
+        }
         if (!script.empty())
         {
             const double now = std::chrono::duration<double>(Clock::now() - start).count();

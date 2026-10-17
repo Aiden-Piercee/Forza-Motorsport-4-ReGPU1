@@ -125,6 +125,28 @@ void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dw
         return;
     if (g_shaders.size() % 50 == 1)
         Log("gpu: %zu distinct shaders seen", g_shaders.size());
+    static const bool traceAddr = getenv("FM2_TRACE_SHADER_ADDR") != nullptr;
+    static const bool hexAddr = getenv("FM2_HEXDUMP_SHADERS") != nullptr;
+    if (hexAddr && guestAddress >= 0x80000000u)
+    {
+        static int dumped = 0;
+        if (dumped++ < 6)
+        {
+            const uint8_t* b = GuestPtr<uint8_t>(guestAddress - 96);
+            char line[400];
+            for (int row = 0; row < 14; row++)
+            {
+                int n = 0;
+                for (int i = 0; i < 16; i++)
+                    n += snprintf(line + n, sizeof(line) - n, "%02X ", b[row * 16 + i]);
+                Log("hex %08X: %s", guestAddress - 96 + row * 16, line);
+            }
+            Log("hex --- (shader starts at %08X)", guestAddress);
+        }
+    }
+    if (traceAddr)
+        Log("shader: %s %016llx at %08X, %u dwords (first dwords %08X %08X)", type == ShaderType::Vertex ? "vs" : "ps", (unsigned long long)hash,
+            guestAddress, dwords, __builtin_bswap32(microcodeBE[0]), __builtin_bswap32(microcodeBE[1]));
     if (g_dumpShaders)
     {
         const auto dir = UserDir() / "shaders";

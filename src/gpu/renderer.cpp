@@ -2267,6 +2267,18 @@ ID3D12Resource* PrepareOverlay()
 }
 }
 
+bool RendererCompileIdle()
+{
+    const uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    const bool warming = g_stats.warmTotal.load() && g_stats.warmDone.load() < g_stats.warmTotal.load();
+    return g_stats.busy.load() == 0 && !warming && nowMs - g_stats.lastColdMs.load() > 2000;
+}
+
+void RendererSaveCaches()
+{
+    g_pipelineLibrary.MaybeSave(true);
+}
+
 void RendererOnShaderLoad(uint32_t type, const uint32_t* microcodeBE, uint32_t dwords)
 {
     std::vector<uint32_t>& code = type == 0 ? g_r.vsCode : g_r.psCode;
