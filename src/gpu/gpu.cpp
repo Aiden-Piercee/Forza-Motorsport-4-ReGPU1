@@ -162,6 +162,27 @@ bool WaitCompare(uint32_t function, uint32_t value, uint32_t reference)
 
 void ExecuteBuffer(uint32_t address, uint32_t dwords);
 
+// Where the packet being executed ends in each buffer being run (innermost last), so
+// the lookahead can continue from there.
+struct BufferCursor
+{
+    uint32_t next, end; // guest addresses: next packet, end of the buffer
+};
+thread_local std::vector<BufferCursor> t_cursors;
+uint32_t g_ringNext = 0;      // ring index after the packet being executed
+std::atomic<bool> g_inRing{ false };
+
+uint32_t PacketLength(uint32_t header)
+{
+    switch (header >> 30)
+    {
+    case 0:
+    case 3: return ((header >> 16) & 0x3FFF) + 2;
+    case 1: return 3;
+    default: return 1;
+    }
+}
+
 constexpr uint32_t SCRATCH_UMSK = 0x01DC;
 constexpr uint32_t SCRATCH_ADDR = 0x01DD;
 
@@ -458,10 +479,172 @@ uint32_t ExecutePacket(uint32_t ptr)
 
 void ExecuteBuffer(uint32_t address, uint32_t dwords)
 {
+    t_cursors.push_back({ address, address + dwords * 4 });
     for (uint32_t done = 0; done < dwords;)
+    {
+        t_cursors.back().next = address + (done + PacketLength(LoadBE32(address + done * 4))) * 4;
         done += ExecutePacket(address + done * 4);
+    }
+    t_cursors.pop_back();
 }
 
+// ---- Lookahead ---------------------------------------------------------------
+struct LookState
+{
+    int packets = 0;
+};
+
+void ShadowWrite(uint32_t index, uint32_t value)
+{
+    if (index >= 0x2000 && index < 0x5000)
+        SetReg(index, value);
+}
+
+void LookaheadBuffer(uint32_t address, uint32_t dwords, int depth, LookState& st)
+{
+    for (uint32_t done = 0; done < dwords && st.packets < 400000;)
+    {
+        const uint32_t ptr = address + done * 4;
+        const uint32_t header = LoadBE32(ptr);
+        const uint32_t length = PacketLength(header);
+        done += length;
+        st.packets++;
+        switch (header >> 30)
+        {
+        case 0:
+        {
+            const uint32_t count = ((header >> 16) & 0x3FFF) + 1;
+            const uint32_t base = header & 0x7FFF;
+            const bool oneReg = header & 0x8000;
+            for (uint32_t i = 0; i < count; i++)
+                ShadowWrite(oneReg ? base : base + i, LoadBE32(ptr + 4 + i * 4));
+            continue;
+        }
+        case 1:
+            ShadowWrite(header & 0x7FF, LoadBE32(ptr + 4));
+            ShadowWrite((header >> 11) & 0x7FF, LoadBE32(ptr + 8));
+            continue;
+        case 2:
+            continue;
+        default:
+            break;
+        }
+        const uint32_t count = ((header >> 16) & 0x3FFF) + 1;
+        const uint32_t opcode = (header >> 8) & 0x7F;
+        const uint32_t data = ptr + 4;
+        auto arg = [&](uint32_t i) { return LoadBE32(data + i * 4); };
+        if ((header & 1) && !(g_gpu.binSelect & g_gpu.binMask))
+            continue;
+        switch (opcode)
+        {
+        case 0x3F:
+        case 0x37:
+            if (depth < 4)
+                LookaheadBuffer(PhysToGuest(arg(0) & ~3u), arg(1) & 0xFFFFF, depth + 1, st);
+            break;
+        case 0x2D:
+        case 0x55:
+        {
+            uint32_t index;
+            if (opcode == 0x55)
+                index = arg(0) & 0xFFFF;
+            else
+            {
+                static const uint32_t bases[] = { gpureg::AluConstants, gpureg::FetchConstants, gpureg::BoolConstants, gpureg::LoopConstants, 0x2000 };
+                const uint32_t type = (arg(0) >> 16) & 0xFF;
+                index = (arg(0) & 0x7FF) + (type < 5 ? bases[type] : 0);
+            }
+            for (uint32_t i = 1; i < count; i++)
+                ShadowWrite(index + i - 1, arg(i));
+            break;
+        }
+        case 0x21:
+            ShadowWrite(arg(0) & 0x1FFF, (Reg(arg(0) & 0x1FFF) & arg(1)) | arg(2));
+            break;
+        case 0x2F:
+        {
+            static const uint32_t bases[] = { gpureg::AluConstants, gpureg::FetchConstants, gpureg::BoolConstants, gpureg::LoopConstants, 0x2000 };
+            const uint32_t source = GpuPhysToGuest(arg(0) & 0x3FFFFFFF);
+            const uint32_t type = (arg(1) >> 16) & 0xFF;
+            const uint32_t index = (arg(1) & 0x7FF) + (type < 5 ? bases[type] : 0);
+            const uint32_t size = arg(2) & 0xFFF;
+            for (uint32_t i = 0; i < size; i++)
+                ShadowWrite(index + i, LoadBE32(source + i * 4));
+            break;
+        }
+        case 0x27:
+        {
+            const uint32_t addr = GpuPhysToGuest(arg(0) & ~3u);
+            const uint32_t dwords2 = arg(1) & 0xFFFF;
+            if (dwords2 && dwords2 <= 0x10000)
+                RendererPredictShader(arg(0) & 3, GuestPtr<uint32_t>(addr), dwords2);
+            break;
+        }
+        case 0x2B:
+        {
+            const uint32_t dwords2 = std::min(arg(1) & 0xFFFF, count - 2);
+            if (dwords2 && dwords2 <= 0x10000)
+                RendererPredictShader(arg(0) & 3, GuestPtr<uint32_t>(data + 8), dwords2);
+            break;
+        }
+        case 0x22:
+            RendererPredictDraw(arg(1));
+            break;
+        case 0x36:
+            RendererPredictDraw(arg(0));
+            break;
+        case 0x60: g_gpu.binMask = (g_gpu.binMask & 0xFFFFFFFF00000000ull) | arg(0); break;
+        case 0x61: g_gpu.binMask = (g_gpu.binMask & 0xFFFFFFFFull) | (uint64_t(arg(0)) << 32); break;
+        case 0x62: g_gpu.binSelect = (g_gpu.binSelect & 0xFFFFFFFF00000000ull) | arg(0); break;
+        case 0x63: g_gpu.binSelect = (g_gpu.binSelect & 0xFFFFFFFFull) | (uint64_t(arg(0)) << 32); break;
+        case 0x50: g_gpu.binMask = (uint64_t(arg(0)) << 32) | arg(1); break;
+        case 0x51: g_gpu.binSelect = (uint64_t(arg(0)) << 32) | arg(1); break;
+        default:
+            break;
+        }
+    }
+}
+}
+
+void GpuLookahead()
+{
+    static const bool off = getenv("FM2_NO_LOOKAHEAD") != nullptr;
+    if (off)
+        return;
+    constexpr uint32_t kFirst = 0x2000, kCount = 0x3000;
+    std::vector<uint32_t> saved(kCount);
+    memcpy(saved.data(), GuestPtr<uint8_t>(kRegisterBase + kFirst * 4), kCount * 4);
+    const uint64_t savedMask = g_gpu.binMask, savedSelect = g_gpu.binSelect;
+    RendererPredictBegin();
+    LookState st;
+    // The rest of every buffer being executed, innermost first.
+    for (size_t i = t_cursors.size(); i-- > 0;)
+    {
+        const BufferCursor c = t_cursors[i];
+        if (c.next < c.end)
+            LookaheadBuffer(c.next, (c.end - c.next) / 4, 1, st);
+    }
+    // Then the ring from after the current packet to the write pointer, copied
+    // contiguously (it may wrap).
+    const uint32_t base = g_gpu.ringBase, size = g_gpu.ringDwords;
+    if (base && size)
+    {
+        const uint32_t wptr = Reg(CP_RB_WPTR) % size;
+        uint32_t start = g_ringNext;
+        const uint32_t queued = (wptr + size - start) % size;
+        static const uint32_t scratch = GuestAlloc(Heap::Virtual, 0x400000 * 4);
+        const uint32_t n = std::min<uint32_t>(queued, 0x400000);
+        for (uint32_t i = 0; i < n; i++)
+            StoreBE32(scratch + i * 4, LoadBE32(base + ((start + i) % size) * 4));
+        LookaheadBuffer(scratch, n, 0, st);
+    }
+    memcpy(GuestPtr<uint8_t>(kRegisterBase + kFirst * 4), saved.data(), kCount * 4);
+    g_gpu.binMask = savedMask;
+    g_gpu.binSelect = savedSelect;
+}
+
+namespace
+{
 void CommandProcessorLoop(PPCContext& ctx)
 {
     t_cpContext = &ctx;
@@ -493,6 +676,7 @@ void CommandProcessorLoop(PPCContext& ctx)
             case 1: length = 3; break;
             default: break;
             }
+            g_ringNext = (g_gpu.rptr + length) % size;
             uint32_t used;
             if (g_gpu.rptr + length <= size)
                 used = ExecutePacket(base + g_gpu.rptr * 4);

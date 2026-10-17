@@ -273,6 +273,8 @@ void LogDebugMessages()
 double g_pipelineMs = 0; // FM2_PERF: time spent creating pipeline states this second
 uint32_t g_pipelinesCreated = 0;
 uint32_t g_skippedPipeline = 0;
+const char* g_waitWhat = "?";
+uint32_t g_waitBlend = 0;
 std::map<std::string, uint64_t> g_created; // FM2_PERF: committed resources created, by kind
 void CountCreate(const char* what) { g_created[what]++; }
 
@@ -888,6 +890,7 @@ struct ShaderCompiler
     std::condition_variable cv;
     std::deque<CompiledShader*> queue;
     std::vector<std::thread> workers;
+    std::atomic<int> jobs{ 0 }; // queued or compiling
 
     void Start()
     {
@@ -901,6 +904,7 @@ struct ShaderCompiler
 
     void Push(CompiledShader* cs)
     {
+        jobs++;
         {
             std::lock_guard lock(mutex);
             queue.push_back(cs);
@@ -925,6 +929,7 @@ struct ShaderCompiler
             g_stats.Begin(label);
             Compile(*cs);
             g_stats.End(true);
+            jobs--;
         }
     }
 
@@ -1320,7 +1325,7 @@ ID3D12PipelineState* WaitForPipeline(const std::shared_ptr<PipelineEntry>& entry
     return entry->state.load() == 1 ? entry->pso.Get() : nullptr;
 }
 
-ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable)
+PipelineKey MakePipelineKey(uint64_t vsHash, uint64_t psHash, bool depthOnly, bool cullable)
 {
     const uint32_t blend = gpureg::Get(RB_BLENDCONTROL0);
     uint32_t depth = gpureg::Get(RB_DEPTHCONTROL);
@@ -1339,12 +1344,47 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     const uint32_t stencil = gpureg::Get(RB_STENCILREFMASK) & 0xFFFF00, mode = gpureg::Get(PA_SU_SC_MODE_CNTL) & 7;
     // Alpha-to-mask (RB_COLORCONTROL bit 4): cut-out foliage and fences.
     const bool alphaToMask = (gpureg::Get(RB_COLORCONTROL) >> 4) & 1;
-    PipelineKey key{ g_r.vsHash, g_r.psHash, blend, depth, stencil | (mask << 24) | (mode << 28),
-        uint32_t(alphaToMask) | (uint32_t(cullable) << 1) };
+    return PipelineKey{ vsHash, psHash, blend, depth, stencil | (mask << 24) | (mode << 28), uint32_t(alphaToMask) | (uint32_t(cullable) << 1) };
+}
+
+// Alpha-blended colour draws (smoke, sparks, glows) are skippable for the moment it
+// takes to build their pipeline; opaque and depth-only draws (shadow maps, geometry)
+// are not: dropping those leaves holes or a black ground.
+std::chrono::steady_clock::time_point g_lastLongHold{}; // end of the last hold of 2 s or more
+
+// Once a loading hold has finished and the game is running (4 s later), new content that
+// shows up first-time (other cars, effects at speed) builds in the background and the
+// draw is skipped for the half second that takes, instead of freezing every frame.
+bool GameSettled()
+{
+    static const bool never = getenv("FM2_NO_SETTLED_SKIP") != nullptr;
+    return !never && g_lastLongHold.time_since_epoch().count() != 0 && std::chrono::steady_clock::now() - g_lastLongHold > std::chrono::seconds(4);
+}
+
+bool SkippableDraw(bool depthOnly, uint32_t blend)
+{
+    static const bool noSkip = getenv("FM2_NO_SKIP_BLENDED") != nullptr;
+    if (noSkip || depthOnly)
+        return false;
+    const bool opaque = (blend & 0xFF1F1F1F) == 0x00010001 || (blend & 0x1F) == 1 && ((blend >> 8) & 0x1F) == 0;
+    return !opaque || GameSettled();
+}
+
+ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable)
+{
+    const PipelineKey key = MakePipelineKey(g_r.vsHash, g_r.psHash, depthOnly, cullable);
     auto it = g_r.pipelines.find(key);
     if (it != g_r.pipelines.end() && it->second->state.load(std::memory_order_acquire) == 1)
         return it->second->pso.Get();
-    return WaitForPipeline(EnsurePipeline(vs, ps, key));
+    const auto entry = EnsurePipeline(vs, ps, key);
+    if (SkippableDraw(depthOnly, key.blend) && entry->state.load(std::memory_order_acquire) == 0)
+    {
+        g_skippedPipeline++;
+        return nullptr; // builds in the background; later frames draw it
+    }
+    g_waitWhat = depthOnly ? "pipeline (depth only)" : "pipeline";
+    g_waitBlend = key.blend;
+    return WaitForPipeline(entry);
 }
 
 // Cube textures: six faces, each a padded 2D slice. Faces the title rendered
@@ -2055,6 +2095,87 @@ void Resolve()
 
 namespace
 {
+// ---- Lookahead: pipelines the command stream will need, found by GpuLookahead.
+struct LookItem
+{
+    PipelineKey key;
+    std::shared_ptr<std::vector<uint32_t>> vsCode, psCode; // only for shaders not translated yet
+    std::shared_ptr<PipelineEntry> entry; // set once the build has been started
+    bool dropped = false;
+};
+std::vector<LookItem> g_look;
+std::unordered_set<PipelineKey, PipelineKeyHash> g_lookKeys;
+uint64_t g_predVs = 0, g_predPs = 0;
+const uint32_t *g_predVsCode = nullptr, *g_predPsCode = nullptr;
+uint32_t g_predVsDwords = 0, g_predPsDwords = 0;
+size_t g_lookNext = 0;
+uint32_t g_lookStarted = 0, g_lookFinished = 0;
+
+// Starts what can be started (translating shaders as needed, queueing pipeline builds);
+// returns true while anything is unfinished.
+bool AdvanceLookahead(double budgetMs)
+{
+    const auto start = std::chrono::steady_clock::now();
+    bool pending = false;
+    for (size_t i = 0; i < g_look.size(); i++)
+    {
+        LookItem& it = g_look[i];
+        if (it.dropped)
+            continue;
+        if (!it.entry)
+        {
+            if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > budgetMs)
+            {
+                pending = true;
+                continue;
+            }
+            const CompiledShader* vs = nullptr;
+            const CompiledShader* ps = nullptr;
+            if (auto f = g_r.shaders.find(it.key.vs); f != g_r.shaders.end())
+                vs = f->second.get();
+            else
+                vs = it.vsCode ? &GetShader(it.key.vs, *it.vsCode, false) : nullptr;
+            if (auto f = g_r.shaders.find(it.key.ps); f != g_r.shaders.end())
+                ps = f->second.get();
+            else
+                ps = it.psCode ? &GetShader(it.key.ps, *it.psCode, true) : nullptr;
+            if (!vs || !ps)
+            {
+                it.dropped = true;
+                g_lookFinished++;
+                continue;
+            }
+            if (vs->state.load() == CompiledShader::Failed || ps->state.load() == CompiledShader::Failed)
+            {
+                it.dropped = true;
+                g_lookFinished++;
+                continue;
+            }
+            if (vs->state.load() == CompiledShader::Pending || ps->state.load() == CompiledShader::Pending)
+            {
+                pending = true;
+                continue;
+            }
+            it.entry = EnsurePipeline(*vs, *ps, it.key);
+            g_lookStarted++;
+        }
+        if (it.entry && it.entry->state.load(std::memory_order_acquire) == 0)
+            pending = true;
+    }
+    // Finished items leave the list so it stays short.
+    size_t keep = 0;
+    for (size_t i = 0; i < g_look.size(); i++)
+    {
+        const bool finished = g_look[i].dropped || (g_look[i].entry && g_look[i].entry->state.load(std::memory_order_acquire) != 0);
+        if (finished && !g_look[i].dropped)
+            g_lookFinished++;
+        if (!finished)
+            g_look[keep++] = std::move(g_look[i]);
+    }
+    g_look.resize(keep);
+    return pending || !g_look.empty();
+}
+
 // Shaders the memory scan found (by renderer hash), to see how much of a race it covers.
 std::unordered_set<uint64_t> g_scanKnown;
 uint32_t g_scanPrefound = 0, g_scanMissed = 0;
@@ -2098,25 +2219,63 @@ void HoldPresent();
 
 // Spins until done() is true. Presents the overlay roughly 8 times a second once the wait
 // has lasted 150 ms.
+
+
 void WaitHoldingImpl(const std::function<bool()>& done)
 {
+    if (done())
+        return;
+    // A stall: look at everything queued behind this draw and build it all at once
+    // (in parallel), then wait for the whole set, not just this draw's pipeline.
+    static auto lastLook = std::chrono::steady_clock::time_point{};
     const auto start = std::chrono::steady_clock::now();
     bool announced = false;
-    while (!done())
+    ShaderScanNow(std::max(2u, std::thread::hardware_concurrency() / 2));
+    DrainScan(0);
+    for (;;)
     {
-        const auto waited = std::chrono::steady_clock::now() - start;
-        if (waited > std::chrono::milliseconds(150))
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastLook > std::chrono::milliseconds(400))
+        {
+            lastLook = now;
+            GpuLookahead();
+        }
+        const bool lookPending = AdvanceLookahead(4.0);
+        if (done() && !lookPending && g_compiler.jobs.load() == 0)
+            break;
+        if (now - start > std::chrono::seconds(180))
+            break;
+        if (now - start > std::chrono::milliseconds(150))
         {
             g_hold.active = true;
             announced = true;
             DrainScan(0);
-            if (std::chrono::steady_clock::now() - g_hold.lastPresent > std::chrono::milliseconds(120))
+            if (now - g_hold.lastPresent > std::chrono::milliseconds(33))
                 HoldPresent();
         }
         Sleep(1);
     }
     if (announced)
         g_hold.active = false;
+    if (std::chrono::steady_clock::now() - start > std::chrono::seconds(2))
+        g_lastLongHold = std::chrono::steady_clock::now();
+    if (getenv("FM2_PERF"))
+    {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        if (ms > 20)
+            Log("perf: stall of %.0f ms on %s (blend %08X, lookahead started %u, finished %u)", ms, g_waitWhat, g_waitBlend, g_lookStarted, g_lookFinished);
+    }
+}
+
+// Lookahead hooks, called from GpuLookahead on shadow register state.
+void PredictBeginImpl()
+{
+    g_predVs = g_r.vsHash;
+    g_predPs = g_r.psHash;
+    g_predVsCode = g_r.vsCode.data();
+    g_predPsCode = g_r.psCode.data();
+    g_predVsDwords = uint32_t(g_r.vsCode.size());
+    g_predPsDwords = uint32_t(g_r.psCode.size());
 }
 
 // ---- Warm-up: rebuilds every shader/pipeline recorded in the manifest in the
@@ -2200,6 +2359,11 @@ bool OverlayWanted(std::vector<std::string>& lines)
     lines.push_back(l);
     snprintf(l, sizeof(l), "Pipelines  %u built, %u from cache", g_stats.pipelinesBuilt.load(), g_stats.pipelinesLoaded.load());
     lines.push_back(l);
+    if (g_hold.active)
+    {
+        snprintf(l, sizeof(l), "This race  %u pipelines found, %u done, %zu waiting", g_lookStarted + uint32_t(g_look.size()), g_lookFinished, g_look.size());
+        lines.push_back(l);
+    }
     if (g_stats.warmTotal.load())
     {
         snprintf(l, sizeof(l), "Warm-up    %u / %u pipelines", std::min(g_stats.warmDone.load(), g_stats.warmTotal.load()), g_stats.warmTotal.load());
@@ -2411,6 +2575,45 @@ void HoldPresent()
 }
 }
 
+void RendererPredictBegin()
+{
+    PredictBeginImpl();
+}
+
+void RendererPredictShader(uint32_t type, const uint32_t* microcodeBE, uint32_t dwords)
+{
+    const uint64_t hash = Fnv(microcodeBE, dwords * 4) ^ type;
+    if (type == 0)
+    {
+        g_predVs = hash;
+        g_predVsCode = microcodeBE;
+        g_predVsDwords = dwords;
+    }
+    else
+    {
+        g_predPs = hash;
+        g_predPsCode = microcodeBE;
+        g_predPsDwords = dwords;
+    }
+}
+
+void RendererPredictDraw(uint32_t initiator)
+{
+    const uint32_t edramMode = gpureg::Get(RB_MODECONTROL) & 7;
+    if ((edramMode != 4 && edramMode != 5) || !g_predVs || !g_predPs || !g_predVsDwords || !g_predPsDwords)
+        return;
+    const uint32_t prim = initiator & 0x3F;
+    const PipelineKey key = MakePipelineKey(g_predVs, g_predPs, edramMode == 5, prim != 8 && prim != 1);
+    if (g_r.pipelines.count(key) || !g_lookKeys.insert(key).second)
+        return;
+    LookItem item{ key, nullptr, nullptr, nullptr, false };
+    if (!g_r.shaders.count(g_predVs))
+        item.vsCode = std::make_shared<std::vector<uint32_t>>(g_predVsCode, g_predVsCode + g_predVsDwords);
+    if (!g_r.shaders.count(g_predPs))
+        item.psCode = std::make_shared<std::vector<uint32_t>>(g_predPsCode, g_predPsCode + g_predPsDwords);
+    g_look.push_back(std::move(item));
+}
+
 bool RendererCompileIdle()
 {
     const uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -2525,6 +2728,14 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     const CompiledShader& ps = GetShader(g_r.psHash, g_r.psCode, true);
     Section(1);
     static const bool asyncShaders = getenv("FM2_ASYNC_SHADERS") != nullptr;
+    const bool shadersPending = vs.state.load(std::memory_order_acquire) == CompiledShader::Pending || ps.state.load(std::memory_order_acquire) == CompiledShader::Pending;
+    if (shadersPending && SkippableDraw(edramMode == 5, gpureg::Get(RB_BLENDCONTROL0)))
+    {
+        g_skippedPipeline++;
+        return; // compiling in the background
+    }
+    g_waitWhat = "shader";
+    g_waitBlend = gpureg::Get(RB_BLENDCONTROL0);
     if (!asyncShaders)
         WaitHoldingImpl([&] {
             return vs.state.load(std::memory_order_acquire) != CompiledShader::Pending && ps.state.load(std::memory_order_acquire) != CompiledShader::Pending;

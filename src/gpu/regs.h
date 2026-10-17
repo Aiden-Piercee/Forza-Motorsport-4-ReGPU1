@@ -21,6 +21,12 @@ inline void Set(uint32_t index, uint32_t value) { StoreBE32(kBase + index * 4, v
 // Physical addresses as the GPU sees them, in our 0xA0000000 view.
 inline uint32_t GpuPhysToGuest(uint32_t phys) { return 0xA0000000 + (phys & 0x1FFFFFFF); }
 
+// Dry-runs the command stream that is queued but not executed yet (rest of the buffers
+// being executed, then the ring up to the write pointer) on a snapshot of the state
+// registers, reporting each upcoming draw's shaders and render state to the renderer
+// (RendererPredictShader / RendererPredictDraw). Command processor thread only.
+void GpuLookahead();
+
 // Frame capture (src/gpu/frame.cpp), called on the command processor thread.
 enum class ShaderType
 {
