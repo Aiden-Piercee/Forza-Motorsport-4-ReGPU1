@@ -117,6 +117,9 @@ struct ResolvedTexture
     uint32_t width = 0, height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM; // R32_FLOAT for depth resolves
     bool swapped = false; // resolved with the copy swap bit: guest memory has red and blue exchanged
+    // The title resolves differently sized images (bloom chain) to one address within a
+    // frame: keep earlier sizes here and swap them in rather than recreating them.
+    std::vector<ResolvedTexture> spares;
 };
 
 struct FrameResources
@@ -243,6 +246,9 @@ void LogDebugMessages()
     }
     queue->ClearStoredMessages();
 }
+std::map<std::string, uint64_t> g_created; // FM2_PERF: committed resources created, by kind
+void CountCreate(const char* what) { g_created[what]++; }
+
 const bool g_dumpHlsl = getenv("FM2_DUMP_HLSL") != nullptr;
 
 uint64_t Fnv(const void* data, size_t bytes, uint64_t h = 0xCBF29CE484222325ull)
@@ -291,7 +297,7 @@ ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RES
     rd.SampleDesc.Count = 1;
     rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     ComPtr<ID3D12Resource> r;
-    Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr, IID_PPV_ARGS(&r)), "CreateCommittedResource(buffer)");
+    Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr, IID_PPV_ARGS(&r)), "CreateCommittedResource(buffer)"); CountCreate("buffer");
     return r;
 }
 
@@ -540,7 +546,7 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
         cv.DepthStencil.Depth = 1.0f;
         Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv,
                   IID_PPV_ARGS(&s.resource)),
-            "CreateCommittedResource(depth surface)");
+            "CreateCommittedResource(depth surface)"); CountCreate("depth surface");
         s.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
         s.view = g_r.dsvHeap->GetCPUDescriptorHandleForHeapStart();
         s.view.ptr += SIZE_T(index) * g_r.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
@@ -556,7 +562,7 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
         cv.Format = td.Format;
         Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv,
                   IID_PPV_ARGS(&s.resource)),
-            "CreateCommittedResource(colour surface)");
+            "CreateCommittedResource(colour surface)"); CountCreate("colour surface");
         s.view = g_r.rtvHeap->GetCPUDescriptorHandleForHeapStart();
         s.view.ptr += SIZE_T(index) * g_r.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         g_r.device->CreateRenderTargetView(s.resource.Get(), nullptr, s.view);
@@ -1098,7 +1104,7 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
         Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
                   IID_PPV_ARGS(&cached.resource)),
-            "CreateCommittedResource(cube)");
+            "CreateCommittedResource(cube)"); CountCreate("cube");
         cached.width = w;
         cached.height = h;
         cached.format = want;
@@ -1241,7 +1247,7 @@ ID3D12Resource* ResolvedMipChain(const TextureFetch& fetch, const ResolvedTextur
         Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
                   IID_PPV_ARGS(&chain.resource)),
-            "CreateCommittedResource(mip chain)");
+            "CreateCommittedResource(mip chain)"); CountCreate("mip chain");
         chain.width = w;
         chain.height = h;
         chain.format = level0.format;
@@ -1339,7 +1345,7 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
             Frame().garbage.push_back(std::move(cached.resource));
         Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                   IID_PPV_ARGS(&cached.resource)),
-            "CreateCommittedResource(texture)");
+            "CreateCommittedResource(texture)"); CountCreate("texture");
         cached.width = w;
         cached.height = h;
     }
@@ -1533,28 +1539,57 @@ void TransitionColor(D3D12_RESOURCE_STATES to)
 void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXGI_FORMAT format, const D3D12_RECT& rect, float scale, bool swapRB = false)
 {
     ResolvedTexture& dest = g_r.resolved[base];
+    auto swapVariant = [](ResolvedTexture& a, ResolvedTexture& b) {
+        std::swap(a.resource, b.resource);
+        std::swap(a.width, b.width);
+        std::swap(a.height, b.height);
+        std::swap(a.format, b.format);
+        std::swap(a.swapped, b.swapped);
+    };
     if (!dest.resource || dest.width != width || dest.height != height || dest.format != format)
     {
-        D3D12_HEAP_PROPERTIES hp{};
-        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC td{};
-        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        td.Width = width;
-        td.Height = height;
-        td.DepthOrArraySize = 1;
-        td.MipLevels = 1;
-        td.SampleDesc.Count = 1;
-        td.Format = format;
-        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        if (dest.resource)
-            Frame().garbage.push_back(std::move(dest.resource));
-        Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
-                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
-                  IID_PPV_ARGS(&dest.resource)),
-            "CreateCommittedResource(resolve)");
-        dest.width = width;
-        dest.height = height;
-        dest.format = format;
+        bool found = false;
+        for (ResolvedTexture& spare : dest.spares)
+            if (spare.resource && spare.width == width && spare.height == height && spare.format == format)
+            {
+                swapVariant(dest, spare);
+                found = true;
+                break;
+            }
+        if (!found)
+        {
+            if (dest.resource)
+            {
+                // The displaced variant stays available; bound the pool.
+                if (dest.spares.size() >= 6)
+                {
+                    Frame().garbage.push_back(std::move(dest.spares.front().resource));
+                    dest.spares.erase(dest.spares.begin());
+                }
+                dest.spares.emplace_back();
+                swapVariant(dest, dest.spares.back());
+            }
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC td{};
+            td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            td.Width = width;
+            td.Height = height;
+            td.DepthOrArraySize = 1;
+            td.MipLevels = 1;
+            td.SampleDesc.Count = 1;
+            td.Format = format;
+            td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                      IID_PPV_ARGS(&dest.resource)),
+                "CreateCommittedResource(resolve)");
+            CountCreate("resolve");
+            dest.width = width;
+            dest.height = height;
+            dest.format = format;
+            dest.swapped = false;
+        }
     }
     const D3D12_RECT sr{ rect.left, rect.top, std::min<LONG>(rect.right, width), std::min<LONG>(rect.bottom, height) };
     FrameResources& f = Frame();
@@ -1737,7 +1772,8 @@ struct Perf
     double section[8] = {};
     uint64_t tablesBuilt = 0, tablesReused = 0;
     std::chrono::steady_clock::time_point mark;
-    uint64_t frames = 0, draws = 0;
+    uint64_t frames = 0, draws = 0, slowFrames = 0;
+    double maxFrame = 0;
 } g_perf;
 void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize);
 }
@@ -2124,6 +2160,18 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
     g_perf.swapSeconds += std::chrono::duration<double>(now - t0).count();
     g_perf.frames++;
     static const bool perf = getenv("FM2_PERF") != nullptr;
+    static auto lastSwap = now;
+    static double frameDraw = 0, lastDrawTotal = 0;
+    {
+        const double dt = std::chrono::duration<double>(now - lastSwap).count() * 1000.0;
+        lastSwap = now;
+        g_perf.maxFrame = std::max(g_perf.maxFrame, dt);
+        if (dt > 20.0)
+            g_perf.slowFrames++;
+        if (perf && dt > 30.0 && dt < 400.0)
+            Log("perf: slow frame %llu: %.1f ms (draw work this window %.1f ms over %llu frames)", (unsigned long long)frameNumber, dt,
+                g_perf.drawSeconds * 1000.0, (unsigned long long)g_perf.frames);
+    }
     const double window = std::chrono::duration<double>(now - g_perf.windowStart).count();
     if (window >= 1.0)
     {
@@ -2136,11 +2184,20 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
                 g_perf.section[0] * 1000.0 / g_perf.frames, g_perf.section[1] * 1000.0 / g_perf.frames, g_perf.section[2] * 1000.0 / g_perf.frames,
                 g_perf.section[3] * 1000.0 / g_perf.frames, g_perf.section[4] * 1000.0 / g_perf.frames, g_perf.section[5] * 1000.0 / g_perf.frames);
         if (perf)
-            Log("perf:   cpu%s", GuestThreadCpuUsage(window).c_str());
+            Log("perf:   cpu%s | slowest frame %.1f ms, %llu over 20 ms", GuestThreadCpuUsage(window).c_str(), g_perf.maxFrame,
+                (unsigned long long)g_perf.slowFrames);
         if (perf && g_perf.frames)
             Log("perf:   waiting on host GPU %.2f ms/frame", g_gpuWaitSeconds * 1000.0 / g_perf.frames);
         if (perf && g_perf.frames)
             Log("perf:   descriptor tables built %.0f, reused %.0f per frame", double(g_perf.tablesBuilt) / g_perf.frames, double(g_perf.tablesReused) / g_perf.frames);
+        if (perf && !g_created.empty())
+        {
+            std::string s;
+            for (auto& [what, n] : g_created)
+                s += " " + what + ":" + std::to_string(n);
+            Log("perf:   resources created this second:%s", s.c_str());
+        }
+        g_created.clear();
         g_gpuWaitSeconds = 0;
         g_perf = Perf{};
     }

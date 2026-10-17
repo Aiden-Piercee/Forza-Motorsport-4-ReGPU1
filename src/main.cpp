@@ -24,6 +24,8 @@ int main(int argc, char** argv)
     RuntimeInit(gameDir);
     ThreadSystemInit(g_title.tlsTemplate, g_title.tlsDataSize, g_title.tlsSlotCount);
 
+    void StartThreadProfiler();
+    StartThreadProfiler();
     void StartWatch();
     StartWatch();
     auto main = CreateGuestThread(g_title.entryPoint, 0, 0, g_title.stackSize, false, "main");

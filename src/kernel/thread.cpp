@@ -1,8 +1,14 @@
 #include "kernel/thread.h"
 
+#include <algorithm>
+#include <chrono>
+#include <string>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include <windows.h>
+#include <dbghelp.h>
 
 #include "log.h"
 
@@ -360,4 +366,66 @@ std::string GuestThreadCpuUsage(double wallSeconds)
         }
     }
     return out;
+}
+
+// Sampling profiler (FM2_PROFILE=<guest thread id>): every millisecond, read the
+// thread's instruction pointer and count it per function; the top of the table
+// is logged every 5 seconds. Needs the symbols crash.cpp loads.
+void StartThreadProfiler()
+{
+    static const char* env = getenv("FM2_PROFILE");
+    if (!env)
+        return;
+    const uint32_t target = uint32_t(atoi(env));
+    std::thread([target] {
+        std::unordered_map<std::string, uint64_t> counts;
+        uint64_t samples = 0;
+        auto lastLog = std::chrono::steady_clock::now();
+        for (;;)
+        {
+            Sleep(1);
+            HANDLE handle = nullptr;
+            {
+                std::lock_guard lock(g_threadsMutex);
+                for (auto& [kthread, weak] : g_threadsByKthread)
+                    if (auto object = weak.lock(); object && !object->exited && object->thread->id == target)
+                        handle = object->thread->hostHandle;
+            }
+            if (!handle)
+                continue;
+            if (SuspendThread(handle) == DWORD(-1))
+                continue;
+            CONTEXT c{};
+            c.ContextFlags = CONTEXT_CONTROL;
+            const bool ok = GetThreadContext(handle, &c);
+            std::string name;
+            if (ok)
+            {
+                alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256];
+                auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+                symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+                symbol->MaxNameLen = 255;
+                DWORD64 displacement = 0;
+                name = SymFromAddr(GetCurrentProcess(), c.Rip, &displacement, symbol) ? symbol->Name : "?";
+            }
+            ResumeThread(handle);
+            if (!ok)
+                continue;
+            counts[name]++;
+            samples++;
+            if (std::chrono::steady_clock::now() - lastLog > std::chrono::seconds(5))
+            {
+                lastLog = std::chrono::steady_clock::now();
+                std::vector<std::pair<uint64_t, std::string>> top;
+                for (auto& [n, k] : counts)
+                    top.push_back({ k, n });
+                std::sort(top.rbegin(), top.rend());
+                Log("profile: thread %u, %llu samples", target, (unsigned long long)samples);
+                for (size_t i = 0; i < top.size() && i < 25; i++)
+                    Log("profile: %5.1f%% %s", top[i].first * 100.0 / samples, top[i].second.c_str());
+                counts.clear();
+                samples = 0;
+            }
+        }
+    }).detach();
 }
