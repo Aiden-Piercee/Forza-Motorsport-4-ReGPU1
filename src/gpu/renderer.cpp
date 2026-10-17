@@ -130,6 +130,8 @@ struct ResolveDump
     int variant = 0;
     UINT width = 0, height = 0, pitch = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    float minDepth = 0, maxDepth = 0;
+    uint64_t midCount = 0;
 };
 
 struct FrameResources
@@ -1291,17 +1293,29 @@ ID3D12Resource* ResolvedMipChain(const TextureFetch& fetch, const ResolvedTextur
     return chain.resource.Get();
 }
 
+// The resolved texture a fetch reads, if any. Resolves are never block compressed,
+// so a compressed fetch at an address we resolved to earlier is a different image the
+// title has since loaded there (menu thumbnails reusing a shadow blob's memory).
+const ResolvedTexture* ResolvedFor(const TextureFetch& fetch)
+{
+    const char* name = TextureFormatName(fetch.Format());
+    if (name && (strncmp(name, "DXT", 3) == 0 || strncmp(name, "DXN", 3) == 0 || strncmp(name, "CTX", 3) == 0))
+        return nullptr;
+    auto it = g_r.resolved.find(fetch.Address() & 0x1FFFFFFF);
+    return it == g_r.resolved.end() ? nullptr : &it->second;
+}
+
 // Decodes (if changed) and uploads a texture; returns its resource.
 ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
 {
     format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    if (auto it = g_r.resolved.find(fetch.Address()); it != g_r.resolved.end())
+    if (const ResolvedTexture* resolvedTexture = ResolvedFor(fetch))
     {
-        format = it->second.format;
+        format = resolvedTexture->format;
         if (fetch.MipMaxLevel() > 0 && fetch.MipAddress())
-            if (ID3D12Resource* chain = ResolvedMipChain(fetch, it->second))
+            if (ID3D12Resource* chain = ResolvedMipChain(fetch, *resolvedTexture))
                 return chain;
-        return it->second.resource.Get();
+        return resolvedTexture->resource.Get();
     }
     if (fetch.Type() != 2 || fetch.Dimension() != 1 || !TextureFormatSupported(fetch.Format()))
         return nullptr;
@@ -2045,12 +2059,12 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // w: dimension (1 2D, 3 cube); bit 31 + bits 8-19: the fetch swizzle, applied in the
         // shader for textures that live on the GPU (resolves). Decoded ones are swizzled already.
         static const bool noGpuSwizzle = getenv("FM2_NO_GPU_SWIZZLE") != nullptr;
-        auto resolvedIt = g_r.resolved.find(fetch.Address() & 0x1FFFFFFF);
-        const bool onGpu = !noGpuSwizzle && fetch.Type() == 2 && resolvedIt != g_r.resolved.end();
+        const ResolvedTexture* resolvedPtr = ResolvedFor(fetch);
+        const bool onGpu = !noGpuSwizzle && fetch.Type() == 2 && resolvedPtr != nullptr;
         // Our resolved textures keep red and blue in place; when the title
         // resolved with the swap bit, its fetch swizzle expects them exchanged.
         uint32_t swizzle = fetch.Swizzle();
-        if (onGpu && resolvedIt->second.swapped)
+        if (onGpu && resolvedPtr->swapped)
             for (uint32_t c = 0; c < 4; c++)
             {
                 const uint32_t sel = (swizzle >> (3 * c)) & 7;
@@ -2064,6 +2078,15 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         pc->tinfo[slot][0] = (point ? (clamp ? 2 : 3) : (clamp ? 1 : 0)) | ((uint32_t(fetch.ExpAdjust()) & 0x3F) << 8);
         pc->tbias[slot][0] = fetch.LodBias();
         memcpy(&pc->tbias[slot][1], &index, 4);
+        // A resolved texture is as wide as the pitch it was resolved with; the fetch
+        // constant may declare a narrower image inside it (e.g. 163 of 192 columns):
+        // the shader scales UVs so 0..1 spans the declared image, not the padding.
+        pc->tbias[slot][2] = pc->tbias[slot][3] = 1.0f;
+        if (onGpu && !cube && resolvedPtr->width && resolvedPtr->height && resolvedPtr->resource)
+        {
+            pc->tbias[slot][2] = std::min(1.0f, float(fetch.Width()) / float(resolvedPtr->width));
+            pc->tbias[slot][3] = std::min(1.0f, float(fetch.Height()) / float(resolvedPtr->height));
+        }
         pc->tinfo[slot][1] = fetch.Width();
         pc->tinfo[slot][2] = fetch.Height();
     }
@@ -2370,6 +2393,12 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
                     else if (d.format == DXGI_FORMAT_R32_FLOAT)
                     {
                         const float f = reinterpret_cast<const float*>(mapped + size_t(y) * d.pitch)[x];
+                        if (x == 0 && y == 0)
+                            d.minDepth = d.maxDepth = f;
+                        d.minDepth = std::min(d.minDepth, f);
+                        d.maxDepth = std::max(d.maxDepth, f);
+                        if (f > 0.0f && f < 1.0f)
+                            d.midCount++;
                         o[0] = o[1] = o[2] = uint8_t(std::clamp(f, 0.0f, 1.0f) * 255.0f + 0.5f);
                         o[3] = 255;
                     }
@@ -2378,6 +2407,9 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
                     o[3] = 255;
                 }
             d.buffer->Unmap(0, nullptr);
+            if (d.format == DXGI_FORMAT_R32_FLOAT)
+                Log("resolve dump: depth %08X %ux%u min %g max %g strictly-inside %llu", d.base, d.width, d.height, d.minDepth, d.maxDepth,
+                    (unsigned long long)d.midCount);
             std::filesystem::create_directories("out/res");
             char name[96];
             snprintf(name, sizeof(name), "out/res/%08X_%ux%u_v%d.png", d.base, d.width, d.height, d.variant);
