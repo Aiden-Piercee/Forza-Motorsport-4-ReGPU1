@@ -25,7 +25,7 @@ int main(int argc, char** argv)
     {
         if (FILE* f = fopen(dump, "wb"))
         {
-            fwrite(GuestPtr(0x82000000), 1, 0x1000000, f);
+            fwrite(GuestPtr(0x82000000), 1, 0x2000000, f);
             fclose(f);
             Log("wrote the loaded image to %s", dump);
         }
