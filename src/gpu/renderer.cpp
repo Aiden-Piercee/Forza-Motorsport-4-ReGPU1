@@ -836,7 +836,16 @@ const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& code
         return cs;
     }
     if (g_dumpHlsl)
-        Log("renderer: %s %016llx:\n%s", pixel ? "ps" : "vs", (unsigned long long)hash, cs.info.hlsl.c_str());
+    {
+        std::filesystem::create_directories("out/hlsl");
+        char name[64];
+        snprintf(name, sizeof(name), "out/hlsl/%s_%016llx.hlsl", pixel ? "ps" : "vs", (unsigned long long)hash);
+        if (FILE* f = fopen(name, "wb"))
+        {
+            fwrite(cs.info.hlsl.data(), 1, cs.info.hlsl.size(), f);
+            fclose(f);
+        }
+    }
     // Debug: FM2_DEBUG_VS=<hash>:<statement> appends a statement to that vertex
     // shader's guest program (it can read r[] and write o[]).
     if (const char* dbg = getenv("FM2_DEBUG_VS"); dbg && !pixel && strtoull(dbg, nullptr, 16) == hash)
@@ -874,6 +883,10 @@ const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& code
     }
     // Debug: FM2_DEBUG_PS=<hash>:<expr> replaces that pixel shader's output, e.g.
     // "a62c809452fcc71b:float4(input.o[4].xyz, 1)".
+    // FM2_DEBUG_PS_ALL=<expr> does the same for every pixel shader.
+    if (const char* all = getenv("FM2_DEBUG_PS_ALL"); all && pixel)
+        if (size_t at = cs.info.hlsl.rfind("return oC[0];"); at != std::string::npos)
+            cs.info.hlsl.replace(at, 13, std::string("return ") + all + ";");
     if (const char* dbg = getenv("FM2_DEBUG_PS"); dbg && pixel && strtoull(dbg, nullptr, 16) == hash)
         if (const char* expr = strchr(dbg, ':'))
             if (size_t at = cs.info.hlsl.rfind("return oC[0];"); at != std::string::npos)
@@ -944,7 +957,15 @@ D3D12_BLEND_OP BlendOp(uint32_t op)
 
 ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable)
 {
-    const uint32_t blend = gpureg::Get(RB_BLENDCONTROL0), depth = gpureg::Get(RB_DEPTHCONTROL);
+    const uint32_t blend = gpureg::Get(RB_BLENDCONTROL0);
+    uint32_t depth = gpureg::Get(RB_DEPTHCONTROL);
+    // Debug: FM2_NO_ZTEST=a-b turns the depth test off for draws a..b-1 of the FM2_DUMP_FRAME frame.
+    static uint32_t noZFrom = 0, noZTo = 0;
+    static const bool noZParsed = [] { if (const char* s = getenv("FM2_NO_ZTEST")) sscanf(s, "%u-%u", &noZFrom, &noZTo); return true; }();
+    static const uint64_t noZFrame = getenv("FM2_DUMP_FRAME") ? strtoull(getenv("FM2_DUMP_FRAME"), nullptr, 10) : 0;
+    (void)noZParsed;
+    if (noZTo && g_r.frame + 1 == noZFrame && g_r.drawsThisFrame >= noZFrom && g_r.drawsThisFrame < noZTo)
+        depth &= ~(getenv("FM2_NO_ZWRITE") ? 4u : 2u);
     const uint32_t mask = depthOnly ? 0 : gpureg::Get(RB_COLOR_MASK) & 0xF;
     // Stencil masks (not the reference, which is dynamic) and culling are pipeline state.
     const uint32_t stencil = gpureg::Get(RB_STENCILREFMASK) & 0xFFFF00, mode = gpureg::Get(PA_SU_SC_MODE_CNTL) & 7;
@@ -1464,6 +1485,13 @@ bool BuildIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize, std:
 
 namespace
 {
+// Origin (screen rows) and screen rectangle of the tile pass being replayed.
+struct TileState
+{
+    int originY = 0;
+    D3D12_RECT rect{ 0, 0, 1 << 14, 1 << 14 };
+} g_tile;
+
 // Tiling: each tile pass is shifted into EDRAM by the window offset and
 // clipped to the tile. We render in screen space, so draws (and resolves)
 // stay unshifted and are clipped to the tile's screen rectangle.
@@ -1980,10 +2008,32 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
 
     Section(5);
-    // Viewport.
-    // The viewport transform happens in the vertex shader; D3D maps 1:1.
-    const D3D12_VIEWPORT vp{ 0, 0, float(kWidth), float(kHeight), 0, 1 };
-    const D3D12_RECT scissor = WindowScissor();
+    // Viewport. The viewport transform happens in the vertex shader; D3D maps 1:1.
+    // Tiled passes shift each draw into EDRAM by the window offset. We render in screen
+    // space, so tiled draws stay unshifted. The title's rectangle draws (depth resets)
+    // reset the window offset to zero and use tile-relative coordinates instead:
+    // those land in the current tile, so shift them by the tile's origin.
+    D3D12_RECT scissor = WindowScissor();
+    float shiftY = 0;
+    {
+        const uint32_t offsetReg = gpureg::Get(PA_SC_WINDOW_OFFSET);
+        const int32_t wy = ((gpureg::Get(PA_SU_SC_MODE_CNTL) >> 16) & 1) ? int32_t((offsetReg >> 16) << 17) >> 17 : 0;
+        const bool full = scissor.left <= 0 && scissor.top <= 0 && scissor.right >= LONG(kWidth) && scissor.bottom >= LONG(kHeight);
+        if (!full)
+        {
+            g_tile.originY = -wy;
+            g_tile.rect = scissor;
+        }
+        else if (g_tile.originY != 0)
+        {
+            shiftY = float(g_tile.originY + wy);
+            scissor.left = std::max(scissor.left, g_tile.rect.left);
+            scissor.top = std::max(scissor.top, g_tile.rect.top);
+            scissor.right = std::min(scissor.right, g_tile.rect.right);
+            scissor.bottom = std::min(scissor.bottom, g_tile.rect.bottom);
+        }
+    }
+    const D3D12_VIEWPORT vp{ 0, shiftY, float(kWidth), float(kHeight), 0, 1 };
     if (scissor.right <= scissor.left || scissor.bottom <= scissor.top)
     {
         TraceSkip("empty scissor", initiator);
@@ -2052,6 +2102,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         Log("    scissors: generic %08X-%08X screen %08X-%08X window %08X-%08X offset %08X vport %g,%g +%g,%g", gpureg::Get(0x2090), gpureg::Get(0x2091),
             gpureg::Get(0x200E), gpureg::Get(0x200F), gpureg::Get(PA_SC_WINDOW_SCISSOR_TL), gpureg::Get(PA_SC_WINDOW_SCISSOR_BR), gpureg::Get(PA_SC_WINDOW_OFFSET),
             RegFloat(PA_CL_VPORT_XOFFSET), RegFloat(PA_CL_VPORT_YOFFSET), RegFloat(PA_CL_VPORT_XSCALE), RegFloat(PA_CL_VPORT_YSCALE));
+        Log("    vport z scale %g offset %g, vte %08X, clip %08X, depth clamp/zrange regs %08X %08X", RegFloat(PA_CL_VPORT_ZSCALE), RegFloat(PA_CL_VPORT_ZOFFSET), gpureg::Get(0x2206), gpureg::Get(0x2204), gpureg::Get(0x2280), gpureg::Get(0x2281));
         Log("    surface %08X color %08X depth %08X depthctl %08X colorctl %08X mode %X", gpureg::Get(0x2000), gpureg::Get(0x2001), gpureg::Get(0x2002),
             gpureg::Get(RB_DEPTHCONTROL), gpureg::Get(RB_COLORCONTROL), gpureg::Get(PA_SU_SC_MODE_CNTL));
         for (uint32_t c : { 0u, 1u, 5u, 6u, 7u, 14u, 22u, 254u, 255u })
@@ -2129,6 +2180,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
 
     static const uint64_t dumpFrame = getenv("FM2_DUMP_FRAME") ? strtoull(getenv("FM2_DUMP_FRAME"), nullptr, 10) : 0;
     ++g_r.frame;
+    g_tile = TileState{};
     static const bool dumpSecond = getenv("FM2_SKIP_VS") != nullptr;
     static const uint64_t dumpEvery = getenv("FM2_DUMP_EVERY") ? strtoull(getenv("FM2_DUMP_EVERY"), nullptr, 10) : 0;
     const bool dump = fromResolve && ((dumpFrame && (g_r.frame == dumpFrame || (dumpSecond && g_r.frame == dumpFrame + 1))) || (dumpEvery && g_r.frame % dumpEvery == 0));
