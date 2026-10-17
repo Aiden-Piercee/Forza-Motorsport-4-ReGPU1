@@ -369,6 +369,9 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
     pd.SampleMask = UINT_MAX;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    static const bool noCull = getenv("FM2_NO_CULL") != nullptr;
+    if (noCull)
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
@@ -984,6 +987,9 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     (void)noZParsed;
     if (noZTo && g_r.frame + 1 == noZFrame && g_r.drawsThisFrame >= noZFrom && g_r.drawsThisFrame < noZTo)
         depth &= ~(getenv("FM2_NO_ZWRITE") ? 4u : 2u);
+    static const bool zFuncAlways = getenv("FM2_ZFUNC_ALWAYS") != nullptr;
+    if (zFuncAlways)
+        depth |= 0x70; // debug: depth func ALWAYS for every draw
     const uint32_t mask = depthOnly ? 0 : gpureg::Get(RB_COLOR_MASK) & 0xF;
     // Stencil masks (not the reference, which is dynamic) and culling are pipeline state.
     const uint32_t stencil = gpureg::Get(RB_STENCILREFMASK) & 0xFFFF00, mode = gpureg::Get(PA_SU_SC_MODE_CNTL) & 7;
@@ -1712,8 +1718,9 @@ void Resolve()
     const uint32_t sourceSelect = control & 7;
     static const uint64_t traceFrame = getenv("FM2_TRACE_DRAWS") ? strtoull(getenv("FM2_TRACE_DRAWS"), nullptr, 10) : 0;
     if (traceFrame && g_r.frame + 1 == traceFrame)
-        Log("resolve: control %08X dest %08X pitch %08X info %08X rect %ld,%ld-%ld,%ld clear %08X", control, gpureg::Get(RB_COPY_DEST_BASE),
-            gpureg::Get(RB_COPY_DEST_PITCH), gpureg::Get(RB_COPY_DEST_INFO), rect.left, rect.top, rect.right, rect.bottom, gpureg::Get(RB_COLOR_CLEAR));
+        Log("resolve: control %08X dest %08X pitch %08X info %08X rect %ld,%ld-%ld,%ld clear %08X (color info %08X depth info %08X surface %08X)", control,
+            gpureg::Get(RB_COPY_DEST_BASE), gpureg::Get(RB_COPY_DEST_PITCH), gpureg::Get(RB_COPY_DEST_INFO), rect.left, rect.top, rect.right, rect.bottom,
+            gpureg::Get(RB_COLOR_CLEAR), gpureg::Get(RB_COLOR_INFO), gpureg::Get(RB_DEPTH_INFO), gpureg::Get(RB_SURFACE_INFO));
     if (command != 3 && sourceSelect <= 4)
     {
         // Each tile resolves to the destination row it starts at; key the
@@ -2025,7 +2032,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     pc->info[1] = (gpureg::Get(SQ_PROGRAM_CNTL) >> 18) & 1 ? (gpureg::Get(SQ_CONTEXT_MISC) >> 8) & 0xFF : 0xFF;
 
     const uint32_t colorControl = gpureg::Get(RB_COLORCONTROL);
-    pc->info[0] = (colorControl >> 3) & 1 ? (colorControl & 7) : 7;
+    // Depth-only passes (EDRAM mode 5) run no pixel shader, so there is no alpha to test.
+    static const bool depthAlphaTest = getenv("FM2_DEPTH_ALPHATEST") != nullptr;
+    pc->info[0] = (colorControl >> 3) & 1 && (edramMode != 5 || depthAlphaTest) ? (colorControl & 7) : 7;
     pc->info2[0] = RegFloat(RB_ALPHA_REF);
 
     Section(4);
@@ -2187,6 +2196,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             gpureg::Get(0x200E), gpureg::Get(0x200F), gpureg::Get(PA_SC_WINDOW_SCISSOR_TL), gpureg::Get(PA_SC_WINDOW_SCISSOR_BR), gpureg::Get(PA_SC_WINDOW_OFFSET),
             RegFloat(PA_CL_VPORT_XOFFSET), RegFloat(PA_CL_VPORT_YOFFSET), RegFloat(PA_CL_VPORT_XSCALE), RegFloat(PA_CL_VPORT_YSCALE));
         Log("    vport z scale %g offset %g, vte %08X, clip %08X, depth clamp/zrange regs %08X %08X", RegFloat(PA_CL_VPORT_ZSCALE), RegFloat(PA_CL_VPORT_ZOFFSET), gpureg::Get(0x2206), gpureg::Get(0x2204), gpureg::Get(0x2280), gpureg::Get(0x2281));
+        Log("    alpha ref %g (pinfo.x %u) edram mode %u colormask %X", RegFloat(RB_ALPHA_REF), pc->info[0], edramMode, gpureg::Get(RB_COLOR_MASK));
         Log("    surface %08X color %08X depth %08X depthctl %08X colorctl %08X mode %X", gpureg::Get(0x2000), gpureg::Get(0x2001), gpureg::Get(0x2002),
             gpureg::Get(RB_DEPTHCONTROL), gpureg::Get(RB_COLORCONTROL), gpureg::Get(PA_SU_SC_MODE_CNTL));
         for (uint32_t c : { 0u, 1u, 5u, 6u, 7u, 14u, 22u, 254u, 255u })
