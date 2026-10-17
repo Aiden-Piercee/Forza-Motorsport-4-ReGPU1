@@ -122,6 +122,16 @@ struct ResolvedTexture
     std::vector<ResolvedTexture> spares;
 };
 
+// FM2_DUMP_RESOLVES readback of one resolved texture.
+struct ResolveDump
+{
+    ComPtr<ID3D12Resource> buffer;
+    uint32_t base = 0;
+    int variant = 0;
+    UINT width = 0, height = 0, pitch = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+};
+
 struct FrameResources
 {
     ComPtr<ID3D12CommandAllocator> allocator;
@@ -2113,9 +2123,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             if (((ps.info.usedTextureSlots >> slot) & 1) == 0)
                 continue;
             const TextureFetch t = ReadTextureFetch(slot);
-            char e[96];
-            snprintf(e, sizeof(e), " t%u=%s %ux%u@%08X sw%03X sg%02X d%u", slot, TextureFormatName(t.Format()), t.Width(), t.Height(), t.Address(), t.Swizzle(),
-                (t.dwords[0] >> 2) & 0xFF, t.Dimension());
+            char e[160];
+            snprintf(e, sizeof(e), " t%u=%s %ux%u@%08X sw%03X sg%02X d%u [%08X %08X %08X %08X %08X %08X]", slot, TextureFormatName(t.Format()), t.Width(), t.Height(), t.Address(), t.Swizzle(),
+                (t.dwords[0] >> 2) & 0xFF, t.Dimension(), t.dwords[0], t.dwords[1], t.dwords[2], t.dwords[3], t.dwords[4], t.dwords[5]);
             tex += e;
         }
         Log("    indices (initiator %08X dma %08X offset %u): %u %u %u %u %u %u ... %u", initiator, dmaBase, gpureg::Get(VGT_INDX_OFFSET),
@@ -2269,6 +2279,49 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         g_r.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
+    // FM2_DUMP_RESOLVES=1 (with FM2_DUMP_FRAME): also write every resolved texture to out/res.
+    static std::vector<ResolveDump> resolveDumps;
+    resolveDumps.clear();
+    if (dump && getenv("FM2_DUMP_RESOLVES"))
+    {
+        auto add = [&](uint32_t base, ResolvedTexture& r, int variant) {
+            if (!r.resource)
+                return;
+            ResolveDump d;
+            d.base = base;
+            d.variant = variant;
+            d.width = r.width;
+            d.height = r.height;
+            d.format = r.format;
+            const UINT bpp = r.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4;
+            d.pitch = (r.width * bpp + 255) & ~255u;
+            d.buffer = CreateBuffer(UINT64(d.pitch) * r.height, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_RESOURCE_BARRIER bar{};
+            bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            bar.Transition.pResource = r.resource.Get();
+            bar.Transition.Subresource = 0;
+            bar.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            g_r.list->ResourceBarrier(1, &bar);
+            D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+            dst.pResource = d.buffer.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint.Footprint = { r.format, r.width, r.height, 1, d.pitch };
+            src.pResource = r.resource.Get();
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            g_r.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            std::swap(bar.Transition.StateBefore, bar.Transition.StateAfter);
+            g_r.list->ResourceBarrier(1, &bar);
+            resolveDumps.push_back(std::move(d));
+        };
+        for (auto& [base, r] : g_r.resolved)
+        {
+            add(base, r, 0);
+            int v = 1;
+            for (ResolvedTexture& spare : r.spares)
+                add(base, spare, v++);
+        }
+    }
     if (fromResolve)
     {
         D3D12_RESOURCE_BARRIER b{};
@@ -2293,6 +2346,44 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     {
         g_r.fence->SetEventOnCompletion(Frame().fence, g_r.fenceEvent);
         WaitForSingleObject(g_r.fenceEvent, INFINITE);
+        for (ResolveDump& d : resolveDumps)
+        {
+            uint8_t* mapped = nullptr;
+            d.buffer->Map(0, nullptr, reinterpret_cast<void**>(&mapped));
+            std::vector<uint8_t> out(size_t(d.width) * d.height * 4);
+            for (UINT y = 0; y < d.height; y++)
+                for (UINT x = 0; x < d.width; x++)
+                {
+                    uint8_t* o = &out[(size_t(y) * d.width + x) * 4];
+                    if (d.format == DXGI_FORMAT_R16G16B16A16_FLOAT)
+                    {
+                        const uint16_t* h = reinterpret_cast<const uint16_t*>(mapped + size_t(y) * d.pitch) + x * 4;
+                        for (int c = 0; c < 4; c++)
+                        {
+                            const uint32_t e = (h[c] >> 10) & 31, m = h[c] & 1023;
+                            float f = e == 0 ? m / 1024.0f * 6.1035e-5f : e == 31 ? 65504.0f : (1.0f + m / 1024.0f) * std::ldexp(1.0f, int(e) - 15);
+                            if (h[c] & 0x8000)
+                                f = -f;
+                            o[c] = uint8_t(std::clamp(f, 0.0f, 1.0f) * 255.0f + 0.5f);
+                        }
+                    }
+                    else if (d.format == DXGI_FORMAT_R32_FLOAT)
+                    {
+                        const float f = reinterpret_cast<const float*>(mapped + size_t(y) * d.pitch)[x];
+                        o[0] = o[1] = o[2] = uint8_t(std::clamp(f, 0.0f, 1.0f) * 255.0f + 0.5f);
+                        o[3] = 255;
+                    }
+                    else
+                        memcpy(o, mapped + size_t(y) * d.pitch + x * 4, 4);
+                    o[3] = 255;
+                }
+            d.buffer->Unmap(0, nullptr);
+            std::filesystem::create_directories("out/res");
+            char name[96];
+            snprintf(name, sizeof(name), "out/res/%08X_%ux%u_v%d.png", d.base, d.width, d.height, d.variant);
+            WritePng(name, d.width, d.height, out);
+        }
+        resolveDumps.clear();
         uint8_t* data = nullptr;
         g_r.readback->Map(0, nullptr, reinterpret_cast<void**>(&data));
         std::vector<uint8_t> rgba(data, data + size_t(kWidth) * kHeight * 4);

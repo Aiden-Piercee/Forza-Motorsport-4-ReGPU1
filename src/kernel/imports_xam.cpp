@@ -401,6 +401,8 @@ bool ReadPad(uint32_t user, PadState& s)
                     break;
                 const char* name = end + 1;
                 size_t len = strcspn(name, ",");
+                if (len == 2 && strncmp(name, "RT", 2) == 0) // "45:RT": right trigger held from 45 s on
+                    v.emplace_back(t, 0xFFFF);
                 for (auto& [n, b] : names)
                     if (strlen(n) == len && strncmp(n, name, len) == 0)
                         v.emplace_back(t, b);
@@ -412,7 +414,12 @@ bool ReadPad(uint32_t user, PadState& s)
         {
             const double now = std::chrono::duration<double>(Clock::now() - start).count();
             for (auto& [t, b] : script)
-                if (now >= t && now < t + 0.15)
+                if (b == 0xFFFF)
+                {
+                    if (now >= t)
+                        s.rightTrigger = 255;
+                }
+                else if (now >= t && now < t + 0.15)
                     s.buttons |= b;
         }
         if (autoStart)
