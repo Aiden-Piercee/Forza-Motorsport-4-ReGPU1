@@ -384,6 +384,37 @@ bool ReadPad(uint32_t user, PadState& s)
         AddKeyboard(s);
         static const bool autoStart = getenv("FM2_AUTOSTART") != nullptr;
         static const auto start = Clock::now();
+        // FM2_INPUT_SCRIPT="7:START,10:A,14:RIGHT,...": press each button for
+        // 150 ms at that many seconds after boot (repro runs).
+        static const std::vector<std::pair<double, uint16_t>> script = [] {
+            std::vector<std::pair<double, uint16_t>> v;
+            static const std::pair<const char*, uint16_t> names[] = { { "A", XINPUT_GAMEPAD_A }, { "B", XINPUT_GAMEPAD_B },
+                { "X", XINPUT_GAMEPAD_X }, { "Y", XINPUT_GAMEPAD_Y }, { "START", XINPUT_GAMEPAD_START }, { "BACK", XINPUT_GAMEPAD_BACK },
+                { "UP", XINPUT_GAMEPAD_DPAD_UP }, { "DOWN", XINPUT_GAMEPAD_DPAD_DOWN }, { "LEFT", XINPUT_GAMEPAD_DPAD_LEFT },
+                { "RIGHT", XINPUT_GAMEPAD_DPAD_RIGHT }, { "LB", XINPUT_GAMEPAD_LEFT_SHOULDER }, { "RB", XINPUT_GAMEPAD_RIGHT_SHOULDER } };
+            const char* s = getenv("FM2_INPUT_SCRIPT");
+            while (s && *s)
+            {
+                char* end;
+                const double t = strtod(s, &end);
+                if (*end != ':')
+                    break;
+                const char* name = end + 1;
+                size_t len = strcspn(name, ",");
+                for (auto& [n, b] : names)
+                    if (strlen(n) == len && strncmp(n, name, len) == 0)
+                        v.emplace_back(t, b);
+                s = name + len + (name[len] == ',' ? 1 : 0);
+            }
+            return v;
+        }();
+        if (!script.empty())
+        {
+            const double now = std::chrono::duration<double>(Clock::now() - start).count();
+            for (auto& [t, b] : script)
+                if (now >= t && now < t + 0.15)
+                    s.buttons |= b;
+        }
         if (autoStart)
         {
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();

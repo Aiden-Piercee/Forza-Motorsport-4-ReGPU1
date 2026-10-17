@@ -6,6 +6,7 @@
 #include <atomic>
 #include <string>
 
+#include "kernel/imports.h"
 #include "kernel/thread.h"
 #include "log.h"
 #include "memory.h"
@@ -39,7 +40,7 @@ LONG WINAPI OnCrash(EXCEPTION_POINTERS* info)
         Log("CRASH: %s host %016llX = guest %llX", record->ExceptionInformation[0] ? "write to" : "read from", fault, guest);
     }
     if (thread && thread->ctx)
-        Log("CRASH: guest lr %08llX r1 %08X r3 %08X", thread->ctx->lr, thread->ctx->r1.u32, thread->ctx->r3.u32);
+        Log("CRASH: guest lr %08llX ctr %08llX r1 %08X r3 %08X", thread->ctx->lr, thread->ctx->ctr.u64, thread->ctx->r1.u32, thread->ctx->r3.u32);
 
     // Host call stack.
     CONTEXT context = *info->ContextRecord;
@@ -145,6 +146,14 @@ LONG WINAPI OnWatchHit(EXCEPTION_POINTERS* info)
         GuestThread* t = CurrentGuestThread();
         Log("watchpoint: thread %u wrote %02X (dr6 %llX): %s", t ? t->id : 0, *reinterpret_cast<uint8_t*>(info->ContextRecord->Dr0),
             info->ContextRecord->Dr6, out.c_str());
+        if (t && t->ctx)
+        {
+            const PPCContext& g = *t->ctx;
+            Log("watchpoint:   r3 %08X r4 %08X r5 %08X r6 %08X r7 %08X r8 %08X r9 %08X r10 %08X r11 %08X r12 %08X", g.r3.u32, g.r4.u32, g.r5.u32,
+                g.r6.u32, g.r7.u32, g.r8.u32, g.r9.u32, g.r10.u32, g.r11.u32, g.r12.u32);
+            Log("watchpoint:   r24 %08X r25 %08X r26 %08X r27 %08X r28 %08X r29 %08X r30 %08X r31 %08X lr %08llX", g.r24.u32, g.r25.u32, g.r26.u32,
+                g.r27.u32, g.r28.u32, g.r29.u32, g.r30.u32, g.r31.u32, g.lr);
+        }
     }
     info->ContextRecord->Dr6 = 0;
     return EXCEPTION_CONTINUE_EXECUTION;

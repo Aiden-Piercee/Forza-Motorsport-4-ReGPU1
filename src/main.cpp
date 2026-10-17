@@ -35,7 +35,7 @@ int main(int argc, char** argv)
             void ArmWatchpointAll();
             for (;;)
             {
-                Sleep(500);
+                Sleep(10);
                 ArmWatchpointAll();
             }
         }).detach();

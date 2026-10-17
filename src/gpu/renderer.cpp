@@ -9,6 +9,7 @@
 // next.
 
 #include <algorithm>
+#include <bit>
 #include <immintrin.h>
 #include <atomic>
 #include <condition_variable>
@@ -115,6 +116,7 @@ struct ResolvedTexture
     ComPtr<ID3D12Resource> resource;
     uint32_t width = 0, height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM; // R32_FLOAT for depth resolves
+    bool swapped = false; // resolved with the copy swap bit: guest memory has red and blue exchanged
 };
 
 struct FrameResources
@@ -308,7 +310,7 @@ void InitDepthBlit()
     params[0].DescriptorTable.pDescriptorRanges = &range;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[1].Constants.Num32BitValues = 1;
+    params[1].Constants.Num32BitValues = 2;
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rs{};
     rs.NumParameters = 2;
@@ -322,7 +324,7 @@ void InitDepthBlit()
     static const char kSource[] = R"(
 Texture2D<float> depthTex : register(t0);
 Texture2D<float4> colorTex : register(t0);
-cbuffer Blit : register(b0) { float scale; };
+cbuffer Blit : register(b0) { float scale; uint swapRB; };
 float4 vs(uint id : SV_VertexID) : SV_Position
 {
     float2 uv = float2((id << 1) & 2, id & 2);
@@ -334,7 +336,8 @@ float ps(float4 pos : SV_Position) : SV_Target
 }
 float4 psColor(float4 pos : SV_Position) : SV_Target
 {
-    return colorTex.Load(int3(int2(pos.xy), 0)) * scale;
+    float4 c = colorTex.Load(int3(int2(pos.xy), 0)) * scale;
+    return swapRB ? c.bgra : c;
 }
 )";
     ComPtr<ID3DBlob> vs, ps;
@@ -980,7 +983,8 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     // 6 incr clamp, 7 decr clamp. Back faces use their own ops when enabled.
     static const D3D12_STENCIL_OP kOps[8] = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_ZERO, D3D12_STENCIL_OP_REPLACE, D3D12_STENCIL_OP_INCR,
         D3D12_STENCIL_OP_DECR, D3D12_STENCIL_OP_INVERT, D3D12_STENCIL_OP_INCR_SAT, D3D12_STENCIL_OP_DECR_SAT };
-    if (depth & 1)
+    static const bool noStencil = getenv("FM2_NO_STENCIL") != nullptr;
+    if ((depth & 1) && !noStencil)
     {
         auto& ds = pd.DepthStencilState;
         ds.StencilEnable = TRUE;
@@ -1498,7 +1502,7 @@ void TransitionColor(D3D12_RESOURCE_STATES to)
 // Draws the resolve rectangle of the colour (or depth) buffer into the
 // destination's host texture at the same pixels, converting the format and
 // scaling colour by the resolve's exponent bias.
-void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXGI_FORMAT format, const D3D12_RECT& rect, float scale)
+void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXGI_FORMAT format, const D3D12_RECT& rect, float scale, bool swapRB = false)
 {
     ResolvedTexture& dest = g_r.resolved[base];
     if (!dest.resource || dest.width != width || dest.height != height || dest.format != format)
@@ -1563,7 +1567,8 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     g_r.list->SetGraphicsRootSignature(g_r.blitRootSignature.Get());
     g_r.list->SetPipelineState(pso);
     g_r.list->SetGraphicsRootDescriptorTable(0, Gpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
-    g_r.list->SetGraphicsRoot32BitConstants(1, 1, &scale, 0);
+    const uint32_t blitConstants[2] = { std::bit_cast<uint32_t>(scale), uint32_t(swapRB) };
+    g_r.list->SetGraphicsRoot32BitConstants(1, 2, blitConstants, 0);
     const D3D12_VIEWPORT vp{ 0, 0, float(width), float(height), 0, 1 };
     g_r.list->RSSetViewports(1, &vp);
     g_r.list->RSSetScissorRects(1, &sr);
@@ -1639,14 +1644,19 @@ void Resolve()
         const DXGI_FORMAT format = depth ? DXGI_FORMAT_R32_FLOAT
             : destFormat == 6 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
         const int bias = int32_t(info << 10) >> 26; // bits 16-21, signed
+        // Bit 24 (copy swap): the destination stores red and blue exchanged; the
+        // fetch swizzle swaps them back when the title samples it.
+        const bool swapRB = !depth && ((info >> 24) & 1);
         BlitResolve(depth, base, width, height, format, rect, depth ? 1.0f : std::ldexp(1.0f, bias));
+        g_r.resolved[base].swapped = swapRB;
     }
     // Clears after a tile's resolve prepare the EDRAM for the next tile, which
     // we draw lower on the same host surface: a full-width clear covers every
     // row from the tile down.
     D3D12_RECT clearRect = rect;
     const uint32_t surfacePitch = gpureg::Get(RB_SURFACE_INFO) & 0x3FFF;
-    if (surfacePitch && uint32_t(rect.right - rect.left) >= std::min<uint32_t>(surfacePitch, kWidth) && rect.left == 0)
+    static const bool noClearExtend = getenv("FM2_NO_CLEAR_EXTEND") != nullptr;
+    if (!noClearExtend && surfacePitch && uint32_t(rect.right - rect.left) >= std::min<uint32_t>(surfacePitch, kWidth) && rect.left == 0)
         clearRect.bottom = kHeight;
     if ((control >> 8) & 1) // colour clear (ARGB)
     {
@@ -1945,8 +1955,20 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         const uint32_t index = texture ? BindlessIndex(texture, format, cube) : (cube ? 1u : 0u);
         // w: dimension (1 2D, 3 cube); bit 31 + bits 8-19: the fetch swizzle, applied in the
         // shader for textures that live on the GPU (resolves). Decoded ones are swizzled already.
-        const bool onGpu = fetch.Type() == 2 && g_r.resolved.count(fetch.Address() & 0x1FFFFFFF);
-        pc->tinfo[slot][3] = (cube ? 3 : 1) | (onGpu ? (1u << 31) | (fetch.Swizzle() << 8) : 0);
+        static const bool noGpuSwizzle = getenv("FM2_NO_GPU_SWIZZLE") != nullptr;
+        auto resolvedIt = g_r.resolved.find(fetch.Address() & 0x1FFFFFFF);
+        const bool onGpu = !noGpuSwizzle && fetch.Type() == 2 && resolvedIt != g_r.resolved.end();
+        // Our resolved textures keep red and blue in place; when the title
+        // resolved with the swap bit, its fetch swizzle expects them exchanged.
+        uint32_t swizzle = fetch.Swizzle();
+        if (onGpu && resolvedIt->second.swapped)
+            for (uint32_t c = 0; c < 4; c++)
+            {
+                const uint32_t sel = (swizzle >> (3 * c)) & 7;
+                if (sel == 0 || sel == 2)
+                    swizzle ^= (sel ^ (2 - sel)) << (3 * c);
+            }
+        pc->tinfo[slot][3] = (cube ? 3 : 1) | (onGpu ? (1u << 31) | (swizzle << 8) : 0);
         // Clamp X (dword 0 bits 10-12): 0 wrap, else clamp. Filter: dword 3 bits 19-20 (mag): 0 point.
         const bool clamp = ((fetch.dwords[0] >> 10) & 7) != 0;
         const bool point = ((fetch.dwords[3] >> 19) & 3) == 0;
@@ -2027,6 +2049,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             }
             Log("    vf%u normal z per vertex:%s", k, nz.c_str());
         }
+        Log("    scissors: generic %08X-%08X screen %08X-%08X window %08X-%08X offset %08X vport %g,%g +%g,%g", gpureg::Get(0x2090), gpureg::Get(0x2091),
+            gpureg::Get(0x200E), gpureg::Get(0x200F), gpureg::Get(PA_SC_WINDOW_SCISSOR_TL), gpureg::Get(PA_SC_WINDOW_SCISSOR_BR), gpureg::Get(PA_SC_WINDOW_OFFSET),
+            RegFloat(PA_CL_VPORT_XOFFSET), RegFloat(PA_CL_VPORT_YOFFSET), RegFloat(PA_CL_VPORT_XSCALE), RegFloat(PA_CL_VPORT_YSCALE));
         Log("    surface %08X color %08X depth %08X depthctl %08X colorctl %08X mode %X", gpureg::Get(0x2000), gpureg::Get(0x2001), gpureg::Get(0x2002),
             gpureg::Get(RB_DEPTHCONTROL), gpureg::Get(RB_COLORCONTROL), gpureg::Get(PA_SU_SC_MODE_CNTL));
         for (uint32_t c : { 0u, 1u, 5u, 6u, 7u, 14u, 22u, 254u, 255u })
