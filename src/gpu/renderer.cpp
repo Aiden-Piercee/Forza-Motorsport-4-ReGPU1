@@ -1862,7 +1862,22 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             return v;
         }();
         const bool skipThis = g_r.frame == dumpFrame && std::find(skipVs.begin(), skipVs.end(), g_r.vsHash) != skipVs.end();
-        if (skipThis || (skipTo && g_r.frame + 1 == dumpFrame && g_r.drawsThisFrame >= skipFrom && g_r.drawsThisFrame < skipTo))
+        // FM2_SWEEP="start,step,count" (with FM2_DUMP_FRAME as the first frame): frame
+        // dumpFrame+i drops draws [start+i*step, start+(i+1)*step) and is written to
+        // out/sweep/<i>.png, so one run compares many skips on near-identical frames.
+        static uint32_t sweepStart = 0, sweepStep = 0, sweepCount = 0;
+        static const bool sweepParsed = [] { if (const char* e = getenv("FM2_SWEEP")) sscanf(e, "%u,%u,%u", &sweepStart, &sweepStep, &sweepCount); return true; }();
+        (void)sweepParsed;
+        bool sweepSkip = false;
+        if (sweepCount && dumpFrame && g_r.frame + 1 >= dumpFrame && g_r.frame + 1 < dumpFrame + sweepCount)
+        {
+            const uint32_t i = uint32_t(g_r.frame + 1 - dumpFrame);
+            sweepSkip = g_r.drawsThisFrame >= sweepStart + i * sweepStep && g_r.drawsThisFrame < sweepStart + (i + 1) * sweepStep;
+            // FM2_SWEEP_ONLY=1: the opposite: drop every draw in the whole swept range except this frame's chunk.
+            if (getenv("FM2_SWEEP_ONLY"))
+                sweepSkip = g_r.drawsThisFrame >= sweepStart && g_r.drawsThisFrame < sweepStart + sweepCount * sweepStep && !sweepSkip;
+        }
+        if (skipThis || sweepSkip || (skipTo && g_r.frame + 1 == dumpFrame && g_r.drawsThisFrame >= skipFrom && g_r.drawsThisFrame < skipTo))
         {
             g_r.drawsThisFrame++;
             return;
@@ -2240,7 +2255,9 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     g_tile = TileState{};
     static const bool dumpSecond = getenv("FM2_SKIP_VS") != nullptr;
     static const uint64_t dumpEvery = getenv("FM2_DUMP_EVERY") ? strtoull(getenv("FM2_DUMP_EVERY"), nullptr, 10) : 0;
-    const bool dump = fromResolve && ((dumpFrame && (g_r.frame == dumpFrame || (dumpSecond && g_r.frame == dumpFrame + 1))) || (dumpEvery && g_r.frame % dumpEvery == 0));
+    static uint32_t sweepCountForDump = [] { uint32_t a = 0, b = 0, c = 0; if (const char* e = getenv("FM2_SWEEP")) sscanf(e, "%u,%u,%u", &a, &b, &c); return c; }();
+    const bool sweepDump = fromResolve && sweepCountForDump && dumpFrame && g_r.frame >= dumpFrame && g_r.frame < dumpFrame + sweepCountForDump;
+    const bool dump = sweepDump || (fromResolve && ((dumpFrame && (g_r.frame == dumpFrame || (dumpSecond && g_r.frame == dumpFrame + 1))) || (dumpEvery && g_r.frame % dumpEvery == 0)));
     if (dump)
     {
         D3D12_TEXTURE_COPY_LOCATION dst{};
@@ -2288,6 +2305,13 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
             char name[64];
             std::filesystem::create_directories("out/frames");
             snprintf(name, sizeof(name), "out/frames/%05llu.png", (unsigned long long)g_r.frame);
+            WritePng(name, kWidth, kHeight, rgba);
+        }
+        else if (sweepDump)
+        {
+            std::filesystem::create_directories("out/sweep");
+            char name[64];
+            snprintf(name, sizeof(name), "out/sweep/%03llu.png", (unsigned long long)(g_r.frame - dumpFrame));
             WritePng(name, kWidth, kHeight, rgba);
         }
         else
