@@ -3,8 +3,14 @@
 #include <cstdlib>
 #include <atomic>
 #include <set>
+#include <map>
+#include <mutex>
+#include <cstring>
+#include <string>
+#include <vector>
 
 #include "kernel/imports.h"
+#include "kernel/objects.h"
 #include "log.h"
 #include "memory.h"
 
@@ -61,6 +67,17 @@ PPC_FUNC(sub_82953E38)
                     size, __builtin_bswap32(GuestPtr<uint32_t>(node)[0]), __builtin_bswap32(GuestPtr<uint32_t>(node)[1]),
                     __builtin_bswap32(GuestPtr<uint32_t>(node)[2]), __builtin_bswap32(GuestPtr<uint32_t>(node)[3]),
                     __builtin_bswap32(GuestPtr<uint32_t>(node)[4]), __builtin_bswap32(GuestPtr<uint32_t>(node)[5]));
+                if (const char* ring = getenv("FM2_DUMP_RING"))
+                {
+                    // "start,end" guest range written to out/ring.bin.
+                    const uint32_t a = uint32_t(strtoul(ring, nullptr, 16)), b = uint32_t(strtoul(strchr(ring, ',') + 1, nullptr, 16));
+                    if (FILE* f = fopen("out/ring.bin", "wb"))
+                    {
+                        fwrite(GuestPtr(a), 1, b - a, f);
+                        fclose(f);
+                        Log("probe: wrote ring %08X..%08X", a, b);
+                    }
+                }
                 break;
             }
             if (known.insert(node).second)
@@ -69,4 +86,204 @@ PPC_FUNC(sub_82953E38)
         }
     }
     __imp__sub_82953E38(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_82957260);
+
+// Video plane writer: log its arguments (FM2_PROBE_VIDEO=1).
+PPC_FUNC(sub_82957260)
+{
+    static const bool probe = getenv("FM2_PROBE_VIDEO") != nullptr;
+    if (probe)
+    {
+        static std::atomic<int> n{ 0 };
+        if ((ctx.r5.u32 == 0x2F0 || ctx.r5.u32 == 0x178) && n++ < 40)
+            Log("probe: video write r3 %08X r4 %08X r5 %08X r6 %08X r7 %08X r8 %08X r9 %08X r10 %08X lr %08llX", ctx.r3.u32, ctx.r4.u32,
+                ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32, ctx.lr);
+    }
+    const uint32_t dest = ctx.r3.u32, width = ctx.r5.u32, height = ctx.r6.u32, pitch = ctx.r7.u32, video = ctx.r10.u32;
+    {
+        extern uint32_t g_binkPlane[3];
+        g_binkPlane[0] = dest, g_binkPlane[1] = pitch, g_binkPlane[2] = width;
+        static const bool logStarts = getenv("FM2_LOG_PLANES") != nullptr;
+        static uint32_t lumaStart = 0;
+        if (logStarts && video == ctx.r10.u32)
+        {
+            if (width == 0x2F0)
+                lumaStart = ctx.r8.u32;
+            Log("bink: video %08X plane w %u bits at %08X (+%X) r9 %08X", video, width, ctx.r8.u32, ctx.r8.u32 - lumaStart, ctx.r9.u32);
+        }
+    }
+    // FM2_CHECK_FRAMEBUF=1: hash each video's bitstream buffer (r8 at the luma
+    // call) and report when it changes before that frame's chroma planes decode.
+    static const bool checkBuf = getenv("FM2_CHECK_FRAMEBUF") != nullptr;
+    if (checkBuf)
+    {
+        struct Seen
+        {
+            uint32_t start = 0;
+            uint64_t hash = 0;
+            int frame = 0;
+        };
+        static std::mutex lock;
+        static std::map<uint32_t, Seen> videos;
+        auto hashOf = [](uint32_t a) {
+            uint64_t h = 1469598103934665603ull;
+            const uint8_t* p = GuestPtr<uint8_t>(a);
+            for (int i = 0; i < 0x8000; i++)
+                h = (h ^ p[i]) * 1099511628211ull;
+            return h;
+        };
+        std::lock_guard<std::mutex> guard(lock);
+        Seen& s = videos[video];
+        if (width == 0x2F0)
+        {
+            s.start = ctx.r8.u32;
+            s.hash = hashOf(s.start);
+            s.frame++;
+        }
+        else if (s.start && hashOf(s.start) != s.hash)
+            Log("bink: video %08X frame %d: bitstream buffer %08X changed before its chroma decode (thread %u)", video, s.frame, s.start,
+                CurrentGuestThreadId());
+    }
+    // FM2_CHECK_FRAMES=<file.bik>: before each 752-wide luma decode, compare the
+    // frame buffer after the read ring with that file's frame.
+    static const char* checkFile = getenv("FM2_CHECK_FRAMES");
+    if (checkFile && width == 0x2F0)
+    {
+        extern uint32_t g_binkRingBase;
+        static std::vector<uint8_t> file;
+        static std::vector<uint32_t> offsets;
+        if (file.empty())
+            if (FILE* f = fopen(checkFile, "rb"))
+            {
+                fseek(f, 0, SEEK_END);
+                file.resize(ftell(f));
+                fseek(f, 0, SEEK_SET);
+                fread(file.data(), 1, file.size(), f);
+                fclose(f);
+                uint32_t frames, tracks;
+                memcpy(&frames, &file[8], 4);
+                memcpy(&tracks, &file[40], 4);
+                for (uint32_t i = 0; i <= frames; i++)
+                {
+                    uint32_t o;
+                    memcpy(&o, &file[44 + tracks * 12 + i * 4], 4);
+                    offsets.push_back(o & ~1u);
+                }
+            }
+        const uint8_t* buf = GuestPtr<uint8_t>(g_binkRingBase + 0x200040);
+        if (g_binkRingBase && offsets.size() > 1)
+        {
+            int frame = -1;
+            uint32_t at = 0;
+            for (uint32_t p = 0; p + 64 <= file.size() && frame < 0; p++)
+                if (memcmp(&file[p], buf, 64) == 0)
+                {
+                    at = p;
+                    for (size_t i = 0; i + 1 < offsets.size(); i++)
+                        if (offsets[i] <= p && p < offsets[i + 1])
+                            frame = int(i);
+                }
+            if (frame < 0)
+                Log("bink: frame buffer %08X matches nothing in the file", g_binkRingBase + 0x200040);
+            else
+            {
+                const uint32_t len = offsets[frame + 1] - at;
+                uint32_t k = 0;
+                while (k < len && buf[k] == file[at + k])
+                    k++;
+                static int lastFrame = -1;
+                if (k < len)
+                    Log("bink: frame %d (buffer = file %X, %u bytes to frame end) differs at +%X", frame, at, len, k);
+                else if (frame != lastFrame && frame % 20 == 0)
+                    Log("bink: frame %d ok (buffer = file %X)", frame, at);
+                lastFrame = frame;
+            }
+        }
+    }
+    // FM2_RING_AT=<n>: dump FM2_DUMP_RING before the n-th luma decode (0-based) of
+    // the first 752-wide video.
+    static const int ringAt = getenv("FM2_RING_AT") ? atoi(getenv("FM2_RING_AT")) : -1;
+    static uint32_t ringVideo = 0;
+    static int lumaCalls = 0;
+    if (ringAt >= 0 && width == 0x2F0)
+    {
+        if (!ringVideo)
+            ringVideo = video;
+        if (video == ringVideo && lumaCalls++ == ringAt)
+            if (const char* ring = getenv("FM2_DUMP_RING"))
+            {
+                const uint32_t a = uint32_t(strtoul(ring, nullptr, 16)), b = uint32_t(strtoul(strchr(ring, ',') + 1, nullptr, 16));
+                if (FILE* f = fopen("out/ring.bin", "wb"))
+                {
+                    fwrite(GuestPtr(a), 1, b - a, f);
+                    fclose(f);
+                    Log("probe: ring dumped before luma decode %d", ringAt);
+                }
+            }
+    }
+    __imp__sub_82957260(ctx, base);
+    // FM2_DUMP_LAST_CHROMA=1: keep the most recent finished 376-wide plane in out/chroma_last.bin.
+    static const bool dumpLast = getenv("FM2_DUMP_LAST_CHROMA") != nullptr;
+    if (dumpLast && width == 376)
+        if (FILE* f = fopen("out/chroma_last.bin", "wb"))
+        {
+            fwrite(GuestPtr(dest), 1, pitch * height, f);
+            fclose(f);
+        }
+    // FM2_DUMP_VIDEO_Y=<width>: append each decoded luma plane of the first
+    // video with that width to out/video_y.raw (width x height, 8 bpp).
+    static const uint32_t dumpWidth = getenv("FM2_DUMP_VIDEO_Y") ? uint32_t(strtoul(getenv("FM2_DUMP_VIDEO_Y"), nullptr, 0)) : 0;
+    static uint32_t dumpVideo = 0;
+    if (dumpWidth && width == dumpWidth)
+    {
+        if (!dumpVideo)
+            dumpVideo = video;
+        if (video == dumpVideo)
+        {
+            static FILE* f = fopen("out/video_y.raw", "wb");
+            if (f)
+                fwrite(GuestPtr(dest), 1, size_t(pitch) * ((height + 31) & ~31u), f); // raw (possibly tiled) plane
+            if (f)
+                fflush(f);
+        }
+    }
+}
+
+PPC_FUNC_IMPL(__imp__sub_827C3BF0);
+PPC_FUNC_IMPL(__imp__sub_827C3CB8);
+
+// The title's malloc/free (FM2_PROBE_HEAP=<min bytes> logs allocations at least that big).
+PPC_FUNC(sub_827C3BF0)
+{
+    static const uint32_t minBytes = getenv("FM2_PROBE_HEAP") ? uint32_t(strtoul(getenv("FM2_PROBE_HEAP"), nullptr, 0)) : 0;
+    const uint32_t size = ctx.r3.u32;
+    const uint64_t lr = ctx.lr;
+    __imp__sub_827C3BF0(ctx, base);
+    if (minBytes && size >= minBytes)
+        Log("probe: malloc(%X) = %08X..%08X (lr %08llX)", size, ctx.r3.u32, ctx.r3.u32 + size, lr);
+}
+
+PPC_FUNC(sub_827C3CB8)
+{
+    static const uint32_t minBytes = getenv("FM2_PROBE_HEAP") ? 1u : 0u;
+    if (minBytes)
+        Log("probe: free(%08X) (lr %08llX)", ctx.r3.u32, ctx.lr);
+    __imp__sub_827C3CB8(ctx, base);
+}
+
+
+// FM2_TRACE_PATCH=1: logs every call to the shader microcode patcher (sub_8272F650) with its
+// inputs and the return address, so each patched shader load can be matched to its inputs.
+PPC_FUNC_IMPL(__imp__sub_8272F650);
+PPC_FUNC(sub_8272F650)
+{
+    static const bool trace = getenv("FM2_TRACE_PATCH") != nullptr;
+    static std::atomic<uint64_t> calls{ 0 };
+    if (trace && calls++ < 400000)
+        Log("patch %llu: lr %08llX r3 %08X r4 %08X r5 %08X r6 %08X r7 %08X r8 %08X r9 %08X r10 %08X r22 %08X r24 %08X r25 %08X r26 %08X r27 %08X r28 %08X r29 %08X r30 %08X r31 %08X",
+            (unsigned long long)calls.load(), (unsigned long long)ctx.lr, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32,
+            ctx.r9.u32, ctx.r10.u32, ctx.r22.u32, ctx.r24.u32, ctx.r25.u32, ctx.r26.u32, ctx.r27.u32, ctx.r28.u32, ctx.r29.u32, ctx.r30.u32, ctx.r31.u32);
+    __imp__sub_8272F650(ctx, base);
 }
