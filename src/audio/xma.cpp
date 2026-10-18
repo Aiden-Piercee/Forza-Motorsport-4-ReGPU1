@@ -1,7 +1,8 @@
-// XMA decoder contexts. The title drives the console's hardware decoder
+// XMA decoder contexts. The title (FMOD) drives the console's hardware decoder
 // through the kernel's XMA* exports, which edit a 64-byte context in guest
-// memory. Until real decoding lands (phase 4) the decoder consumes the
-// queued input packets and writes silence. Like the hardware it runs ahead
+// memory: two input buffers of 2 KB XMA packets, an output ring of 256-byte
+// blocks of 16-bit big-endian PCM, loop points. Each context gets an FFmpeg
+// xma2 decoder fed one packet at a time. Like the hardware it runs ahead
 // whenever there is output space; the consumer sets the pace.
 //
 // XMA_CONTEXT_DATA, big-endian dwords, bit fields counted from bit 0:
@@ -14,22 +15,32 @@
 //   3: loop start 0-25      4: loop end 0-25, current input buffer 31
 //   5: in0 address  6: in1 address  7: output address  8: work buffer
 //   9: output read offset 0-4
+#include <algorithm>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <set>
 #include <thread>
+#include <vector>
 
 #include <windows.h>
 
+extern "C"
+{
+#include <libavcodec/avcodec.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/log.h>
+}
+
 #include "kernel/imports.h"
+#include "log.h"
 
 namespace
 {
 constexpr uint32_t kContextSize = 0x40;
 constexpr uint32_t kPacketBits = 2048 * 8;
 constexpr uint32_t kBlockBytes = 256;
-// Silence written per input packet: about what a 2 KB packet decodes to.
-constexpr uint32_t kBlocksPerPacket = 16;
+constexpr uint32_t kPacketBytes = 2048;
 
 uint32_t Field(uint32_t ctx, int dword, int lo, int bits)
 {
@@ -47,8 +58,107 @@ std::mutex g_mutex;
 std::set<uint32_t> g_enabled;
 std::once_flag g_started;
 
-// One decoder step for a context: consume one input packet, write the
-// matching silence. Returns false when it has nothing to do.
+struct Decoder
+{
+    AVCodecContext* av = nullptr;
+    AVPacket* packet = nullptr;
+    AVFrame* frame = nullptr;
+    uint32_t channels = 0, rate = 0;
+    std::vector<int16_t> pcm; // decoded, interleaved, not yet in the output ring
+    size_t pcmRead = 0;
+    bool flush = true; // start of a stream or a jump: reset before the next packet
+
+    void Close()
+    {
+        avcodec_free_context(&av);
+        av_packet_free(&packet);
+        av_frame_free(&frame);
+    }
+
+    bool Open(uint32_t ch, uint32_t hz)
+    {
+        Close();
+        const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_XMA2);
+        if (!codec || !(av = avcodec_alloc_context3(codec)))
+            return false;
+        av->sample_rate = int(hz);
+        av_channel_layout_default(&av->ch_layout, int(ch));
+        av->block_align = kPacketBytes;
+        // XMA2WAVEFORMATEX (34 bytes): one stream; FFmpeg reads the stream count from it.
+        av->extradata = static_cast<uint8_t*>(av_mallocz(34 + AV_INPUT_BUFFER_PADDING_SIZE));
+        av->extradata_size = 34;
+        av->extradata[0] = 1;
+        if (avcodec_open2(av, codec, nullptr) < 0)
+        {
+            avcodec_free_context(&av);
+            return false;
+        }
+        packet = av_packet_alloc();
+        frame = av_frame_alloc();
+        channels = ch;
+        rate = hz;
+        return true;
+    }
+
+    // Decodes one 2 KB packet and appends its samples.
+    void Decode(const uint8_t* data)
+    {
+        if (flush)
+        {
+            avcodec_flush_buffers(av);
+            flush = false;
+        }
+        if (av_new_packet(packet, kPacketBytes) < 0)
+            return;
+        memcpy(packet->data, data, kPacketBytes);
+        const int sent = avcodec_send_packet(av, packet);
+        av_packet_unref(packet);
+        if (sent < 0)
+        {
+            flush = true;
+            return;
+        }
+        while (avcodec_receive_frame(av, frame) == 0)
+        {
+            const int n = frame->nb_samples, ch = std::min<int>(frame->ch_layout.nb_channels, int(channels));
+            const size_t base = pcm.size();
+            pcm.resize(base + size_t(n) * channels);
+            for (int c = 0; c < int(channels); c++)
+            {
+                const float* in = reinterpret_cast<const float*>(frame->extended_data[std::min(c, ch - 1)]);
+                for (int i = 0; i < n; i++)
+                    pcm[base + size_t(i) * channels + c] = int16_t(std::clamp(in[i], -1.0f, 1.0f) * 32767.0f);
+            }
+            av_frame_unref(frame);
+        }
+    }
+};
+
+std::map<uint32_t, Decoder> g_decoders;
+
+// The output ring has a free block: fill it from decoded samples. Returns false when it
+// has nothing decoded to give.
+bool WriteBlock(uint32_t ctx, Decoder& d)
+{
+    const size_t perBlock = kBlockBytes / 2;
+    if (d.pcm.size() - d.pcmRead < perBlock)
+        return false;
+    const uint32_t blocks = Field(ctx, 0, 22, 5), write = Field(ctx, 0, 27, 5);
+    uint16_t* out = GuestPtr<uint16_t>(LoadBE32(ctx + 7 * 4) + write * kBlockBytes);
+    for (size_t i = 0; i < perBlock; i++)
+        out[i] = __builtin_bswap16(uint16_t(d.pcm[d.pcmRead + i]));
+    d.pcmRead += perBlock;
+    if (d.pcmRead > (1u << 16))
+    {
+        d.pcm.erase(d.pcm.begin(), d.pcm.begin() + ptrdiff_t(d.pcmRead));
+        d.pcmRead = 0;
+    }
+    SetField(ctx, 0, 27, 5, (write + 1) % blocks);
+    return true;
+}
+
+// One decoder step for a context: fill one output block, decoding the next input packet
+// when needed. Returns false when it has nothing to do.
 bool Step(uint32_t ctx)
 {
     if (!Field(ctx, 1, 31, 1)) // output buffer not valid
@@ -58,9 +168,17 @@ bool Step(uint32_t ctx)
         return false;
     const uint32_t write = Field(ctx, 0, 27, 5), read = Field(ctx, 9, 0, 5);
     // Keep one block free so a full ring never reads as empty.
-    const uint32_t space = (read + blocks - write - 1) % blocks;
-    if (space < std::min(kBlocksPerPacket, blocks - 1))
+    if ((read + blocks - write - 1) % blocks == 0)
         return false;
+
+    static const uint32_t kRates[4] = { 24000, 32000, 44100, 48000 };
+    const uint32_t channels = Field(ctx, 1, 29, 1) ? 2 : 1, rate = kRates[Field(ctx, 1, 27, 2)];
+    Decoder& d = g_decoders[ctx];
+    if (!d.av || d.channels != channels || d.rate != rate)
+        if (!d.Open(channels, rate))
+            return false;
+    if (WriteBlock(ctx, d))
+        return true;
 
     uint32_t current = Field(ctx, 4, 31, 1);
     if (!Field(ctx, 0, 20 + current, 1))
@@ -72,15 +190,24 @@ bool Step(uint32_t ctx)
         SetField(ctx, 2, 0, 26, 32);
     }
     const uint32_t packets = current ? Field(ctx, 1, 0, 12) : Field(ctx, 0, 0, 12);
+    const uint32_t buffer = LoadBE32(ctx + (5 + current) * 4);
+    const uint32_t packet = Field(ctx, 2, 0, 26) / kPacketBits;
+    if (packet < packets)
+        d.Decode(GuestPtr<uint8_t>(buffer + packet * kPacketBytes));
 
-    const uint32_t output = LoadBE32(ctx + 7 * 4);
-    const uint32_t n = std::min(kBlocksPerPacket, blocks - 1);
-    for (uint32_t i = 0; i < n; i++)
-        memset(GuestPtr((output + ((write + i) % blocks) * kBlockBytes)), 0, kBlockBytes);
-    SetField(ctx, 0, 27, 5, (write + n) % blocks);
-
-    const uint32_t offset = Field(ctx, 2, 0, 26) / kPacketBits * kPacketBits + kPacketBits + 32;
-    if (offset >= packets * kPacketBits)
+    // Loop: when the packet holding the loop end is done and loops remain, continue from
+    // the loop start (packet-accurate).
+    const uint32_t loops = Field(ctx, 0, 12, 8), loopEnd = Field(ctx, 4, 0, 26);
+    if (loops && loopEnd / kPacketBits == packet)
+    {
+        if (loops != 255)
+            SetField(ctx, 0, 12, 8, loops - 1);
+        SetField(ctx, 2, 0, 26, Field(ctx, 3, 0, 26));
+        d.flush = true;
+        return true;
+    }
+    const uint32_t offset = (packet + 1) * kPacketBits + 32;
+    if (packet + 1 >= packets)
     {
         SetField(ctx, 0, 20 + current, 1, 0); // buffer consumed
         SetField(ctx, 4, 31, 1, current ^ 1);
@@ -111,7 +238,10 @@ GUEST_EXPORT(XMACreateContext)
 {
     const uint32_t context = GuestAlloc(Heap::Physical, kContextSize, 0x100);
     StoreIfNonNull(ctx.r3.u32, context);
-    std::call_once(g_started, [] { std::thread(DecoderLoop).detach(); });
+    std::call_once(g_started, [] {
+        av_log_set_level(AV_LOG_ERROR);
+        std::thread(DecoderLoop).detach();
+    });
     Return(ctx, context ? X_STATUS_SUCCESS : X_STATUS_NO_MEMORY);
 }
 
@@ -120,6 +250,11 @@ GUEST_EXPORT(XMAReleaseContext)
     {
         std::lock_guard lock(g_mutex);
         g_enabled.erase(ctx.r3.u32);
+        if (auto it = g_decoders.find(ctx.r3.u32); it != g_decoders.end())
+        {
+            it->second.Close();
+            g_decoders.erase(it);
+        }
     }
     GuestFree(ctx.r3.u32);
     Return(ctx, 0);
@@ -148,6 +283,12 @@ GUEST_EXPORT(XMAInitializeContext)
     SetField(c, 3, 0, 26, in(0x2C));
     SetField(c, 4, 0, 26, in(0x30));
     SetField(c, 0, 12, 8, *GuestPtr<uint8_t>(init + 0x34));
+    if (auto it = g_decoders.find(c); it != g_decoders.end())
+    {
+        it->second.flush = true;
+        it->second.pcm.clear();
+        it->second.pcmRead = 0;
+    }
     Return(ctx, 0);
 }
 
@@ -180,7 +321,21 @@ GUEST_EXPORT(XMADisableContext)
         Return(ctx, 0);                                              \
     }
 
-XMA_FIELD_EXPORTS(InputBufferReadOffset, 2, 0, 26)
+GUEST_EXPORT(XMAGetInputBufferReadOffset)
+{
+    std::lock_guard lock(g_mutex);
+    Return(ctx, Field(ctx.r3.u32, 2, 0, 26));
+}
+
+GUEST_EXPORT(XMASetInputBufferReadOffset)
+{
+    // A seek: the decoder starts over at the new packet.
+    std::lock_guard lock(g_mutex);
+    SetField(ctx.r3.u32, 2, 0, 26, ctx.r4.u32);
+    if (auto it = g_decoders.find(ctx.r3.u32); it != g_decoders.end())
+        it->second.flush = true;
+    Return(ctx, 0);
+}
 XMA_FIELD_EXPORTS(OutputBufferReadOffset, 9, 0, 5)
 
 GUEST_EXPORT(XMAGetOutputBufferWriteOffset)

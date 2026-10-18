@@ -61,13 +61,20 @@ The minimum column has not been tested yet.
 ## Status
 
 The game boots, plays its intro, and runs the menus, race setup and races natively at
-60 fps, with car and track rendering, shadows, HDR resolves and the HUD. Audio is
-not implemented yet (XMA is stubbed), and higher frame rates and ultrawide are
-planned (see the scope document).
+60 fps, with car and track rendering, shadows, HDR resolves and the HUD, and full 5.1
+audio: the game's sound engine (FMOD) mixes into our render driver, which plays through
+XAudio2, and its XMA sound data is decoded with FFmpeg's XMA decoder. Higher frame
+rates and ultrawide are planned (see the scope document).
 
 ## Building
 
-Needs Visual Studio 2022 Build Tools, LLVM (clang-cl), CMake, Ninja, Python 3.
+Needs Visual Studio 2022 Build Tools, LLVM (clang-cl), CMake, Ninja, Python 3, and an
+FFmpeg Windows x64 **LGPL shared** build (for XMA audio decoding), for example
+`ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip` from
+[BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases): extract it so that
+`thirdparty/ffmpeg/include`, `lib` and `bin` exist. The build copies the DLLs it needs
+next to `fm2.exe`; FFmpeg is linked dynamically and stays under its own LGPL license
+(`thirdparty/ffmpeg/LICENSE.txt`).
 
 ```
 git submodule update --init --recursive
@@ -98,6 +105,7 @@ code (`out/ppc`, ~131 MB) is generated from your own copy and never committed.
 | `FM2_AUTOSTART=1` | Tap Start + A every 3 s |
 | `FM2_DUMP_SHADERS=1` | Save every distinct shader's microcode to `Documents/fm2/shaders` |
 | `FM2_DUMP_FRAME=<n>` | Write the n-th rendered frame to `frame.png` |
+| `FM2_DUMP_AUDIO=<file.wav>` | Write everything the game plays (6-channel float, 48 kHz) to a WAV file |
 | `FM2_TRACE_DRAWS=<n>` | Log every draw, skip, resolve, PM4 packet and texture upload of frame n |
 | `FM2_DUMP_TEXTURE=<hex address>` | Write that texture, decoded, to `texture.png` |
 | `FM2_DUMP_HLSL=1` | Log each translated shader |
@@ -121,6 +129,6 @@ code (`out/ppc`, ~131 MB) is generated from your own copy and never committed.
 |---|---|
 | `config/` | XenonRecomp config and jump tables for FM2 |
 | `patches/` | Our XenonRecomp changes: FM2's extra VMX/PPC instructions, non-trapping divides, MSR[EE] hook |
-| `src/` | Runtime: guest memory, loader, kernel/XAM imports, threads, GPU and audio stand-ins |
+| `src/` | Runtime: guest memory, loader, kernel/XAM imports, threads, renderer, audio output and XMA decoding |
 | `src/hooks/` | Overrides of recompiled functions (`sub_X`): XAPI fibers on host fibers, D3D instrumentation |
 | `tools/` | Disc extraction, XEX dump/disassembler, analysis scripts |

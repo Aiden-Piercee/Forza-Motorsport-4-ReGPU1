@@ -31,7 +31,18 @@ target_link_libraries(fm2 PRIVATE fm2_ppc XenonUtils synchronization winmm oneco
 target_compile_definitions(fm2 PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 target_compile_options(fm2 PRIVATE -gline-tables-only)
 target_link_options(fm2 PRIVATE /STACK:0x1000000 /DEBUG)
-target_link_libraries(fm2 PRIVATE dbghelp)
+target_link_libraries(fm2 PRIVATE dbghelp xaudio2)
+
+# XMA decoding through FFmpeg's xma2 decoder (LGPL, linked dynamically): a shared build
+# with include/, lib/ and bin/ in thirdparty/ffmpeg (see README).
+set(FM2_FFMPEG "${CMAKE_SOURCE_DIR}/thirdparty/ffmpeg")
+if(NOT EXISTS "${FM2_FFMPEG}/include/libavcodec/avcodec.h")
+    message(FATAL_ERROR "thirdparty/ffmpeg is missing: extract an FFmpeg win64 LGPL shared build there (see README)")
+endif()
+target_include_directories(fm2 PRIVATE "${FM2_FFMPEG}/include")
+target_link_libraries(fm2 PRIVATE "${FM2_FFMPEG}/lib/avcodec.lib" "${FM2_FFMPEG}/lib/avutil.lib")
+file(GLOB FM2_FFMPEG_DLLS "${FM2_FFMPEG}/bin/avcodec-*.dll" "${FM2_FFMPEG}/bin/avutil-*.dll" "${FM2_FFMPEG}/bin/swresample-*.dll")
+add_custom_command(TARGET fm2 POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FM2_FFMPEG_DLLS} $<TARGET_FILE_DIR:fm2>)
 
 # Xenos shader disassembler for captured microcode.
 add_executable(xenos_dis tools/xenos_dis.cpp src/gpu/ucode.cpp src/gpu/hlsl.cpp)

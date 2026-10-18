@@ -1,8 +1,8 @@
 # Testing the current build
 
 Build state: boots, menus, race setup and races render natively. The game
-is fully playable with a controller or the keyboard. Audio is silent (XMA is
-stubbed), and there is no ultrawide support yet.
+is fully playable with a controller or the keyboard, with sound (5.1, downmixed by
+Windows for stereo devices). There is no ultrawide support yet.
 
 ## Run it
 
@@ -44,7 +44,8 @@ The keyboard only works while the game window has focus.
   the console.
 - Face culling is off (only a performance cost).
 - The game runs at 60 fps; higher refresh rates are not supported yet.
-- No audio.
+- Looping sounds restart at the start of the 2 KB packet holding the loop point, not
+  the exact sample: listen for clicks or stutters in engine and ambient loops.
 
 ## What to report
 
