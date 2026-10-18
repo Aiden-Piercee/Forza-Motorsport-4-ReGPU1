@@ -361,13 +361,27 @@ uint64_t Fnv(const void* data, size_t bytes, uint64_t h = 0xCBF29CE484222325ull)
 }
 
 // Sampled hash for large texture sources: every 64th dword plus the ends.
+// (Word-wise: it runs for every small buffer of every draw.)
 uint64_t ContentHash(const uint8_t* data, size_t bytes)
 {
-    uint64_t h = Fnv(&bytes, sizeof(bytes));
+    auto mix = [](uint64_t h, uint64_t v) {
+        h = (h ^ v) * 0xFF51AFD7ED558CCDull;
+        return h ^ (h >> 32);
+    };
+    uint64_t h = mix(0xCBF29CE484222325ull, bytes);
     for (size_t i = 0; i + 4 <= bytes; i += 256)
-        h = Fnv(data + i, 4, h);
+    {
+        uint32_t v;
+        memcpy(&v, data + i, 4);
+        h = mix(h, v);
+    }
     if (bytes >= 64)
-        h = Fnv(data + bytes - 64, 64, h);
+        for (size_t i = bytes - 64; i < bytes; i += 8)
+        {
+            uint64_t v;
+            memcpy(&v, data + i, 8);
+            h = mix(h, v);
+        }
     return h;
 }
 
@@ -2111,11 +2125,14 @@ bool BuildIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize, std:
     const uint32_t prim = initiator & 0x3F, source = (initiator >> 6) & 3, count = initiator >> 16;
     const bool is32 = (initiator >> 11) & 1;
     const uint32_t offset = gpureg::Get(VGT_INDX_OFFSET);
-    std::vector<uint32_t> g(count);
+    // Reused between draws (no allocation per draw).
+    static std::vector<uint32_t> g;
+    static std::vector<uint8_t> cut;
+    g.resize(count);
+    cut.clear();
     // Primitive restart: a raw index equal to the reset value ends the strip/fan.
     const bool restart = (gpureg::Get(PA_SU_SC_MODE_CNTL) >> 21) & 1;
     const uint32_t resetIndex = gpureg::Get(VGT_MULTI_PRIM_IB_RESET_INDX) & (is32 ? 0xFFFFFF : 0xFFFF);
-    std::vector<bool> cut;
     if (source == 0) // DMA
     {
         const uint32_t base = GpuPhysToGuest(dmaBase & ~(is32 ? 3u : 1u));
@@ -2127,7 +2144,7 @@ bool BuildIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize, std:
             if (restart && (raw & (is32 ? 0xFFFFFF : 0xFFFF)) == resetIndex)
             {
                 cut.resize(count);
-                cut[i] = true;
+                cut[i] = 1;
             }
             g[i] = raw + offset;
         }
@@ -2144,37 +2161,54 @@ bool BuildIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize, std:
     switch (prim)
     {
     case 1: // point list: a quad per point, corner in bits 29-30
+    {
+        out.resize(size_t(count) * 6);
+        uint32_t* o = out.data();
         for (uint32_t i = 0; i < count; i++)
             for (uint32_t corner : { 0u, 1u, 2u, 2u, 1u, 3u })
-                out.push_back((corner << 29) | (g[i] & 0x1FFFFFFF));
+                *o++ = (corner << 29) | (g[i] & 0x1FFFFFFF);
         return true;
+    }
     case 4: // triangle list
         out.assign(g.begin(), g.begin() + (count / 3) * 3);
         return true;
     case 6: // triangle strip(s), split at restart indices
     case 5: // triangle fan(s)
+    {
+        out.resize(count >= 3 ? size_t(count - 2) * 3 : 0); // upper bound
+        uint32_t* o = out.data();
         for (uint32_t start = 0; start < count;)
         {
             uint32_t end = start;
-            while (end < count && !(end < cut.size() && cut[end]))
-                end++;
+            if (cut.empty())
+                end = count;
+            else
+                while (end < count && !cut[end])
+                    end++;
             for (uint32_t i = start; i + 2 < end; i++)
             {
                 const uint32_t k = i - start;
                 if (prim == 5)
-                    out.insert(out.end(), { g[start], g[i + 1], g[i + 2] });
+                    o[0] = g[start], o[1] = g[i + 1], o[2] = g[i + 2];
                 else if (k & 1)
-                    out.insert(out.end(), { g[i + 1], g[i], g[i + 2] });
+                    o[0] = g[i + 1], o[1] = g[i], o[2] = g[i + 2];
                 else
-                    out.insert(out.end(), { g[i], g[i + 1], g[i + 2] });
+                    o[0] = g[i], o[1] = g[i + 1], o[2] = g[i + 2];
+                o += 3;
             }
             start = end + 1;
         }
+        out.resize(size_t(o - out.data()));
         return true;
+    }
     case 13: // quad list
-        for (uint32_t i = 0; i + 3 < count; i += 4)
-            out.insert(out.end(), { g[i], g[i + 1], g[i + 2], g[i], g[i + 2], g[i + 3] });
+    {
+        out.resize(size_t(count / 4) * 6);
+        uint32_t* o = out.data();
+        for (uint32_t i = 0; i + 3 < count; i += 4, o += 6)
+            o[0] = g[i], o[1] = g[i + 1], o[2] = g[i + 2], o[3] = g[i], o[4] = g[i + 2], o[5] = g[i + 3];
         return true;
+    }
     case 8: // rectangle list: first triangle as given, second from the
             // hypotenuse ends and the computed fourth corner
         for (uint32_t i = 0; i + 2 < count; i += 3)
@@ -3125,6 +3159,13 @@ void RendererSaveCaches()
     g_pipelineLibrary.MaybeSave(true);
 }
 
+void RendererSetShader(uint32_t type, const uint32_t* microcodeBE, uint32_t usedDwords, uint64_t hash)
+{
+    std::vector<uint32_t>& code = type == 0 ? g_r.vsCode : g_r.psCode;
+    code.assign(microcodeBE, microcodeBE + usedDwords);
+    (type == 0 ? g_r.vsHash : g_r.psHash) = hash;
+}
+
 void RendererOnShaderLoad(uint32_t type, const uint32_t* microcodeBE, uint32_t dwords)
 {
     std::vector<uint32_t>& code = type == 0 ? g_r.vsCode : g_r.psCode;
@@ -3272,7 +3313,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     const bool directIndex = g_r.physical && !noDirectIndex && (indexSource == 0 || indexSource == 2) &&
         (prim == 4 || prim == 13 || (prim == 6 && !restartOn));
     const uint32_t directVertices = prim == 4 ? indexCount / 3 * 3 : prim == 13 ? indexCount / 4 * 6 : (indexCount >= 3 ? (indexCount - 2) * 3 : 0);
-    std::vector<uint32_t> list;
+    static std::vector<uint32_t> list; // reused between draws
+    list.clear();
     if (directIndex ? directVertices == 0 : (!BuildIndexList(initiator, dmaBase, dmaSize, list) || list.empty()))
     {
         TraceSkip("primitive", initiator);

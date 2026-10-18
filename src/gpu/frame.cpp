@@ -4,13 +4,16 @@
 // real game content, until translated shaders draw the frame itself.
 #include <algorithm>
 #include <condition_variable>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <mutex>
 #include <set>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "gpu/regs.h"
 #include "gpu/ucode.h"
@@ -33,6 +36,33 @@ uint64_t Fnv1a(const uint32_t* data, uint32_t dwords)
 }
 
 std::unordered_set<uint64_t> g_shaders;
+
+// The title uploads its shaders again for nearly every draw. Each distinct upload is
+// parsed and hashed once; repeats are found by a fast word hash and confirmed by
+// comparing the words.
+struct ShaderUpload
+{
+    std::vector<uint32_t> words; // as uploaded (big-endian)
+    uint32_t used = 0;           // ucode::UsedDwords
+    uint64_t hash = 0;           // Fnv1a of the used dwords ^ type
+};
+std::unordered_map<uint64_t, ShaderUpload> g_uploads;
+
+uint64_t FastKey(const uint32_t* p, uint32_t dwords, uint32_t type)
+{
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ (uint64_t(dwords) << 8) ^ type;
+    uint32_t i = 0;
+    for (; i + 2 <= dwords; i += 2)
+    {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0xFF51AFD7ED558CCDull;
+        h ^= h >> 32;
+    }
+    if (i < dwords)
+        h = (h ^ p[i]) * 0xFF51AFD7ED558CCDull;
+    return h ^ (h >> 29);
+}
 const bool g_dumpShaders = getenv("FM2_DUMP_SHADERS") != nullptr;
 
 struct TextureKey
@@ -120,9 +150,20 @@ void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dw
 {
     if (!dwords || dwords > 0x10000)
         return;
-    RendererOnShaderLoad(uint32_t(type), microcodeBE, dwords);
+    const uint64_t key = FastKey(microcodeBE, dwords, uint32_t(type));
+    auto it = g_uploads.find(key);
+    if (it != g_uploads.end() && it->second.words.size() == dwords && memcmp(it->second.words.data(), microcodeBE, dwords * 4) == 0)
+    {
+        RendererSetShader(uint32_t(type), microcodeBE, it->second.used, it->second.hash);
+        return; // seen before: already logged and dumped
+    }
+    const uint32_t raw = dwords;
     dwords = ucode::UsedDwords(microcodeBE, dwords);
     const uint64_t hash = Fnv1a(microcodeBE, dwords) ^ uint64_t(type);
+    RendererSetShader(uint32_t(type), microcodeBE, dwords, hash);
+    if (g_uploads.size() > 8192)
+        g_uploads.clear();
+    g_uploads[key] = ShaderUpload{ std::vector<uint32_t>(microcodeBE, microcodeBE + raw), dwords, hash };
     if (!g_shaders.insert(hash).second)
         return;
     if (g_shaders.size() % 50 == 1)
