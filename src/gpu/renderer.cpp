@@ -1384,6 +1384,7 @@ const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& code
             {
                 cs.info.ok = true;
                 cs.info.usedTextureSlots = base.info.usedTextureSlots;
+                cs.info.constantsUsed = base.info.constantsUsed; // same ALU code
                 cs.info.vertexFetchLayout = std::move(layout.vertexFetchLayout);
                 cs.info.vertexFetchConstants = std::move(layout.vertexFetchConstants);
                 cs.cacheKey = base.cacheKey;
@@ -3639,14 +3640,16 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     {
         // Byte-swapped block copy of both constant banks (1024 dwords each).
         const __m128i swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+        // Only the constants each shader reads (the rest of the block is never read).
         const auto* src = GuestPtr<const __m128i>(gpureg::kBase + gpureg::AluConstants * 4);
         auto* dv = reinterpret_cast<__m128i*>(vc->c);
         auto* dp = reinterpret_cast<__m128i*>(pc->c);
-        for (uint32_t i = 0; i < 256; i++)
-        {
+        static const bool allConstants = getenv("FM2_ALL_CONSTANTS") != nullptr; // A/B
+        const uint32_t nv = allConstants ? 256 : std::min(vs.info.constantsUsed, 256u), np = allConstants ? 256 : std::min(ps.info.constantsUsed, 256u);
+        for (uint32_t i = 0; i < nv; i++)
             _mm_storeu_si128(dv + i, _mm_shuffle_epi8(_mm_loadu_si128(src + i), swap));
+        for (uint32_t i = 0; i < np; i++)
             _mm_storeu_si128(dp + i, _mm_shuffle_epi8(_mm_loadu_si128(src + 256 + i), swap));
-        }
     }
     for (uint32_t i = 0; i < 8; i++)
         vc->b[i] = pc->b[i] = gpureg::Get(gpureg::BoolConstants + i);

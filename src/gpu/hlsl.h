@@ -29,6 +29,9 @@ struct TranslatedShader
     uint32_t usedTextureSlots = 0;  // bit per fetch slot (pixel shaders)
     std::vector<uint32_t> vertexFetchConstants; // vertex shaders
     std::vector<std::array<uint32_t, 4>> vertexFetchLayout; // vfl[k] for each vertex fetch (see hlsl.cpp)
+    // Float constants the code reads: c[0] up to this (exclusive), 256 with relative
+    // addressing. Only these are uploaded per draw.
+    uint32_t constantsUsed = 0;
 };
 
 TranslatedShader TranslateShader(const ucode::Shader& shader);
