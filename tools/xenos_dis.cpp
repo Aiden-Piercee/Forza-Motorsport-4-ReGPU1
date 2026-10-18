@@ -57,9 +57,11 @@ int main(int argc, char** argv)
         {
             // The renderer's fast path for patched copies must give the same fetch layout.
             TranslatedShader layout;
-            if (!pixel && TranslateVertexFetchLayout(shader, layout) &&
-                (layout.vertexFetchLayout != t.vertexFetchLayout || layout.vertexFetchConstants != t.vertexFetchConstants))
+            const bool dynamic = !pixel && TranslateVertexFetchLayout(shader, layout);
+            if (dynamic && (layout.vertexFetchLayout != t.vertexFetchLayout || layout.vertexFetchConstants != t.vertexFetchConstants))
                 printf("LAYOUT MISMATCH %s\n", argv[i]);
+            if (!pixel && !dynamic)
+                printf("BAKED FETCH %s\n", argv[i]); // some fetch kept literal fields in the HLSL
             uint64_t h = 0xCBF29CE484222325ull;
             for (char c : t.hlsl)
                 h = (h ^ uint8_t(c)) * 0x100000001B3ull;

@@ -1,35 +1,69 @@
 # fm2
 
-A native PC port of Forza Motorsport 2 (Xbox 360): the game's PowerPC code is
-statically recompiled to C++ with [XenonRecomp](https://github.com/hedge-dev/XenonRecomp),
-running on our own kernel layer and, from phase 2, a native renderer. No game
-data is included; you need your own disc image. See
-[FM2-native-scope.md](FM2-native-scope.md) for the plan.
+A native Windows port of **Forza Motorsport 2** (Xbox 360). Nothing is emulated:
+
+- **CPU:** the game's entire PowerPC executable is statically recompiled to x64 C++
+  with [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) (51,034 functions), running on our own
+  implementation of the Xbox 360 kernel and XAM. No interpreter, no JIT.
+- **GPU:** a native Direct3D 12 renderer replaces Xenos GPU emulation. The game's
+  Xenos shader microcode is translated to HLSL, its render state to D3D12 pipelines,
+  EDRAM resolves to GPU copies, and its tiled textures are decoded natively.
+
+No game data is included: you need your own copy of the disc. See
+[FM2-native-scope.md](FM2-native-scope.md) for the plan and [TESTING.md](TESTING.md)
+for playing it.
+
+## Shaders compiled before you drive, smooth frame times while you do
+
+Shader compilation stutter is the usual weak point of running Xbox 360 games on PC.
+Emulators and emulator-based ports translate each shader the first time the game uses
+it, so every new car, track and effect hitches the first time it appears, unless you
+first play through the game to fill a cache, or run a long "prepare shaders" step.
+
+This port finds every shader up front instead:
+
+- **On the first start**, it scans the game's files (the mesh archives and the
+  executable) and finds the shader microcode directly, about 4,800 shaders in
+  about 4 seconds. All of them are compiled behind a loading screen built from the game's own art
+  (about 3.5 minutes on 16 threads, once). Later starts load the compiled shaders from
+  the cache instantly.
+- **Copies the game patches at load** (each vertex shader is rewritten for the vertex
+  layout of the mesh it draws) share the bytecode of the original: the vertex layout
+  is passed to the shader per draw instead of being compiled in.
+- **The thread that feeds the GPU never blocks on disk or bookkeeping**: pipeline
+  cache saves, cache file writes and shader lookups all happen off it, and draws never
+  wait on a scan of guest memory.
+
+Measured on the test machine below, through a full race with every GPU pipeline
+built fresh: **no renderer-caused frame-time spikes, 59.9 fps average, 59.1 fps
+minimum**, against hundreds of slow frames before this work. Run with `FM2_PERF=1`
+and every slow frame is logged with what caused it.
+
+For comparison, the existing emulator-based port
+([hl360-Forza2](https://github.com/0herculabs/hl360-Forza2), v0.3.0) runs the Xbox 360 GPU
+through a Xenia-derived emulation layer with a shader warm-up step; its own changelog
+notes menus locked to half rate and 144 Hz running slower than 60 Hz. Details in
+[FM2-native-scope.md](FM2-native-scope.md).
+
+## System requirements
+
+| | Minimum (estimated) | Tested on |
+|---|---|---|
+| OS | Windows 10 64-bit (version 1803 or later) | Windows 11 |
+| CPU | 4 cores / 8 threads, x64 with SSSE3 | AMD Ryzen 7 5800X (8 cores / 16 threads) |
+| GPU | DirectX 12, feature level 12_0 | NVIDIA GeForce RTX 4070 |
+| RAM | 8 GB | 64 GB |
+| Disk | 6 GB (extracted game ~4.7 GB, plus shader and pipeline caches) | |
+
+The first start compiles every shader once; it takes longer with fewer CPU threads.
+The minimum column has not been tested yet.
 
 ## Status
 
-Phase 1 (recompile and boot) is done. The game boots on our kernel layer,
-plays its intro sequence, passes the title screen (Start) and reaches the
-main menu, presenting at a steady 60 Hz with the menu videos and showcase car
-loaded. A window with a D3D12 swap chain presents every frame (a placeholder
-clear for now; `FM2_HEADLESS=1` runs without it).
-
-Renderer progress: the native D3D12 renderer draws the game. Xenos shaders
-are translated to HLSL (all menu/title shaders so far), vertices and indices
-are fetched in the translated vertex shader, textures are decoded and cached
-by content, EDRAM resolves become GPU copies into host textures, and
-predicated tiling is drawn tile by tile in screen space. Point lists become
-screen-aligned sprites. Large vertex buffers are read in place from guest
-memory (the physical section is mapped for the GPU), small ones are copied
-once per frame. Shaders compile on background threads (draws wait a few
-frames instead of stalling the game) and are cached in
-`Documents/fm2/shadercache`. The title screen, attract video, loading
-screen, main menu and the race-setup menus (class select, starting grid with
-the 3D track behind it) render correctly. Races load and draw: the track is
-lit and textured (DXT5A textures, depth-only passes and depth resolves for the
-shadow maps). The EDRAM colour target is half float; resolves are shader
-passes that apply the exponent bias and keep HDR range unless the destination
-is 8888.
+The game boots, plays its intro, and runs the menus, race setup and races natively at
+60 fps, with car and track rendering, shadows, HDR resolves and the HUD. Audio is
+not implemented yet (XMA is stubbed), and higher frame rates and ultrawide are
+planned (see the scope document).
 
 ## Building
 

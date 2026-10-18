@@ -10,8 +10,11 @@ Double-click `play.cmd` (or run `build\rel\fm2.exe` from the repository root).
 The game needs `game\` (the extracted disc) next to it. Logs are written to
 `out\play.log`.
 
-The first boot compiles shaders in the background, so some effects pop in
-for the first minute. Later runs load them from `Documents\fm2\shadercache`.
+The first start finds and compiles every shader in the game (about 3.5 minutes on
+16 threads) behind a loading screen with a progress bar. Let it finish; the game
+has not hung. Later starts load the compiled shaders from `Documents\fm2\shadercache`.
+`play-cold.cmd` moves the caches aside and starts like a first boot with
+`FM2_PERF=1`: slow frames are logged to `out\play.log` with their cause.
 
 ## Controls
 
@@ -40,7 +43,7 @@ The keyboard only works while the game window has focus.
 - Bright surfaces (the asphalt) may be overexposed; not yet compared with
   the console.
 - Face culling is off (only a performance cost).
-- The game presents at about 30 fps; performance work has not started yet.
+- The game runs at 60 fps; higher refresh rates are not supported yet.
 - No audio.
 
 ## What to report

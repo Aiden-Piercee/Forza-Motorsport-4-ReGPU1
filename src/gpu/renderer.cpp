@@ -1165,8 +1165,11 @@ const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& code
             }
         }
     cs.info = TranslateShader(parsed);
+    // Only a translation whose fetches all read vfl can stand in for its patched copies; one
+    // with baked fetch fields would hand them the wrong layout.
     if (canonical && cs.info.ok)
-        g_canonical.emplace(canonical, &cs);
+        if (TranslatedShader check; TranslateVertexFetchLayout(parsed, check))
+            g_canonical.emplace(canonical, &cs);
     if (!cs.info.ok)
     {
         Log("renderer: %s %016llx not translated: %s", pixel ? "ps" : "vs", (unsigned long long)hash, cs.info.error.c_str());
