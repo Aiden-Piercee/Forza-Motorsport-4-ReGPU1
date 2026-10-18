@@ -32,6 +32,10 @@ struct TranslatedShader
 };
 
 TranslatedShader TranslateShader(const ucode::Shader& shader);
+// Only the vertex fetch layout and constants of a vertex shader, without generating HLSL:
+// for copies of an already translated shader that differ only in their fetch fields (see
+// VFetchK). False when a fetch would have to be baked into the code (translate in full).
+bool TranslateVertexFetchLayout(const ucode::Shader& shader, TranslatedShader& out);
 
 // Shared HLSL declarations both stages compile against.
 const char* HlslPreamble();

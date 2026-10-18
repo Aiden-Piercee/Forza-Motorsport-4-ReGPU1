@@ -279,7 +279,19 @@ uint32_t g_skippedPipeline = 0;
 const char* g_waitWhat = "?";
 uint32_t g_waitBlend = 0;
 std::map<std::string, uint64_t> g_created; // FM2_PERF: committed resources created, by kind
-void CountCreate(const char* what) { g_created[what]++; }
+// FM2_PERF: what happened during the current frame, for the slow-frame log.
+struct FrameEvents
+{
+    double waitMs = 0;          // CP thread waiting on shader/pipeline builds
+    uint32_t waits = 0, pipelines = 0, created = 0;
+    double section[8] = {};     // draw path sections (see Section), ms
+    double worstDrawMs = 0;     // the single slowest draw
+} g_frameEvents;
+void CountCreate(const char* what)
+{
+    g_created[what]++;
+    g_frameEvents.created++;
+}
 
 const bool g_dumpHlsl = getenv("FM2_DUMP_HLSL") != nullptr;
 
@@ -813,6 +825,54 @@ struct CompileStats
 // Everything the title has ever bound is recorded (shader microcode as files in
 // shadercache/, pipeline states in pipelines.manifest) so later runs rebuild all of
 // it in the background at boot instead of stalling the first time a race needs it.
+// Cache files written off the command processor thread: opening a file can take
+// milliseconds (more with a virus scanner), which showed as frame spikes whenever a race
+// met a new pipeline.
+struct DiskWriter
+{
+    std::mutex mutex;
+    std::condition_variable cv, idle;
+    std::deque<std::function<void()>> queue;
+    bool busy = false;
+
+    void Push(std::function<void()> job)
+    {
+        static std::once_flag started;
+        std::call_once(started, [this] {
+            std::thread([this] {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                for (;;)
+                {
+                    std::function<void()> next;
+                    {
+                        std::unique_lock lock(mutex);
+                        cv.wait(lock, [this] { return !queue.empty(); });
+                        next = std::move(queue.front());
+                        queue.pop_front();
+                        busy = true;
+                    }
+                    next();
+                    std::lock_guard lock(mutex);
+                    busy = false;
+                    if (queue.empty())
+                        idle.notify_all();
+                }
+            }).detach();
+        });
+        {
+            std::lock_guard lock(mutex);
+            queue.push_back(std::move(job));
+        }
+        cv.notify_one();
+    }
+    // Waits until everything queued is written (at exit).
+    void Flush()
+    {
+        std::unique_lock lock(mutex);
+        idle.wait_for(lock, std::chrono::seconds(5), [this] { return queue.empty() && !busy; });
+    }
+} g_diskWriter;
+
 struct Manifest
 {
     std::mutex mutex;
@@ -852,19 +912,21 @@ struct Manifest
         std::lock_guard lock(mutex);
         if (!known.insert(k).second)
             return;
-        std::ofstream(Path(), std::ios::app) << "P " << std::hex << k.vs << ' ' << k.ps << ' ' << k.blend << ' ' << k.depth << ' ' << k.stencilMaskMode
-                                              << ' ' << k.flags << '\n';
+        g_diskWriter.Push([k] {
+            std::ofstream(Path(), std::ios::app) << "P " << std::hex << k.vs << ' ' << k.ps << ' ' << k.blend << ' ' << k.depth << ' '
+                                                  << k.stencilMaskMode << ' ' << k.flags << '\n';
+        });
     }
     void RecordShader(bool pixel, uint64_t hash, const std::vector<uint32_t>& codeBE)
     {
         std::lock_guard lock(mutex);
         if (codeBE.empty() || !shaderFiles.insert(hash).second)
             return;
-        const auto path = UcodePath(pixel, hash);
-        std::error_code ec;
-        if (std::filesystem::exists(path, ec))
-            return;
-        std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(codeBE.data()), std::streamsize(codeBE.size() * 4));
+        g_diskWriter.Push([path = UcodePath(pixel, hash), code = codeBE] {
+            std::error_code ec;
+            if (!std::filesystem::exists(path, ec))
+                std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(code.data()), std::streamsize(code.size() * 4));
+        });
     }
     static bool LoadShader(bool pixel, uint64_t hash, std::vector<uint32_t>& out)
     {
@@ -1012,6 +1074,36 @@ struct ShaderCompiler
     }
 } g_compiler;
 
+// Shaders by canonical key: the microcode with the vertex fetch fields the title patches at
+// load masked out. A patched copy of a translated shader shares its HLSL and bytecode and
+// only needs its own fetch layout (TranslateVertexFetchLayout), not a full translation
+// (which took up to ~18 ms on the command processor for a large shader).
+std::unordered_map<uint64_t, const CompiledShader*> g_canonical;
+// Bytecode already loaded, by HLSL hash: a shader whose HLSL matches one in memory doesn't
+// read the shader cache from disk again.
+std::unordered_map<uint64_t, ComPtr<ID3DBlob>> g_bytecode;
+
+uint64_t CanonicalKey(const ucode::Shader& parsed)
+{
+    std::vector<uint32_t> w = parsed.words;
+    for (const ucode::Cf& cf : parsed.cf)
+    {
+        if (cf.IsExec())
+            for (uint32_t k = 0; k < cf.count(); k++)
+            {
+                const uint32_t index = cf.address() + k;
+                if (!((cf.sequence() >> (2 * k)) & 1) || (index + 1) * 3 > w.size() || (w[index * 3] & 0x1F) != 0)
+                    continue;
+                w[index * 3] &= ~0x1FF00000u;   // fetch constant
+                w[index * 3 + 1] &= 0x80000000u; // swizzle, format, sign, rounding, exponent, mini
+                w[index * 3 + 2] &= 0x80000000u; // stride, offset
+            }
+        if (cf.IsEnd())
+            break;
+    }
+    return Fnv(w.data(), w.size() * 4, 0x5A17);
+}
+
 // background: queued behind everything a draw needs (the static shader set).
 const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel, bool background = false)
 {
@@ -1032,8 +1124,49 @@ const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& code
     // Not saved yet: the memory scan also finds stale copies in freed blocks (heap links
     // over the first words), so only shaders a pipeline uses go into the cache.
     cs.ucodeBE = codeBE;
+    const auto getStart = std::chrono::steady_clock::now();
+    static const bool perfLog = getenv("FM2_PERF") != nullptr;
+    const char* path = "full";
+    struct LogSlow
+    {
+        std::chrono::steady_clock::time_point start;
+        const CompiledShader& cs;
+        const char*& path;
+        ~LogSlow()
+        {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            if (perfLog && ms > 5.0)
+                Log("perf: GetShader %s %016llx took %.1f ms (%s, %zu dwords)", cs.pixel ? "ps" : "vs", (unsigned long long)cs.hash, ms, path,
+                    cs.ucodeBE.size());
+        }
+    } logSlow{ getStart, cs, path };
     const ucode::Shader parsed = ucode::Parse(codeBE.data(), uint32_t(codeBE.size()), pixel);
+    static const bool noCanonical = getenv("FM2_NO_CANONICAL") != nullptr;
+    const uint64_t canonical = pixel || noCanonical ? 0 : CanonicalKey(parsed);
+    if (canonical)
+        path = g_canonical.count(canonical) ? (g_canonical[canonical]->IsReady() ? "full, layout fallback" : "full, base not ready") : "full, new canonical";
+    if (canonical)
+        if (auto c = g_canonical.find(canonical); c != g_canonical.end() && c->second->IsReady())
+        {
+            const CompiledShader& base = *c->second;
+            TranslatedShader layout;
+            if (TranslateVertexFetchLayout(parsed, layout))
+            {
+                cs.info.ok = true;
+                cs.info.usedTextureSlots = base.info.usedTextureSlots;
+                cs.info.vertexFetchLayout = std::move(layout.vertexFetchLayout);
+                cs.info.vertexFetchConstants = std::move(layout.vertexFetchConstants);
+                cs.cacheKey = base.cacheKey;
+                cs.code = base.code;
+                cs.state = CompiledShader::Ready;
+                g_stats.shadersCached++;
+                path = "variant";
+                return cs;
+            }
+        }
     cs.info = TranslateShader(parsed);
+    if (canonical && cs.info.ok)
+        g_canonical.emplace(canonical, &cs);
     if (!cs.info.ok)
     {
         Log("renderer: %s %016llx not translated: %s", pixel ? "ps" : "vs", (unsigned long long)hash, cs.info.error.c_str());
@@ -1097,6 +1230,13 @@ const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& code
             if (size_t at = cs.info.hlsl.rfind("return oC[0];"); at != std::string::npos)
                 cs.info.hlsl.replace(at, 13, std::string("return ") + (expr + 1) + ";");
     cs.cacheKey = Fnv(cs.info.hlsl.data(), cs.info.hlsl.size(), pixel ? 1 : 2);
+    if (auto b = g_bytecode.find(cs.cacheKey); b != g_bytecode.end())
+    {
+        cs.code = b->second;
+        cs.state = CompiledShader::Ready;
+        g_stats.shadersCached++;
+        return cs;
+    }
     if (std::ifstream in{ ShaderCachePath(cs.cacheKey), std::ios::binary | std::ios::ate })
     {
         const auto size = size_t(in.tellg());
@@ -1105,6 +1245,7 @@ const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& code
             in.seekg(0);
             in.read(static_cast<char*>(cs.code->GetBufferPointer()), std::streamsize(size));
             cs.state = CompiledShader::Ready;
+            g_bytecode.emplace(cs.cacheKey, cs.code);
             g_stats.shadersCached++;
             return cs;
         }
@@ -1219,25 +1360,56 @@ struct PipelineLibrary
         return device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
     }
 
-    // Writes the library out when new pipelines were stored (at most every 10 s).
+    // Writes the library out when new pipelines were stored (at most every 10 s). Never on
+    // the calling thread: serializing and writing the whole library (tens to hundreds of MB)
+    // there stalled the command processor for one frame every 10 s of a race. force (exit)
+    // writes synchronously.
+    std::atomic<bool> saving{ false };
+
     void MaybeSave(bool force = false)
     {
         if (!library || !stored.load())
             return;
-        if (!force && std::chrono::steady_clock::now() - lastSave < std::chrono::seconds(10))
+        if (force)
+        {
+            SaveNow();
             return;
-        std::lock_guard lock(saveMutex);
+        }
+        if (std::chrono::steady_clock::now() - lastSave < std::chrono::seconds(10) || saving.exchange(true))
+            return;
         lastSave = std::chrono::steady_clock::now();
-        stored = 0;
-        std::vector<char> blob(library->GetSerializedSize());
-        if (blob.empty() || FAILED(library->Serialize(blob.data(), blob.size())))
+        std::thread([this] {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+            SaveNow();
+            saving = false;
+        }).detach();
+    }
+
+    void SaveNow()
+    {
+        std::lock_guard lock(saveMutex);
+        const int pending = stored.exchange(0);
+        if (!pending)
             return;
+        const auto start = std::chrono::steady_clock::now();
+        std::vector<char> blob(library->GetSerializedSize());
+        // A pipeline stored between the two calls changes the size; try again next time.
+        if (blob.empty() || FAILED(library->Serialize(blob.data(), blob.size())))
+        {
+            stored += pending;
+            return;
+        }
+        const auto serialized = std::chrono::steady_clock::now();
         const auto tmp = Path().string() + ".tmp";
         { std::ofstream(tmp, std::ios::binary).write(blob.data(), std::streamsize(blob.size())); }
         std::error_code ec;
         std::filesystem::rename(tmp, Path(), ec);
         if (ec)
             std::filesystem::remove(tmp, ec);
+        if (getenv("FM2_PERF"))
+            Log("perf: pipeline library saved in the background (%.0f MB): serialize %.0f ms, write %.0f ms", blob.size() / 1048576.0,
+                std::chrono::duration<double, std::milli>(serialized - start).count(),
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - serialized).count());
     }
 } g_pipelineLibrary;
 
@@ -1372,6 +1544,7 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
         g_stats.End(!hit);
     });
     g_pipelinesCreated++;
+    g_frameEvents.pipelines++;
     return entry;
 }
 
@@ -2292,13 +2465,27 @@ void WaitHoldingImpl(const std::function<bool()>& done)
 {
     if (done())
         return;
+    const auto waitStart = std::chrono::steady_clock::now();
+    struct CountWait
+    {
+        std::chrono::steady_clock::time_point start;
+        ~CountWait()
+        {
+            g_frameEvents.waitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            g_frameEvents.waits++;
+        }
+    } countWait{ waitStart };
     // A stall: look at everything queued behind this draw and build it all at once
     // (in parallel), then wait for the whole set, not just this draw's pipeline.
     static auto lastLook = std::chrono::steady_clock::time_point{};
     const auto start = std::chrono::steady_clock::now();
     bool announced = false;
-    ShaderScanNow(std::max(2u, std::thread::hardware_concurrency() / 2));
-    DrainScan(0);
+    // Not once the game runs: the scan alone takes ~18 ms and the wait is usually shorter.
+    if (!g_compiler.park.load())
+    {
+        ShaderScanNow(std::max(2u, std::thread::hardware_concurrency() / 2));
+        DrainScan(0);
+    }
     for (;;)
     {
         const auto now = std::chrono::steady_clock::now();
@@ -2769,6 +2956,7 @@ bool RendererCompileIdle()
 
 void RendererSaveCaches()
 {
+    g_diskWriter.Flush();
     g_pipelineLibrary.MaybeSave(true);
 }
 
@@ -2810,7 +2998,9 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
     const auto t0 = std::chrono::steady_clock::now();
     DrawImpl(initiator, dmaBase, dmaSize);
-    g_perf.drawSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    g_perf.drawSeconds += seconds;
+    g_frameEvents.worstDrawMs = std::max(g_frameEvents.worstDrawMs, seconds * 1000.0);
     g_perf.draws++;
 }
 
@@ -2820,7 +3010,11 @@ void Section(int i)
 {
     const auto now = std::chrono::steady_clock::now();
     if (i > 0)
-        g_perf.section[i - 1] += std::chrono::duration<double>(now - g_perf.mark).count();
+    {
+        const double seconds = std::chrono::duration<double>(now - g_perf.mark).count();
+        g_perf.section[i - 1] += seconds;
+        g_frameEvents.section[i - 1] += seconds * 1000.0;
+    }
     g_perf.mark = now;
 }
 
@@ -2846,9 +3040,11 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         return;
     }
     {
-        // A draw reached a shader we have not seen: a new race or car has loaded. Scan guest
-        // memory for all of its shader objects now and queue every unseen one for compiling
-        // in parallel, instead of meeting them one stall at a time.
+        // A draw reached a shader we have not seen: a new race or car has loaded. Before the
+        // static shader set existed this scanned guest memory for all of its shader objects
+        // right away; now that set covers the game, and the 512 MB scan (~18 ms on this
+        // thread) only showed as a frame spike, so once the game runs the low-priority
+        // background scan is enough.
         const bool unseen = g_r.shaders.find(g_r.vsHash) == g_r.shaders.end() || g_r.shaders.find(g_r.psHash) == g_r.shaders.end();
         static auto lastScan = std::chrono::steady_clock::time_point{};
         static const bool noScan = getenv("FM2_NO_SHADER_SCAN") != nullptr;
@@ -2858,7 +3054,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 g_scanPrefound++;
             else
                 g_scanMissed++;
-            if (std::chrono::steady_clock::now() - lastScan > std::chrono::milliseconds(300))
+            if (!g_compiler.park.load() && std::chrono::steady_clock::now() - lastScan > std::chrono::milliseconds(300))
             {
                 const auto t0 = std::chrono::steady_clock::now();
                 ShaderScanNow(std::max(2u, std::thread::hardware_concurrency() / 2));
@@ -3296,9 +3492,17 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
         g_perf.maxFrame = std::max(g_perf.maxFrame, dt);
         if (dt > 20.0)
             g_perf.slowFrames++;
-        if (perf && dt > 30.0 && dt < 400.0)
-            Log("perf: slow frame %llu: %.1f ms (draw work this window %.1f ms over %llu frames)", (unsigned long long)frameNumber, dt,
-                g_perf.drawSeconds * 1000.0, (unsigned long long)g_perf.frames);
+        const double drawNow = g_perf.drawSeconds * 1000.0;
+        static double drawBefore = 0;
+        const double frameDrawMs = drawNow >= drawBefore ? drawNow - drawBefore : drawNow;
+        drawBefore = drawNow;
+        if (perf && dt > 25.0)
+            Log("perf: slow frame %llu: %.1f ms | draw %.1f ms (worst draw %.1f; shaders %.1f indices %.1f pipeline %.1f constants %.1f "
+                "textures %.1f submit %.1f), waited %.1f ms on %u builds, %u pipelines started, %u resources created",
+                (unsigned long long)frameNumber, dt, frameDrawMs, g_frameEvents.worstDrawMs, g_frameEvents.section[0], g_frameEvents.section[1],
+                g_frameEvents.section[2], g_frameEvents.section[3], g_frameEvents.section[4], g_frameEvents.section[5], g_frameEvents.waitMs,
+                g_frameEvents.waits, g_frameEvents.pipelines, g_frameEvents.created);
+        g_frameEvents = {};
     }
     const double window = std::chrono::duration<double>(now - g_perf.windowStart).count();
     if (window >= 1.0)

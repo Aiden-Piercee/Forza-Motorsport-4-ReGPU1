@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include "gpu/hlsl.h"
 
@@ -257,6 +258,8 @@ struct Emitter
     std::string out;
     std::string error;
     TranslatedShader& result;
+    bool layoutOnly = false;   // only collect the vertex fetch layout (no HLSL)
+    bool literalFetch = false; // a fetch had to be baked into the code
     uint32_t lastStride = 0;
     uint32_t lastSrc = 0, lastSrcSwizzle = 0; // mini fetches reuse the full fetch's index
     bool lastRound = false;
@@ -518,7 +521,20 @@ struct Emitter
                     f.expAdjust, lastStride, f.offset, f.isMini, lastRound);
             const uint32_t k = uint32_t(result.vertexFetchLayout.size());
             static const bool bakedFetch = getenv("FM2_BAKED_VFETCH") != nullptr;
-            if (!bakedFetch && k < 32 && f.src == lastSrc && f.srcSwizzle == lastSrcSwizzle)
+            const bool dynamic = !bakedFetch && k < 32 && f.src == lastSrc && f.srcSwizzle == lastSrcSwizzle;
+            literalFetch = literalFetch || !dynamic;
+            if (layoutOnly)
+            {
+                if (dynamic)
+                    result.vertexFetchLayout.push_back({ f.constIndex | (f.format << 8) | (f.isSigned ? 0x4000u : 0) | (f.isNormalized ? 0x8000u : 0) |
+                            (lastRound ? 0x10000u : 0),
+                        lastStride, f.offset, f.destSwizzle | ((uint32_t(f.expAdjust) & 0x3F) << 16) });
+                if (std::find(result.vertexFetchConstants.begin(), result.vertexFetchConstants.end(), f.constIndex) ==
+                    result.vertexFetchConstants.end())
+                    result.vertexFetchConstants.push_back(f.constIndex);
+                return;
+            }
+            if (dynamic)
             {
                 // Layout from vfl[k]; only the registers stay in the code.
                 result.vertexFetchLayout.push_back({ f.constIndex | (f.format << 8) | (f.isSigned ? 0x4000u : 0) | (f.isNormalized ? 0x8000u : 0) |
@@ -584,6 +600,13 @@ struct Emitter
                 return;
             }
             const uint32_t* w = &shader.words[index * 3];
+            if (layoutOnly)
+            {
+                if ((cf.sequence() >> (2 * k)) & 1)
+                    if (const Fetch f = DecodeFetch(w); f.opcode == 0)
+                        EmitFetch(f);
+                continue;
+            }
             if ((cf.sequence() >> (2 * k)) & 1)
                 EmitFetch(DecodeFetch(w));
             else
@@ -692,6 +715,28 @@ struct Emitter
 const char* HlslPreamble()
 {
     return kPreamble;
+}
+
+bool TranslateVertexFetchLayout(const Shader& shader, TranslatedShader& out)
+{
+    TranslatedShader result;
+    if (!shader.valid || shader.pixel)
+        return false;
+    Emitter e{ shader, shader.pixel, {}, {}, result };
+    e.layoutOnly = true;
+    // The same walk as EmitProgram: control flow in order, each exec once, up to the end.
+    for (const Cf& cf : shader.cf)
+    {
+        if (cf.IsExec())
+            e.EmitExec(cf);
+        if (!e.error.empty() || e.literalFetch)
+            return false;
+        if (cf.IsEnd())
+            break;
+    }
+    out.vertexFetchLayout = std::move(result.vertexFetchLayout);
+    out.vertexFetchConstants = std::move(result.vertexFetchConstants);
+    return true;
 }
 
 TranslatedShader TranslateShader(const Shader& shader)
