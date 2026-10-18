@@ -2230,7 +2230,7 @@ uint32_t g_scanPrefound = 0, g_scanMissed = 0;
 
 // Hands shaders the scanner found to the compile queue (translation runs here, on the
 // command processor thread, so the budget keeps it from eating a frame).
-void DrainScan(double budgetMs)
+void DrainScan(double budgetMs, std::vector<const CompiledShader*>* queued = nullptr)
 {
     const auto start = std::chrono::steady_clock::now();
     std::vector<ScannedShader> found;
@@ -2245,7 +2245,9 @@ void DrainScan(double budgetMs)
             g_scanKnown.insert(hash);
             // Speculative (and partly stale memory): compiled when nothing urgent waits,
             // promoted if a draw turns out to need it.
-            GetShader(hash, s.code, s.pixel, true);
+            const CompiledShader& cs = GetShader(hash, s.code, s.pixel, true);
+            if (queued && cs.state.load() == CompiledShader::Pending)
+                queued->push_back(&cs);
         }
         if (budgetMs > 0 && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > budgetMs)
             return;
@@ -3382,7 +3384,7 @@ void PrecompileAll()
     g_stats.staticTotal = uint32_t(toCompile);
     g_stats.staticDone = 0;
     const auto compileStart = std::chrono::steady_clock::now();
-    auto lastShown = std::chrono::steady_clock::time_point{};
+    auto lastShown = std::chrono::steady_clock::time_point{}, lastScan = std::chrono::steady_clock::now();
     for (size_t next = 0;;)
     {
         while (next < compiling.size() && compiling[next]->state.load() != CompiledShader::Pending)
@@ -3390,6 +3392,16 @@ void PrecompileAll()
         if (next == compiling.size())
             break;
         const auto now = std::chrono::steady_clock::now();
+        // The game keeps running meanwhile and builds the shaders it makes at runtime (the
+        // title's among them): compile those in the same wait.
+        if (now - lastScan > std::chrono::milliseconds(1500))
+        {
+            lastScan = now;
+            ShaderScanNow(2);
+            const size_t before = compiling.size();
+            DrainScan(0, &compiling);
+            g_stats.staticTotal += uint32_t(compiling.size() - before);
+        }
         if (now - lastShown > std::chrono::milliseconds(100))
         {
             lastShown = now;
@@ -3403,7 +3415,7 @@ void PrecompileAll()
     g_hold.active = false;
     g_stats.staticTotal = 0;
     g_lastLongHold = std::chrono::steady_clock::now();
-    Log("static shaders: %d compiled in %.1f s", toCompile, std::chrono::duration<double>(std::chrono::steady_clock::now() - compileStart).count());
+    Log("static shaders: %zu compiled in %.1f s (%zu found in memory meanwhile)", compiling.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - compileStart).count(), compiling.size() - size_t(toCompile));
 }
 
 void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
