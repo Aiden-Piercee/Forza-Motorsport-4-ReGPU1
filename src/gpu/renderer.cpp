@@ -24,6 +24,7 @@
 #include <cmath>
 #include <map>
 #include <set>
+#include <shared_mutex>
 #include <unordered_set>
 #include <unordered_map>
 
@@ -48,6 +49,8 @@
 
 using Microsoft::WRL::ComPtr;
 
+
+void LogAllHostThreadStacks(const char* why); // hang.cpp
 namespace
 {
 constexpr UINT kWidth = 1280, kHeight = 720;
@@ -1312,6 +1315,10 @@ struct PipelineLibrary
     ComPtr<ID3D12PipelineLibrary> library;
     std::atomic<int> stored{ 0 };
     std::mutex saveMutex;
+    // Stores and loads share the library; serializing takes it alone. Serialize running
+    // during a StorePipeline is not something the runtime promises to handle, and a cold
+    // load with many pipelines building at once locked up (Mugello).
+    std::shared_mutex access;
     std::chrono::steady_clock::time_point lastSave = std::chrono::steady_clock::now();
     std::vector<char> loaded;
 
@@ -1350,14 +1357,22 @@ struct PipelineLibrary
         if (library)
         {
             const std::wstring name = Name(key);
-            if (SUCCEEDED(library->LoadGraphicsPipeline(name.c_str(), &pd, IID_PPV_ARGS(&pso))))
             {
-                *hit = true;
-                return S_OK;
+                std::shared_lock lock(access);
+                if (SUCCEEDED(library->LoadGraphicsPipeline(name.c_str(), &pd, IID_PPV_ARGS(&pso))))
+                {
+                    *hit = true;
+                    return S_OK;
+                }
             }
+            // The slow part (the driver compiling) runs outside the lock.
             const HRESULT hr = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
-            if (SUCCEEDED(hr) && SUCCEEDED(library->StorePipeline(name.c_str(), pso.Get())))
-                stored++;
+            if (SUCCEEDED(hr))
+            {
+                std::shared_lock lock(access);
+                if (SUCCEEDED(library->StorePipeline(name.c_str(), pso.Get())))
+                    stored++;
+            }
             return hr;
         }
         return device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
@@ -1382,7 +1397,9 @@ struct PipelineLibrary
             return;
         lastSave = std::chrono::steady_clock::now();
         std::thread([this] {
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+            // Not lower: it holds the library alone while serializing, and starving it then
+            // would stall every pipeline build.
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             SaveNow();
             saving = false;
         }).detach();
@@ -1395,12 +1412,15 @@ struct PipelineLibrary
         if (!pending)
             return;
         const auto start = std::chrono::steady_clock::now();
-        std::vector<char> blob(library->GetSerializedSize());
-        // A pipeline stored between the two calls changes the size; try again next time.
-        if (blob.empty() || FAILED(library->Serialize(blob.data(), blob.size())))
+        std::vector<char> blob;
         {
-            stored += pending;
-            return;
+            std::unique_lock lock(access);
+            blob.resize(library->GetSerializedSize());
+            if (blob.empty() || FAILED(library->Serialize(blob.data(), blob.size())))
+            {
+                stored += pending;
+                return;
+            }
         }
         const auto serialized = std::chrono::steady_clock::now();
         const auto tmp = Path().string() + ".tmp";
@@ -2502,6 +2522,25 @@ void WaitHoldingImpl(const std::function<bool()>& done)
             break;
         if (now - start > std::chrono::seconds(180))
             break;
+        // Nothing legitimate takes this long: say what is still pending and where every
+        // thread is, once per wait.
+        static std::chrono::steady_clock::time_point reported{};
+        if (now - start > std::chrono::seconds(20) && reported != start)
+        {
+            reported = start;
+            int queued = 0, background = 0, parked = 0;
+            {
+                std::lock_guard lock(g_compiler.mutex);
+                queued = int(g_compiler.queue.size());
+                background = int(g_compiler.background.size());
+                parked = int(g_compiler.parked.size());
+            }
+            Log("hang: waiting %.0f s on %s: done %d, lookahead pending %d (%zu items), compile jobs %d (queued %d, background %d, parked %d), "
+                "pipeline builds in flight %d",
+                std::chrono::duration<double>(now - start).count(), g_waitWhat, int(done()), int(lookPending), g_look.size(),
+                g_compiler.jobs.load(), queued, background, parked, g_stats.busy.load());
+            LogAllHostThreadStacks("renderer wait over 20 s");
+        }
         if (now - start > std::chrono::milliseconds(150))
         {
             g_hold.active = true;
