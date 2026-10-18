@@ -2,6 +2,7 @@
 // VdSwap hands a frame over; a render thread presents it without blocking
 // the guest. Until the D3D hooks draw real content the frame is a clear
 // whose shade pulses with the frame count, proving the path end to end.
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -48,6 +49,26 @@ struct Presenter
 };
 
 Presenter g_p;
+}
+
+// Output size: FM2_RESOLUTION=<width>x<height> (any aspect, e.g. 3440x1440), else
+// FM2_RENDER_SCALE=<1-4> times the game's 1280x720.
+void RenderSize(uint32_t& width, uint32_t& height)
+{
+    static const std::pair<uint32_t, uint32_t> size = [] {
+        uint32_t w = 0, h = 0;
+        if (const char* r = getenv("FM2_RESOLUTION"); r && sscanf(r, "%ux%u", &w, &h) == 2 && w >= 640 && h >= 360 && w <= 15360 && h <= 8640)
+            return std::pair{ w, h };
+        const char* v = getenv("FM2_RENDER_SCALE");
+        const uint32_t k = v ? std::clamp<uint32_t>(uint32_t(atoi(v)), 1, 4) : 1u;
+        return std::pair{ 1280 * k, 720 * k };
+    }();
+    width = size.first;
+    height = size.second;
+}
+
+namespace
+{
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -95,7 +116,21 @@ void CreateWindowAndDevice()
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.lpszClassName = L"fm2";
     RegisterClassW(&wc);
-    RECT r{ 0, 0, LONG(kWidth), LONG(kHeight) };
+    // The client area starts at the output size, shrunk (aspect kept) to fit the screen;
+    // the swap chain is stretched to whatever the window becomes.
+    RECT work{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    uint32_t outW, outH;
+    RenderSize(outW, outH);
+    LONG cw = LONG(outW), ch = LONG(outH);
+    const LONG maxW = (work.right - work.left) * 9 / 10, maxH = (work.bottom - work.top) * 9 / 10;
+    if (cw > maxW || ch > maxH)
+    {
+        const double f = std::min(double(maxW) / cw, double(maxH) / ch);
+        cw = LONG(cw * f);
+        ch = LONG(ch * f);
+    }
+    RECT r{ 0, 0, cw, ch };
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     g_p.window = CreateWindowW(L"fm2", L"Forza Motorsport 2", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
         r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
@@ -107,8 +142,9 @@ void CreateWindowAndDevice()
     g_p.queue = g_queue;
 
     DXGI_SWAP_CHAIN_DESC1 sd{};
-    sd.Width = kWidth;
-    sd.Height = kHeight;
+    sd.Width = outW;
+    sd.Height = outH;
+    sd.Scaling = DXGI_SCALING_STRETCH;
     sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;

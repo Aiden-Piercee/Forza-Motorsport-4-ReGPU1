@@ -54,6 +54,34 @@ void LogAllHostThreadStacks(const char* why); // hang.cpp
 namespace
 {
 constexpr UINT kWidth = 1280, kHeight = 720;
+// Output size (RenderSize: FM2_RESOLUTION or FM2_RENDER_SCALE). Everything else
+// (registers, scissors, resolve and clear rectangles, shader constants) stays in the game's
+// own pixels; only the D3D calls scale. Vertically that is output height / 720. A pass at
+// the game's full 1280-pixel width (surface pitch 1280: the main view and its full-screen
+// post-processing) scales horizontally to the full output width, wider than 16:9 on an
+// ultrawide; every other pass (reflection faces, shadow maps, reduced-size post passes)
+// scales uniformly, so square targets stay square. Draws, clears and resolves of a pass
+// all read the same pitch, so they agree.
+uint32_t OutputWidth()
+{
+    static const uint32_t w = [] { uint32_t w, h; RenderSize(w, h); return w; }();
+    return w;
+}
+uint32_t OutputHeight()
+{
+    static const uint32_t h = [] { uint32_t w, h; RenderSize(w, h); return h; }();
+    return h;
+}
+float ScaleY() { return float(OutputHeight()) / float(kHeight); }
+float ScaleWide() { return float(OutputWidth()) / float(kWidth); }
+bool WidePass() { return (gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF) == kWidth; }
+float ScaleX() { return WidePass() ? ScaleWide() : ScaleY(); }
+LONG HostX(LONG v) { return LONG(std::lround(double(v) * ScaleX())); }
+LONG HostY(LONG v) { return LONG(std::lround(double(v) * ScaleY())); }
+D3D12_RECT ToHost(const D3D12_RECT& r)
+{
+    return { HostX(r.left), HostY(r.top), HostX(r.right), HostY(r.bottom) };
+}
 constexpr UINT kFrames = 3;
 constexpr UINT64 kRingSize = 64ull << 20;
 constexpr UINT kDescriptorsPerFrame = 8192; // per frame: ring + guest memory views, then resolve-blit views
@@ -123,7 +151,9 @@ struct CachedTexture
 struct ResolvedTexture
 {
     ComPtr<ID3D12Resource> resource;
-    uint32_t width = 0, height = 0;
+    uint32_t width = 0, height = 0;          // game pixels
+    uint32_t hostWidth = 0, hostHeight = 0;  // the texture (see ScaleX/ScaleY)
+    uint64_t frame = ~0ull;                  // renderer frame of the last resolve into it
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM; // R32_FLOAT for depth resolves
     bool swapped = false; // resolved with the copy swap bit: guest memory has red and blue exchanged
     // The title resolves differently sized images (bloom chain) to one address within a
@@ -155,6 +185,7 @@ struct FrameResources
     UINT descriptorsUsed = 0;
     UINT64 fence = 0;
     std::vector<ComPtr<ID3D12Resource>> garbage; // released once this frame's work completes
+    bool timed = false; // FM2_PERF: GPU timestamps were written for this frame
 };
 
 struct PipelineKey
@@ -280,6 +311,14 @@ double g_pipelineMs = 0; // FM2_PERF: time spent creating pipeline states this s
 uint32_t g_pipelinesCreated = 0;
 uint32_t g_skippedPipeline = 0;
 const char* g_waitWhat = "?";
+// The current draw samples the full-screen image the title resolved this frame (the
+// post-processing composite): its flat geometry is a screen layer, not HUD (see vwide.w).
+bool g_drawSamplesResolve = false;
+// FM2_PERF: GPU time per frame from timestamps at the start and end of each frame's list.
+ComPtr<ID3D12QueryHeap> g_timestamps;
+ComPtr<ID3D12Resource> g_timestampReadback;
+double g_gpuFrameMs = 0, g_gpuFrameMaxMs = 0;
+uint32_t g_gpuFrames = 0;
 uint32_t g_waitBlend = 0;
 std::map<std::string, uint64_t> g_created; // FM2_PERF: committed resources created, by kind
 // FM2_PERF: what happened during the current frame, for the slow-frame log.
@@ -545,7 +584,7 @@ void Init()
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     Check(d->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_r.blitRtvHeap)), "CreateDescriptorHeap(blit rtv)");
     InitDepthBlit();
-    g_r.readback = CreateBuffer(UINT64(kWidth) * kHeight * 4, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    g_r.readback = CreateBuffer(UINT64((OutputWidth() * 4 + 255) & ~255u) * OutputHeight(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
 
     for (UINT i = 0; i < kFrames; i++)
     {
@@ -584,8 +623,8 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC td{};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    td.Width = kWidth;
-    td.Height = kHeight;
+    td.Width = OutputWidth();
+    td.Height = OutputHeight();
     td.DepthOrArraySize = 1;
     td.MipLevels = 1;
     td.SampleDesc.Count = 1;
@@ -717,8 +756,41 @@ void BeginFrameIfNeeded()
         g_gpuWaitSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
     }
     f.garbage.clear();
+    static const bool perf = getenv("FM2_PERF") != nullptr;
+    const UINT frameIndex = UINT(&f - g_r.frames);
+    if (perf && !g_timestamps)
+    {
+        D3D12_QUERY_HEAP_DESC qd{};
+        qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qd.Count = 2 * kFrames;
+        g_r.device->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_timestamps));
+        g_timestampReadback = CreateBuffer(8 * 2 * kFrames, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+    if (perf && f.timed && g_timestampReadback)
+    {
+        // This slot's previous frame has completed (waited for above).
+        uint64_t* t = nullptr;
+        const D3D12_RANGE range{ size_t(frameIndex) * 16, size_t(frameIndex) * 16 + 16 };
+        if (SUCCEEDED(g_timestampReadback->Map(0, &range, reinterpret_cast<void**>(&t))))
+        {
+            UINT64 frequency = 1;
+            g_r.queue->GetTimestampFrequency(&frequency);
+            const double ms = double(t[frameIndex * 2 + 1] - t[frameIndex * 2]) * 1000.0 / double(frequency);
+            const D3D12_RANGE none{ 0, 0 };
+            g_timestampReadback->Unmap(0, &none);
+            if (ms > 0 && ms < 1000)
+            {
+                g_gpuFrameMs += ms;
+                g_gpuFrameMaxMs = std::max(g_gpuFrameMaxMs, ms);
+                g_gpuFrames++;
+            }
+        }
+        f.timed = false;
+    }
     f.allocator->Reset();
     g_r.list->Reset(f.allocator.Get(), nullptr);
+    if (perf && g_timestamps)
+        g_r.list->EndQuery(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 2);
     f.ringUsed = 0;
     f.uploads.clear();
     // Per-frame table: t0 this frame's ring, t1 guest physical memory.
@@ -1682,14 +1754,16 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
             want = faces[i]->format;
             break;
         }
-    if (!cached.resource || cached.width != w || cached.height != h || cached.format != want)
+    // Faces the title rendered are at the render scale; the cube matches them.
+    const uint32_t cw = resolved ? uint32_t(std::lround(w * ScaleY())) : w, ch = resolved ? uint32_t(std::lround(h * ScaleY())) : h;
+    if (!cached.resource || cached.width != cw || cached.height != ch || cached.format != want)
     {
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC td{};
         td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        td.Width = w;
-        td.Height = h;
+        td.Width = cw;
+        td.Height = ch;
         td.DepthOrArraySize = 6;
         td.MipLevels = 1;
         td.SampleDesc.Count = 1;
@@ -1700,8 +1774,8 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
                   IID_PPV_ARGS(&cached.resource)),
             "CreateCommittedResource(cube)"); CountCreate("cube");
-        cached.width = w;
-        cached.height = h;
+        cached.width = cw;
+        cached.height = ch;
         cached.format = want;
         cached.contentHash = 0;
     }
@@ -1741,7 +1815,7 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
             dst.SubresourceIndex = i;
             src.pResource = faces[i]->resource.Get();
             src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            const D3D12_BOX box{ 0, 0, 0, w, h, 1 };
+            const D3D12_BOX box{ 0, 0, 0, std::min(cw, faces[i]->hostWidth), std::min(ch, faces[i]->hostHeight), 1 };
             g_r.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
         }
         for (UINT k = 0; k < n; k++)
@@ -1894,6 +1968,12 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
     format = DXGI_FORMAT_R8G8B8A8_UNORM;
     if (const ResolvedTexture* resolvedTexture = ResolvedFor(fetch))
     {
+        // The full-screen scene image rendered this frame: the draw is a screen layer (the
+        // post-processing composite, a grid of rectangles). HUD elements sample only atlases
+        // and reduced-size buffers (a 320x180 blur of the scene behind their panels).
+        // (By the size the draw fetches it at: the HUD samples the scene image too, at 320x180.)
+        if (resolvedTexture->frame == g_r.frame && fetch.Width() >= kWidth)
+            g_drawSamplesResolve = true;
         format = resolvedTexture->format;
         if (fetch.MipMaxLevel() > 0 && fetch.MipAddress())
             if (ID3D12Resource* chain = ResolvedMipChain(fetch, *resolvedTexture))
@@ -2150,14 +2230,20 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
         std::swap(a.resource, b.resource);
         std::swap(a.width, b.width);
         std::swap(a.height, b.height);
+        std::swap(a.hostWidth, b.hostWidth);
+        std::swap(a.hostHeight, b.hostHeight);
+        std::swap(a.frame, b.frame);
         std::swap(a.format, b.format);
         std::swap(a.swapped, b.swapped);
     };
-    if (!dest.resource || dest.width != width || dest.height != height || dest.format != format)
+    const uint32_t hostWidth = uint32_t(HostX(LONG(width))), hostHeight = uint32_t(HostY(LONG(height)));
+    if (!dest.resource || dest.width != width || dest.height != height || dest.hostWidth != hostWidth || dest.hostHeight != hostHeight ||
+        dest.format != format)
     {
         bool found = false;
         for (ResolvedTexture& spare : dest.spares)
-            if (spare.resource && spare.width == width && spare.height == height && spare.format == format)
+            if (spare.resource && spare.width == width && spare.height == height && spare.hostWidth == hostWidth &&
+                spare.hostHeight == hostHeight && spare.format == format)
             {
                 swapVariant(dest, spare);
                 found = true;
@@ -2180,8 +2266,8 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
             hp.Type = D3D12_HEAP_TYPE_DEFAULT;
             D3D12_RESOURCE_DESC td{};
             td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            td.Width = width;
-            td.Height = height;
+            td.Width = hostWidth;
+            td.Height = hostHeight;
             td.DepthOrArraySize = 1;
             td.MipLevels = 1;
             td.SampleDesc.Count = 1;
@@ -2194,10 +2280,13 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
             CountCreate("resolve");
             dest.width = width;
             dest.height = height;
+            dest.hostWidth = hostWidth;
+            dest.hostHeight = hostHeight;
             dest.format = format;
             dest.swapped = false;
         }
     }
+    dest.frame = g_r.frame;
     const D3D12_RECT sr{ rect.left, rect.top, std::min<LONG>(rect.right, width), std::min<LONG>(rect.bottom, height) };
     FrameResources& f = Frame();
     if (sr.right <= sr.left || sr.bottom <= sr.top || f.descriptorsUsed >= kDescriptorsPerFrame)
@@ -2239,9 +2328,12 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     g_r.list->SetGraphicsRootDescriptorTable(0, Gpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
     const uint32_t blitConstants[2] = { std::bit_cast<uint32_t>(scale), uint32_t(swapRB) };
     g_r.list->SetGraphicsRoot32BitConstants(1, 2, blitConstants, 0);
-    const D3D12_VIEWPORT vp{ 0, 0, float(width), float(height), 0, 1 };
+    // Width and height stay in game pixels (the size the title knows); the texture and the
+    // rectangle are scaled.
+    const D3D12_VIEWPORT vp{ 0, 0, float(hostWidth), float(hostHeight), 0, 1 };
+    const D3D12_RECT hostRect = ToHost(sr);
     g_r.list->RSSetViewports(1, &vp);
-    g_r.list->RSSetScissorRects(1, &sr);
+    g_r.list->RSSetScissorRects(1, &hostRect);
     g_r.list->DrawInstanced(3, 1, 0, 0);
 
     std::swap(b[0].Transition.StateBefore, b[0].Transition.StateAfter);
@@ -2334,7 +2426,8 @@ void Resolve()
         const uint32_t c = gpureg::Get(RB_COLOR_CLEAR);
         const float color[4] = { ((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f, (c & 0xFF) / 255.0f, (c >> 24) / 255.0f };
         TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
-        g_r.list->ClearRenderTargetView(g_r.rtv, color, 1, &clearRect);
+        const D3D12_RECT hostClear = ToHost(clearRect);
+        g_r.list->ClearRenderTargetView(g_r.rtv, color, 1, &hostClear);
     }
     if ((control >> 9) & 1) // depth/stencil clear: depth 24 bits | stencil 8
     {
@@ -2347,7 +2440,8 @@ void Resolve()
             depth = e ? std::ldexp(1.0f + float(m) / 1048576.0f, int(e) - 15) : std::ldexp(float(m) / 1048576.0f, -14);
             depth = std::clamp(depth, 0.0f, 1.0f);
         }
-        g_r.list->ClearDepthStencilView(g_r.dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, depth, UINT8(v & 0xFF), 1, &clearRect);
+        const D3D12_RECT hostClear = ToHost(clearRect);
+        g_r.list->ClearDepthStencilView(g_r.dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, depth, UINT8(v & 0xFF), 1, &hostClear);
     }
 }
 }
@@ -2880,10 +2974,11 @@ void HoldPresent()
 // shown before the game has drawn anything that HoldPresent could repeat.
 void BootPresent(const std::vector<uint8_t>& rgba)
 {
-    constexpr uint32_t w = 1280, h = 720;
+    constexpr uint32_t gw = 1280, gh = 720;
+    const uint32_t w = OutputWidth(), h = OutputHeight(); // the swap chain size
     static ComPtr<ID3D12Resource> texture, upload;
     static uint8_t* uploadCpu = nullptr;
-    if (!g_r.device || rgba.size() != size_t(w) * h * 4)
+    if (!g_r.device || rgba.size() != size_t(gw) * gh * 4)
         return;
     if (!g_hold.list)
     {
@@ -2910,12 +3005,25 @@ void BootPresent(const std::vector<uint8_t>& rgba)
         desc.SampleDesc.Count = 1;
         if (FAILED(g_r.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture))))
             return;
-        upload = CreateBuffer(UINT64(w) * 4 * h, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        upload = CreateBuffer(UINT64((w * 4 + 255) & ~255u) * h, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         void* mapped = nullptr;
         upload->Map(0, nullptr, &mapped);
         uploadCpu = static_cast<uint8_t*>(mapped);
     }
-    memcpy(uploadCpu, rgba.data(), rgba.size()); // the row pitch (5120) is already 256-aligned
+    // Nearest-neighbour to the output size, centred at 16:9 on wider outputs with the
+    // background's edge columns carried out to the sides.
+    const uint32_t pitch = (w * 4 + 255) & ~255u;
+    const uint32_t contentW = std::min(w, h * gw / gh), left = (w - contentW) / 2;
+    for (uint32_t y = 0; y < h; y++)
+    {
+        const uint32_t* in = reinterpret_cast<const uint32_t*>(rgba.data()) + size_t(y * gh / h) * gw;
+        uint32_t* out = reinterpret_cast<uint32_t*>(uploadCpu + size_t(y) * pitch);
+        for (uint32_t x = 0; x < w; x++)
+        {
+            const uint32_t cx = x < left ? 0 : std::min(contentW - 1, x - left);
+            out[x] = in[size_t(cx) * gw / contentW];
+        }
+    }
     g_hold.allocator->Reset();
     g_hold.list->Reset(g_hold.allocator.Get(), nullptr);
     D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
@@ -2923,7 +3031,7 @@ void BootPresent(const std::vector<uint8_t>& rgba)
     dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.pResource = upload.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1, w * 4 };
+    src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1, (w * 4 + 255) & ~255u };
     g_hold.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -3063,6 +3171,7 @@ void Section(int i)
 void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
     Section(0);
+    g_drawSamplesResolve = false;
     static const bool noRender = getenv("FM2_NO_RENDER") != nullptr;
     if (noRender)
         return;
@@ -3230,6 +3339,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         float vscale[4], voffset[4];
         uint32_t vte[4];
         uint32_t vfl[32][4]; // vertex fetch layout of the bound shader
+        float vwide[4];      // x: Hor+ factor (see hlsl.cpp)
     };
     struct PSConstants
     {
@@ -3286,6 +3396,23 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         vc->vf[k][0] = uint32_t(dataOffset);
         vc->vf[k][1] = d1 & 3;
     }
+    // Wider than 16:9: the screen is `wide` times as wide as 16:9 for its height. The view
+    // extends horizontally by `extent` (1 + (wide - 1) x FM2_WIDE_FOV%): 100 is full Hor+ (the
+    // most side view, but rectilinear stretch at the edges grows fast with FM2's wide camera);
+    // 0 keeps the 16:9 horizontal view and zooms in vertically instead.
+    {
+        static const float widePercent = [] {
+            const char* v = getenv("FM2_WIDE_FOV");
+            return v ? std::clamp(float(atof(v)), 0.0f, 100.0f) : 100.0f;
+        }();
+        const float wide = WidePass() ? ScaleWide() / ScaleY() : 1.0f;
+        const float extent = 1.0f + (wide - 1.0f) * widePercent / 100.0f;
+        vc->vwide[0] = 1.0f / extent;
+        vc->vwide[1] = wide / extent;
+        static const bool noSqueeze = getenv("FM2_NO_HUD_SQUEEZE") != nullptr; // A/B: 2D stretched with the view
+        vc->vwide[2] = noSqueeze ? 1.0f : 1.0f / wide;
+        vc->vwide[3] = 1; // set after the textures are bound (below)
+    }
     if (!vs.info.vertexFetchLayout.empty())
         memcpy(vc->vfl, vs.info.vertexFetchLayout.data(), vs.info.vertexFetchLayout.size() * sizeof(vc->vfl[0]));
     vc->info[0] = uint32_t(listOffset);
@@ -3338,6 +3465,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     static const bool depthAlphaTest = getenv("FM2_DEPTH_ALPHATEST") != nullptr;
     pc->info[0] = (colorControl >> 3) & 1 && (edramMode != 5 || depthAlphaTest) ? (colorControl & 7) : 7;
     pc->info2[0] = RegFloat(RB_ALPHA_REF);
+    pc->info2[1] = 1.0f / ScaleX();
+    pc->info2[2] = 1.0f / ScaleY();
 
     Section(4);
     // Textures are bindless: each one has a permanent descriptor in the heap's
@@ -3401,6 +3530,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         pc->tinfo[slot][1] = fetch.Width();
         pc->tinfo[slot][2] = fetch.Height();
     }
+    // HUD and menus sample ordinary textures; full-screen layers sample resolved targets
+    // and must keep spanning the width (squeezing them warped the image outside 16:9).
+    vc->vwide[3] = g_drawSamplesResolve ? 0.0f : 1.0f;
 
     Section(5);
     // Viewport. The viewport transform happens in the vertex shader; D3D maps 1:1.
@@ -3428,15 +3560,25 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             scissor.bottom = std::min(scissor.bottom, g_tile.rect.bottom);
         }
     }
-    const D3D12_VIEWPORT vp{ 0, shiftY, float(kWidth), float(kHeight), 0, 1 };
+    const D3D12_VIEWPORT vp{ 0, shiftY * ScaleY(), float(kWidth) * ScaleX(), float(OutputHeight()), 0, 1 };
     if (scissor.right <= scissor.left || scissor.bottom <= scissor.top)
     {
         TraceSkip("empty scissor", initiator);
         g_r.skippedThisFrame++;
         return;
     }
+    D3D12_RECT hostScissor = ToHost(scissor);
+    // A scissor narrower than the screen in a wide pass clips 2D content (the track map),
+    // which the vertex shader keeps in the centred 16:9 area: map it the same way. Not for
+    // screen layers (post-processing done in halves would leave a seam).
+    if (WidePass() && ScaleWide() != ScaleY() && !g_drawSamplesResolve && (scissor.left > 0 || scissor.right < LONG(kWidth)))
+    {
+        const double centre = OutputWidth() / 2.0, s = ScaleY();
+        hostScissor.left = LONG(std::lround(centre + (scissor.left - double(kWidth) / 2) * s));
+        hostScissor.right = LONG(std::lround(centre + (scissor.right - double(kWidth) / 2) * s));
+    }
     g_r.list->RSSetViewports(1, &vp);
-    g_r.list->RSSetScissorRects(1, &scissor);
+    g_r.list->RSSetScissorRects(1, &hostScissor);
     g_r.list->OMSetStencilRef(gpureg::Get(RB_STENCILREFMASK) & 0xFF);
     {
         // RB_BLEND_RED..ALPHA: the constant colour for blend factors 12-15.
@@ -3465,9 +3607,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         Log("    indices (initiator %08X dma %08X offset %u): %u %u %u %u %u %u ... %u", initiator, dmaBase, gpureg::Get(VGT_INDX_OFFSET),
             list.size() > 0 ? list[0] : 0, list.size() > 1 ? list[1] : 0, list.size() > 2 ? list[2] : 0, list.size() > 3 ? list[3] : 0,
             list.size() > 4 ? list[4] : 0, list.size() > 5 ? list[5] : 0, list.empty() ? 0 : list.back());
-        Log("draw #%u vs %016llx ps %016llx prim %u n %zu blend %08X mask %X scissor %ld,%ld-%ld,%ld%s", g_r.drawsThisFrame, (unsigned long long)g_r.vsHash,
-            (unsigned long long)g_r.psHash, initiator & 0x3F, list.size(), gpureg::Get(RB_BLENDCONTROL0), gpureg::Get(RB_COLOR_MASK) & 15,
-            scissor.left, scissor.top, scissor.right, scissor.bottom, tex.c_str());
+        Log("draw #%u vs %016llx ps %016llx prim %u n %zu blend %08X mask %X scissor %ld,%ld-%ld,%ld vte %03X wide %d layer %d pitch %u%s", g_r.drawsThisFrame,
+            (unsigned long long)g_r.vsHash, (unsigned long long)g_r.psHash, initiator & 0x3F, list.size(), gpureg::Get(RB_BLENDCONTROL0),
+            gpureg::Get(RB_COLOR_MASK) & 15, scissor.left, scissor.top, scissor.right, scissor.bottom, gpureg::Get(PA_CL_VTE_CNTL) & 0x3FF,
+            int(WidePass()), int(g_drawSamplesResolve), gpureg::Get(RB_SURFACE_INFO) & 0x3FFF, tex.c_str());
         uint32_t bools[8];
         for (int i = 0; i < 8; i++)
             bools[i] = gpureg::Get(gpureg::BoolConstants + i);
@@ -3571,7 +3714,10 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
             Log("perf:   cpu%s | slowest frame %.1f ms, %llu over 20 ms", GuestThreadCpuUsage(window).c_str(), g_perf.maxFrame,
                 (unsigned long long)g_perf.slowFrames);
         if (perf && g_perf.frames)
-            Log("perf:   waiting on host GPU %.2f ms/frame", g_gpuWaitSeconds * 1000.0 / g_perf.frames);
+            Log("perf:   waiting on host GPU %.2f ms/frame | GPU time %.2f ms/frame (worst %.1f)", g_gpuWaitSeconds * 1000.0 / g_perf.frames,
+                g_gpuFrames ? g_gpuFrameMs / g_gpuFrames : 0.0, g_gpuFrameMaxMs);
+        g_gpuFrameMs = g_gpuFrameMaxMs = 0;
+        g_gpuFrames = 0;
         if (perf && g_perf.frames)
             Log("perf:   descriptor tables built %.0f, reused %.0f per frame", double(g_perf.tablesBuilt) / g_perf.frames, double(g_perf.tablesReused) / g_perf.frames);
         if (perf && !g_created.empty())
@@ -3829,7 +3975,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         D3D12_TEXTURE_COPY_LOCATION dst{};
         dst.pResource = g_r.readback.Get();
         dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, kWidth, kHeight, 1, kWidth * 4 };
+        dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, OutputWidth(), OutputHeight(), 1, (OutputWidth() * 4 + 255) & ~255u };
         D3D12_TEXTURE_COPY_LOCATION src{};
         src.pResource = image;
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -3846,12 +3992,12 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
             ResolveDump d;
             d.base = base;
             d.variant = variant;
-            d.width = r.width;
-            d.height = r.height;
+            d.width = r.hostWidth; // the texture's own size
+            d.height = r.hostHeight;
             d.format = r.format;
             const UINT bpp = r.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4;
-            d.pitch = (r.width * bpp + 255) & ~255u;
-            d.buffer = CreateBuffer(UINT64(d.pitch) * r.height, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+            d.pitch = (d.width * bpp + 255) & ~255u;
+            d.buffer = CreateBuffer(UINT64(d.pitch) * d.height, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
             D3D12_RESOURCE_BARRIER bar{};
             bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             bar.Transition.pResource = r.resource.Get();
@@ -3862,7 +4008,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
             D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
             dst.pResource = d.buffer.Get();
             dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            dst.PlacedFootprint.Footprint = { r.format, r.width, r.height, 1, d.pitch };
+            dst.PlacedFootprint.Footprint = { r.format, d.width, d.height, 1, d.pitch };
             src.pResource = r.resource.Get();
             src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             g_r.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
@@ -3889,6 +4035,13 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         g_r.list->ResourceBarrier(1, &b);
     }
 
+    if (g_timestamps)
+    {
+        const UINT frameIndex = UINT(&Frame() - g_r.frames);
+        g_r.list->EndQuery(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 2 + 1);
+        g_r.list->ResolveQueryData(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 2, 2, g_timestampReadback.Get(), UINT64(frameIndex) * 16);
+        Frame().timed = true;
+    }
     g_r.list->Close();
     ID3D12CommandList* lists[] = { g_r.list.Get() };
     g_r.queue->ExecuteCommandLists(1, lists);
@@ -3951,17 +4104,25 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         resolveDumps.clear();
         uint8_t* data = nullptr;
         g_r.readback->Map(0, nullptr, reinterpret_cast<void**>(&data));
-        std::vector<uint8_t> rgba(data, data + size_t(kWidth) * kHeight * 4);
+        // Written at the render size; the region probes below work on a 1280x720 copy.
+        const uint32_t dw = OutputWidth(), dh = OutputHeight(), dpitch = (dw * 4 + 255) & ~255u;
+        std::vector<uint8_t> full(size_t(dw) * dh * 4);
+        for (uint32_t y = 0; y < dh; y++)
+            memcpy(&full[size_t(y) * dw * 4], data + size_t(y) * dpitch, size_t(dw) * 4);
         g_r.readback->Unmap(0, nullptr);
-        for (size_t i = 3; i < rgba.size(); i += 4)
-            rgba[i] = 255;
+        for (size_t i = 3; i < full.size(); i += 4)
+            full[i] = 255;
+        std::vector<uint8_t> rgba(size_t(kWidth) * kHeight * 4);
+        for (uint32_t y = 0; y < kHeight; y++)
+            for (uint32_t x = 0; x < kWidth; x++)
+                memcpy(&rgba[(size_t(y) * kWidth + x) * 4], &full[(size_t(y) * dh / kHeight * dw + size_t(x) * dw / kWidth) * 4], 4);
         static const uint64_t every = getenv("FM2_DUMP_EVERY") ? strtoull(getenv("FM2_DUMP_EVERY"), nullptr, 10) : 0;
         if (every && g_r.frame % every == 0 && g_r.frame != dumpFrame)
         {
             char name[64];
             std::filesystem::create_directories("out/frames");
             snprintf(name, sizeof(name), "out/frames/%05llu.png", (unsigned long long)g_r.frame);
-            WritePng(name, kWidth, kHeight, rgba);
+            WritePng(name, dw, dh, full);
         }
         else if (sweepDump && getenv("FM2_SWEEP_STAT"))
         {
@@ -3981,10 +4142,10 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
             std::filesystem::create_directories("out/sweep");
             char name[64];
             snprintf(name, sizeof(name), "out/sweep/%03llu.png", (unsigned long long)(g_r.frame - dumpFrame));
-            WritePng(name, kWidth, kHeight, rgba);
+            WritePng(name, dw, dh, full);
         }
         else
-            WritePng(g_r.frame == dumpFrame ? "frame.png" : "frame2.png", kWidth, kHeight, rgba);
+            WritePng(g_r.frame == dumpFrame ? "frame.png" : "frame2.png", dw, dh, full);
         Log("renderer: wrote frame.png (frame %llu: %u draws, %u skipped)", (unsigned long long)frameNumber, g_r.drawsThisFrame,
             g_r.skippedThisFrame);
     }

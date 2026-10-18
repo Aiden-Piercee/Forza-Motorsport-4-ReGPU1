@@ -4,6 +4,9 @@
 
 // Window + D3D12 swap chain (FM2_HEADLESS=1 disables it).
 void PresenterInit();
+// The output size everything renders at (FM2_RESOLUTION or FM2_RENDER_SCALE); the swap
+// chain is that size and stretches to the window.
+void RenderSize(uint32_t& width, uint32_t& height);
 // Called from VdSwap: the guest finished a frame.
 void PresenterSubmitFrame(uint64_t frame);
 // Shows a CPU-side RGBA8 image (scaled 1:1 into the 1280x720 back buffer).
@@ -19,7 +22,7 @@ struct ID3D12Resource;
 // Shared D3D12 device and queue (created on first use, also when headless).
 ID3D12Device* RenderDevice();
 ID3D12CommandQueue* RenderQueue();
-// Records copying src (COPY_SOURCE, 1280x720 RGBA8) into the current back
+// Records copying src (COPY_SOURCE, RGBA8 at RenderSize()) into the current back
 // buffer; returns false when there is no window. Call PresenterPresent()
 // after executing the list.
 // overlay (COPY_SOURCE RGBA8, overlayW x overlayH) is copied over the top-left corner when given.

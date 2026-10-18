@@ -22,13 +22,18 @@ cbuffer VSConstants : register(b0)
     // Vertex fetch k of this shader (see VFetchK): x fetch constant | format << 8 | signed << 14
     // | normalized << 15 | round << 16, y stride, z offset (dwords), w dest swizzle | exp << 16.
     uint4 vfl[32];
+    // xy: clip-space factors for perspective geometry in a wide pass (outputs wider than
+    // 16:9; 1 otherwise): x narrows the view to the wider screen (Hor+), y zooms in when
+    // FM2_WIDE_FOV limits how far the view widens; z keeps 2D (HUD, menus) at 16:9; w is 0
+    // for draws that sample a resolved render target (screen layers, never squeezed).
+    float4 vwide;
 };
 cbuffer PSConstants : register(b1)
 {
     float4 pc[256];
     uint4 pb[2];
     uint4 pinfo;      // x alpha test function (7 = always), y generated-parameter register (0xFF none)
-    float4 pinfo2;    // x alpha reference
+    float4 pinfo2;    // x alpha reference, y 1 / render scale (pixel positions back to game pixels)
     uint4 tinfo[32];  // x sampler (0 lin wrap, 1 lin clamp, 2 point clamp, 3 point wrap), y/z size, w dimension (3 cube)
     float4 tbias[32]; // x fetch-constant LOD bias, y (as uint) bindless descriptor index
 };
@@ -852,6 +857,10 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    float2 size = float2(vinfo.zw);\n"
              "    // The Xenos viewport transform (PA_CL_VTE_CNTL): optional divide by w, then\n"
              "    // per-axis scale and offset to screen pixels; back to D3D clip space after.\n"
+             "    // Hor+: on a wider-than-16:9 output a full-width pass is drawn wider; perspective\n"
+             "    // geometry is narrowed to match, so the view widens instead of stretching.\n"
+             "    const bool flat = abs(r.pos.w - 1.0) <= 1e-4;\n"
+             "    if (!flat) r.pos.xy *= vwide.xy;\n"
              "    float w = r.pos.w;\n"
              "    // (VTX_W0_FMT set means w is the true W0, the normal case.)\n"
              "    float3 p = r.pos.xyz;\n"
@@ -871,7 +880,14 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    if (vscale.w > 0.0) p.xy *= float2(vscale.w, voffset.w);\n"
              "    p.xy += pointOffset;\n"
              "    if (vte.x & (1u << 8)) w = 1.0;\n"
-             "    r.pos = float4(float2(p.x / size.x * 2.0 - 1.0, 1.0 - p.y / size.y * 2.0) * w, p.z * w, w);\n"
+             "    float2 ndc = float2(p.x / size.x * 2.0 - 1.0, 1.0 - p.y / size.y * 2.0);\n"
+             "    // Flat (2D) geometry in a wide pass keeps 16:9 proportions in a centred 16:9 area\n"
+             "    // (HUD, menus, text); vertices on the left or right screen edge stay there, so\n"
+             "    // full-screen layers (backgrounds, fades) still span the width. Screen-space passes\n"
+             "    // (no viewport transform: the title's filter and post-processing passes) are left\n"
+             "    // alone: squeezing their inner vertices warped the image outside 16:9.\n"
+             "    if (flat && vwide.w > 0.5 && vwide.z < 1.0 && (vte.x & 0x30Fu) != 0x300u && abs(ndc.x) < 0.999) ndc.x *= vwide.z;\n"
+             "    r.pos = float4(ndc * w, p.z * w, w);\n"
              "    return r;\n}\n";
     }
     else
@@ -882,7 +898,7 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    float4 oC[4]; [unroll] for (int k = 0; k < 4; k++) oC[k] = 0;\n"
              "    float ps = 0; bool p = false; int a0 = 0, aL = 0;\n"
              "    // Generated parameter: pixel position, point sprite coordinate.\n"
-             "    if (pinfo.y < 16u) r[pinfo.y] = float4(input.pos.xy, input.pcoord);\n";
+             "    if (pinfo.y < 16u) r[pinfo.y] = float4(input.pos.xy * pinfo2.yz, input.pcoord);\n";
         h += e.out;
         h += "    switch (pinfo.x)\n    {\n"
              "    case 0: discard; break;\n"
