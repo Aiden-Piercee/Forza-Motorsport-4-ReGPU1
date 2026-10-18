@@ -18,6 +18,9 @@ cbuffer VSConstants : register(b0)
     float4 vscale;    // PA_CL_VPORT_X/Y/ZSCALE
     float4 voffset;   // PA_CL_VPORT_X/Y/ZOFFSET
     uint4 vte;        // x PA_CL_VTE_CNTL
+    // Vertex fetch k of this shader (see VFetchK): x fetch constant | format << 8 | signed << 14
+    // | normalized << 15 | round << 16, y stride, z offset (dwords), w dest swizzle | exp << 16.
+    uint4 vfl[32];
 };
 cbuffer PSConstants : register(b1)
 {
@@ -138,6 +141,29 @@ float4 VFetch(uint fetch, float index, uint stride, uint offset, uint format, bo
 {
     uint d = uint(max(index, 0.0)) * stride + offset; // index already rounded or floored
     return Unpack(LoadGuest(fetch, d), LoadGuest(fetch, d + 1), LoadGuest(fetch, d + 2), LoadGuest(fetch, d + 3), format, isSigned, norm);
+}
+
+// The title binds each vertex shader to the vertex layout it draws by patching its fetch
+// instructions (constant slot, format, stride, offset, swizzle). Reading those fields from
+// vfl instead of baking them in makes every patched copy of a shader the same HLSL, so they
+// share one compile.
+float4 VFetchK(uint k, float i)
+{
+    uint4 p = vfl[k];
+    float idx = (p.x & 0x10000u) ? round(i) : floor(i);
+    return VFetch(p.x & 0x7Fu, idx, p.y, p.z, (p.x >> 8) & 0x3Fu, (p.x & 0x4000u) != 0, (p.x & 0x8000u) != 0) * exp2(float(int(p.w << 10) >> 26));
+}
+
+float4 VMerge(uint k, float4 old, float4 t)
+{
+    uint sw = vfl[k].w & 0xFFFu;
+    float4 r = old;
+    [unroll] for (uint c = 0; c < 4; c++)
+    {
+        uint s = (sw >> (3 * c)) & 7u;
+        r[c] = s < 4 ? t[s] : (s == 4 ? 0.0 : (s == 5 ? 1.0 : old[c]));
+    }
+    return r;
 }
 
 // Cube fetch coordinates are (s, t, face) as produced by the CUBE instruction
@@ -490,11 +516,27 @@ struct Emitter
             if (getenv("FM2_TRACE_VFETCH"))
                 fprintf(stderr, "vfetch: fmt %u signed %d norm %d exp %d stride %u offset %u mini %d round %d\n", f.format, f.isSigned, f.isNormalized,
                     f.expAdjust, lastStride, f.offset, f.isMini, lastRound);
-            char call[320];
-            snprintf(call, sizeof(call), "VFetch(%u, %s(r[%u].%c), %u, %u, %u, %s, %s) * %.9g", f.constIndex, lastRound ? "round" : "floor",
-                lastSrc, "xyzw"[lastSrcSwizzle & 3], lastStride, f.offset, f.format, f.isSigned ? "true" : "false",
-                f.isNormalized ? "true" : "false", std::ldexp(1.0, f.expAdjust));
-            body = std::string("{ float4 t = ") + call + "; " + DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
+            const uint32_t k = uint32_t(result.vertexFetchLayout.size());
+            static const bool bakedFetch = getenv("FM2_BAKED_VFETCH") != nullptr;
+            if (!bakedFetch && k < 32 && f.src == lastSrc && f.srcSwizzle == lastSrcSwizzle)
+            {
+                // Layout from vfl[k]; only the registers stay in the code.
+                result.vertexFetchLayout.push_back({ f.constIndex | (f.format << 8) | (f.isSigned ? 0x4000u : 0) | (f.isNormalized ? 0x8000u : 0) |
+                        (lastRound ? 0x10000u : 0),
+                    lastStride, f.offset, f.destSwizzle | ((uint32_t(f.expAdjust) & 0x3F) << 16) });
+                char call[160];
+                snprintf(call, sizeof(call), "{ float4 t = VFetchK(%u, r[%u].%c); r[%u] = VMerge(%u, r[%u], t); }", k, f.src,
+                    "xyzw"[f.srcSwizzle & 3], f.dest, k, f.dest);
+                body = call;
+            }
+            else
+            {
+                char call[320];
+                snprintf(call, sizeof(call), "VFetch(%u, %s(r[%u].%c), %u, %u, %u, %s, %s) * %.9g", f.constIndex, lastRound ? "round" : "floor",
+                    lastSrc, "xyzw"[lastSrcSwizzle & 3], lastStride, f.offset, f.format, f.isSigned ? "true" : "false",
+                    f.isNormalized ? "true" : "false", std::ldexp(1.0, f.expAdjust));
+                body = std::string("{ float4 t = ") + call + "; " + DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
+            }
             bool known = false;
             for (uint32_t c : result.vertexFetchConstants)
                 known = known || c == f.constIndex;

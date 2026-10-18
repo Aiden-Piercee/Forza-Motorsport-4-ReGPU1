@@ -1,8 +1,9 @@
 // Finds every shader in the game data before the game asks for one.
 //
 // The title keeps shader microcode raw inside its .rmb.bin mesh files (deflated in the
-// track, car and UI zips), 16-byte aligned and with no packet header, plus a few dozen
-// in the executable. A candidate is a shader when its control flow decodes cleanly:
+// track, car and UI zips), 16-byte aligned and with no packet header, plus a few hundred
+// in the executable (dword aligned). The title patches vertex fetch layouts into its
+// copies at load; the translator reads those from constants, so the copies share HLSL. A candidate is a shader when its control flow decodes cleanly:
 // valid opcodes up to an end flag, the first exec address equal to the control-flow
 // length, and exec ranges that tile the instruction slots without gaps. Only the used
 // slots are kept (the loaded copy has a per-load stamp after them; see
@@ -109,14 +110,19 @@ struct Found
     std::vector<ScannedShader> shaders;
 };
 
-void ScanBytes(const uint8_t* bytes, size_t size, Found& found)
+// Data files: candidates every 16 bytes. Executable: every dword, and also shaders that start
+// with a branch (in the data files that rule only adds false positives).
+void ScanBytes(const uint8_t* bytes, size_t size, Found& found, bool executable = false)
 {
     const size_t words = size / 4;
-    for (size_t i = 0; i + 4 <= words; i += 4)
+    const size_t stepWords = executable ? 1 : 4;
+    for (size_t i = 0; i + 4 <= words; i += stepWords)
     {
         const uint32_t w0 = Be(bytes + i * 4), w1 = Be(bytes + i * 4 + 4);
         const uint32_t op = (w1 >> 12) & 0xF, addr = w0 & 0xFFF;
-        if (!((IsExecOp(op) && addr >= 1 && addr <= 64) || (op == 12 && !(w0 & 0xFFFFFFF8))))
+        // First instruction: an exec at the end of the control flow or an alloc; in the
+        // executable also a loop, call or jump (its shaders with branches start with one).
+        if (!((IsExecOp(op) && addr >= 1 && addr <= 64) || (op == 12 && !(w0 & 0xFFFFFFF8)) || (executable && (op == 7 || op == 9 || op == 11))))
             continue;
         bool pixel;
         const uint32_t used = ShaderAt(bytes, words, i, pixel);
@@ -134,7 +140,7 @@ void ScanBytes(const uint8_t* bytes, size_t size, Found& found)
 }
 
 constexpr uint32_t kFileMagic = 0x53534D46; // 'FMSS'
-constexpr uint32_t kFileVersion = 1;
+constexpr uint32_t kFileVersion = 4; // 2: executable at dword alignment; 4: its shaders that start with a branch
 
 std::filesystem::path SavedPath() { return UserDir() / "static_shaders.bin"; }
 
@@ -215,8 +221,9 @@ std::vector<ScannedShader> StaticShaders()
     for (auto& w : workers)
         w.join();
     const size_t fromFiles = found.shaders.size();
-    // Shaders built into the executable (it is compressed on disc; scan the loaded image).
-    ScanBytes(GuestPtr<uint8_t>(0x82000000), 0x2000000, found);
+    // Shaders built into the executable (compressed on disc, so the loaded image): most of
+    // the UI, title and effect shaders, only dword aligned.
+    ScanBytes(GuestPtr<uint8_t>(0x82000000), 0x2000000, found, true);
     result = std::move(found.shaders);
     Save(result);
     Log("static shaders: %zu found (%zu in %zu data files, %zu in the executable) in %.1f s", result.size(), fromFiles, files.size(),

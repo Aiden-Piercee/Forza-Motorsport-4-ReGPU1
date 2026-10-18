@@ -16,6 +16,7 @@
 //   s0 linear wrap, s1 linear clamp, s2 point clamp, s3 point wrap
 #include <cstdint>
 #include <string>
+#include <array>
 #include <vector>
 
 #include "gpu/ucode.h"
@@ -27,6 +28,7 @@ struct TranslatedShader
     std::string hlsl;
     uint32_t usedTextureSlots = 0;  // bit per fetch slot (pixel shaders)
     std::vector<uint32_t> vertexFetchConstants; // vertex shaders
+    std::vector<std::array<uint32_t, 4>> vertexFetchLayout; // vfl[k] for each vertex fetch (see hlsl.cpp)
 };
 
 TranslatedShader TranslateShader(const ucode::Shader& shader);

@@ -1,5 +1,6 @@
 // xenos_dis [--hlsl] <shader.bin>...: disassemble captured Xenos microcode
-// (vs_*.bin / ps_*.bin from FM2_DUMP_SHADERS); --hlsl translates and
+// (vs_*.bin / ps_*.bin from FM2_DUMP_SHADERS); --hash prints each file with a hash of its
+// translated HLSL (no compile: shaders with the same hash share bytecode); --hlsl translates and
 // compiles each one instead and reports the result.
 #include <cstdio>
 #include <cstring>
@@ -16,13 +17,18 @@
 
 int main(int argc, char** argv)
 {
-    bool hlsl = false, print = false;
+    bool hlsl = false, print = false, hashOnly = false;
     int failures = 0;
     for (int i = 1; i < argc; i++)
     {
         if (!strcmp(argv[i], "--hlsl"))
         {
             hlsl = true;
+            continue;
+        }
+        if (!strcmp(argv[i], "--hash"))
+        {
+            hlsl = hashOnly = true;
             continue;
         }
         if (!strcmp(argv[i], "--print"))
@@ -45,6 +51,14 @@ int main(int argc, char** argv)
         {
             printf("FAIL translate %s: %s\n", argv[i], t.error.c_str());
             failures++;
+            continue;
+        }
+        if (hashOnly)
+        {
+            uint64_t h = 0xCBF29CE484222325ull;
+            for (char c : t.hlsl)
+                h = (h ^ uint8_t(c)) * 0x100000001B3ull;
+            printf("%s %016llx\n", argv[i], (unsigned long long)h);
             continue;
         }
         if (print)

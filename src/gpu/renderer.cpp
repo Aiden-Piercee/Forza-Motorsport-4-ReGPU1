@@ -896,7 +896,11 @@ struct ShaderCompiler
     std::deque<CompiledShader*> background; // static shaders: compiled when nothing urgent waits
     std::vector<std::thread> workers;
     std::atomic<int> jobs{ 0 };   // urgent, queued or compiling (holds wait for these)
-    std::atomic<int> waiting{ 0 }; // background, queued
+    std::atomic<int> waiting{ 0 }; // background, queued or parked
+    // Once the game runs, background pushes (memory-scan finds: mostly stale copies the
+    // game never draws) are parked instead: translated, compiled only if a draw promotes them.
+    std::atomic<bool> park{ false };
+    std::unordered_set<const CompiledShader*> parked;
 
     void Start()
     {
@@ -916,7 +920,10 @@ struct ShaderCompiler
             if (later)
             {
                 waiting++;
-                background.push_back(cs);
+                if (park.load())
+                    parked.insert(cs);
+                else
+                    background.push_back(cs);
             }
             else
             {
@@ -933,9 +940,16 @@ struct ShaderCompiler
         if (cs.state.load(std::memory_order_relaxed) != CompiledShader::Pending || !waiting.load(std::memory_order_relaxed))
             return;
         std::lock_guard lock(mutex);
-        if (auto it = std::find(background.begin(), background.end(), &cs); it != background.end())
+        bool found = false;
+        if (parked.erase(&cs))
+            found = true;
+        else if (auto it = std::find(background.begin(), background.end(), &cs); it != background.end())
         {
             background.erase(it);
+            found = true;
+        }
+        if (found)
+        {
             waiting--;
             jobs++;
             queue.push_front(const_cast<CompiledShader*>(&cs));
@@ -2967,6 +2981,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         float point[4];
         float vscale[4], voffset[4];
         uint32_t vte[4];
+        uint32_t vfl[32][4]; // vertex fetch layout of the bound shader
     };
     struct PSConstants
     {
@@ -3023,6 +3038,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         vc->vf[k][0] = uint32_t(dataOffset);
         vc->vf[k][1] = d1 & 3;
     }
+    if (!vs.info.vertexFetchLayout.empty())
+        memcpy(vc->vfl, vs.info.vertexFetchLayout.data(), vs.info.vertexFetchLayout.size() * sizeof(vc->vfl[0]));
     vc->info[0] = uint32_t(listOffset);
     vc->info[1] = (initiator & 0x3F) == 1 ? 2 : 0;
     // Viewport transform in the vertex shader (see hlsl.cpp).
@@ -3336,6 +3353,11 @@ void PrecompileAll()
     if (g_precompileDone)
         return;
     g_precompileDone = true;
+    // From here on the game runs: speculative finds wait for a draw that needs them.
+    struct ParkAfter
+    {
+        ~ParkAfter() { g_compiler.park = true; }
+    } parkAfter;
     if (getenv("FM2_NO_PRECOMPILE"))
         return;
     const auto start = std::chrono::steady_clock::now();
