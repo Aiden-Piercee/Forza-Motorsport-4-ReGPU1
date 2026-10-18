@@ -65,7 +65,31 @@ int main(int argc, char** argv)
             uint64_t h = 0xCBF29CE484222325ull;
             for (char c : t.hlsl)
                 h = (h ^ uint8_t(c)) * 0x100000001B3ull;
-            printf("%s %016llx\n", argv[i], (unsigned long long)h);
+            // The renderer's canonical key (CanonicalKey): microcode with the patched vertex
+            // fetch fields masked. Shaders with equal keys must have equal HLSL hashes.
+            std::vector<uint32_t> w = shader.words;
+            for (const ucode::Cf& cf : shader.cf)
+            {
+                if (cf.IsExec())
+                    for (uint32_t k = 0; k < cf.count(); k++)
+                    {
+                        const uint32_t index = cf.address() + k;
+                        if (!((cf.sequence() >> (2 * k)) & 1) || (index + 1) * 3 > w.size() || (w[index * 3] & 0x1F) != 0)
+                            continue;
+                        w[index * 3] &= ~0x1FF00000u;
+                        w[index * 3 + 1] &= 0x80000000u;
+                        w[index * 3 + 2] &= 0x80000000u;
+                    }
+                if (cf.IsEnd())
+                    break;
+            }
+            uint64_t canon = 0xCBF29CE484222325ull;
+            for (uint32_t x : w)
+                for (int b = 0; b < 4; b++)
+                    canon = (canon ^ ((x >> (8 * b)) & 0xFF)) * 0x100000001B3ull;
+            printf("%s %016llx canon %016llx\n", argv[i], (unsigned long long)h, (unsigned long long)canon);
+            if (print)
+                printf("%s\n", t.hlsl.c_str());
             continue;
         }
         if (print)

@@ -3130,6 +3130,16 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         g_r.skippedThisFrame++;
         return;
     }
+    // A fetch from vertex fetch constant 96 or above (index field past the 96 slots) has no
+    // vertex data. With the layout baked in, such shaders failed to compile and their draws
+    // were skipped; read from vfl they compile and draw garbage (black shapes on Mugello).
+    for (uint32_t k : vs.info.vertexFetchConstants)
+        if (k >= 96)
+        {
+            TraceSkip("invalid vertex fetch constant", initiator);
+            g_r.skippedThisFrame++;
+            return;
+        }
     // Triangle lists and restart-free strips read their indices on the GPU;
     // everything else is expanded here.
     const uint32_t prim = initiator & 0x3F, indexSource = (initiator >> 6) & 3, indexCount = initiator >> 16;
