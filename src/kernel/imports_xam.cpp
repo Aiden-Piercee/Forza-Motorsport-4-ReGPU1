@@ -5,6 +5,8 @@
 #include <chrono>
 #include <deque>
 #include <filesystem>
+#include <fstream>
+#include <vector>
 
 #include "gpu/renderer.h"
 #include "kernel/imports.h"
@@ -13,6 +15,7 @@
 #include "kernel/vfs.h"
 #include "loader.h"
 #include "render/presenter.h"
+#include "settings.h"
 
 #include <windows.h>
 #include <Xinput.h>
@@ -20,7 +23,38 @@
 
 namespace
 {
-constexpr uint64_t kXuid = 0xE000000000F02F02ull;
+// The profile's offline XUID (0xE000...): derived from its name, so each profile's saves
+// carry their own owner.
+uint64_t Xuid()
+{
+    static const uint64_t xuid = [] {
+        uint64_t h = 0xCBF29CE484222325ull;
+        for (char c : GetSettings().profile)
+            h = (h ^ uint8_t(c)) * 0x100000001B3ull;
+        return 0xE000000000000000ull | (h & 0x0000FFFFFFFFFFFFull);
+    }();
+    return xuid;
+}
+
+constexpr uint32_t kContentDataSize = 0x134;
+
+// XCONTENT_DATA: deviceId, contentType, displayName[128] (UTF-16 BE), fileName[42].
+struct ContentItem
+{
+    uint32_t type = 0;
+    std::u16string displayName;
+    std::string fileName;
+};
+
+std::filesystem::path ContentTypeDir(uint32_t type)
+{
+    char t[16];
+    snprintf(t, sizeof(t), "%08X", type);
+    return ContentDir() / t;
+}
+
+// Display names live beside the packages (<fileName>.title, UTF-16 LE), outside what the game sees.
+std::filesystem::path TitlePath(uint32_t type, const std::string& fileName) { return ContentTypeDir(type) / (fileName + ".title"); }
 
 struct ListenerObject : KernelObject
 {
@@ -32,6 +66,8 @@ struct ListenerObject : KernelObject
 struct EnumeratorObject : KernelObject
 {
     EnumeratorObject() : KernelObject(Kind::Other) {}
+    std::vector<ContentItem> items;
+    size_t next = 0;
 };
 
 std::mutex g_listenerMutex;
@@ -52,7 +88,7 @@ GUEST_EXPORT(XamUserGetXUID)
         Return(ctx, X_ERROR_NO_SUCH_USER);
         return;
     }
-    StoreBE64(ctx.r5.u32, kXuid);
+    StoreBE64(ctx.r5.u32, Xuid());
     Return(ctx, X_ERROR_SUCCESS);
 }
 
@@ -64,7 +100,7 @@ GUEST_EXPORT(XamUserGetName)
         Return(ctx, X_ERROR_NO_SUCH_USER);
         return;
     }
-    const char* name = "Player";
+    const char* name = GetSettings().profile.c_str();
     const uint32_t size = ctx.r5.u32;
     if (size)
     {
@@ -244,7 +280,19 @@ void FinishUi(PPCContext& ctx, uint32_t overlapped, uint32_t result = X_ERROR_SU
 }
 }
 
-GUEST_EXPORT(XamShowSigninUI) { Return(ctx, X_ERROR_SUCCESS); }
+GUEST_EXPORT(XamShowSigninUI)
+{
+    // The sign-in guide opens and closes at once, with the profile signed in.
+    std::lock_guard lock(g_listenerMutex);
+    for (auto& weak : g_listeners)
+        if (auto l = weak.lock())
+        {
+            l->queue.push_back({ 0x00000009, 1 }); // XN_SYS_UI: shown
+            l->queue.push_back({ 0x0000000A, 1 }); // XN_SYS_SIGNINCHANGED: user 0
+            l->queue.push_back({ 0x00000009, 0 }); // XN_SYS_UI: hidden
+        }
+    Return(ctx, X_ERROR_SUCCESS);
+}
 GUEST_EXPORT(XamShowFriendsUI) { Return(ctx, X_ERROR_SUCCESS); }
 GUEST_EXPORT(XamShowGamerCardUIForXUID) { Return(ctx, X_ERROR_SUCCESS); }
 GUEST_EXPORT(XamShowDirtyDiscErrorUI)
@@ -581,11 +629,7 @@ GUEST_EXPORT(XamContentCreateEx)
     // XCONTENT_DATA: deviceId, contentType, displayName[128] (wide), fileName[42].
     const std::string fileName(GuestPtr<char>(data + 8 + 256), strnlen(GuestPtr<char>(data + 8 + 256), 42));
     const uint32_t contentType = LoadBE32(data + 4);
-    const std::filesystem::path dir = UserDir() / "content" / ([&] {
-        char t[16];
-        snprintf(t, sizeof(t), "%08X", contentType);
-        return std::string(t);
-    }()) / fileName;
+    const std::filesystem::path dir = ContentTypeDir(contentType) / fileName;
     std::error_code ec;
     const bool existed = std::filesystem::exists(dir, ec);
     const uint32_t flags = ctx.r6.u32;
@@ -596,6 +640,18 @@ GUEST_EXPORT(XamContentCreateEx)
         return;
     }
     std::filesystem::create_directories(dir, ec);
+    if (!existed)
+    {
+        std::u16string title;
+        for (uint32_t i = 0; i < 128; i++)
+        {
+            const uint16_t c = __builtin_bswap16(*GuestPtr<uint16_t>(data + 8 + i * 2));
+            if (!c)
+                break;
+            title += char16_t(c);
+        }
+        std::ofstream(TitlePath(contentType, fileName), std::ios::binary).write(reinterpret_cast<const char*>(title.data()), title.size() * 2);
+    }
     const std::string device = "\\Device\\Content\\" + dir.parent_path().filename().string() + "\\" + fileName;
     VfsAddLink(root + ":", device);
     Log("content: %s: -> %s", root.c_str(), dir.string().c_str());
@@ -611,14 +667,28 @@ GUEST_EXPORT(XamContentClose)
 }
 
 GUEST_EXPORT(XamContentFlush) { FinishUi(ctx, ctx.r4.u32); }
-GUEST_EXPORT(XamContentDelete) { FinishUi(ctx, ctx.r5.u32); }
+GUEST_EXPORT(XamContentDelete)
+{
+    // (user, XCONTENT_DATA*, overlapped)
+    const uint32_t data = ctx.r4.u32;
+    const std::string fileName(GuestPtr<char>(data + 8 + 256), strnlen(GuestPtr<char>(data + 8 + 256), 42));
+    std::error_code ec;
+    if (!fileName.empty())
+    {
+        const uint32_t type = LoadBE32(data + 4);
+        std::filesystem::remove_all(ContentTypeDir(type) / fileName, ec);
+        std::filesystem::remove(TitlePath(type, fileName), ec);
+        Log("content: deleted %08X/%s", type, fileName.c_str());
+    }
+    FinishUi(ctx, ctx.r5.u32);
+}
 
 GUEST_EXPORT(XamContentGetCreator)
 {
     // (user, data*, isCreator*, xuid*, overlapped)
     StoreIfNonNull(ctx.r5.u32, 1);
     if (ctx.r6.u32)
-        StoreBE64(ctx.r6.u32, kXuid);
+        StoreBE64(ctx.r6.u32, Xuid());
     FinishUi(ctx, ctx.r7.u32);
 }
 
@@ -641,9 +711,33 @@ GUEST_EXPORT(XamContentGetDeviceData)
 
 GUEST_EXPORT(XamContentCreateEnumerator)
 {
-    // (user, deviceId, contentType, flags, itemCount, bufferSize*, handle*)
-    StoreIfNonNull(ctx.r8.u32, ctx.r7.u32 * 0x134);
-    StoreIfNonNull(ctx.r9.u32, CreateHandle(std::make_shared<EnumeratorObject>()));
+    // (user, deviceId, contentType, flags, itemCount, bufferSize*, handle*): lists the
+    // profile's packages of that type (all types for 0).
+    auto e = std::make_shared<EnumeratorObject>();
+    const uint32_t wanted = ctx.r5.u32;
+    std::error_code ec;
+    for (const auto& typeDir : std::filesystem::directory_iterator(ContentDir(), ec))
+    {
+        uint32_t type = 0;
+        if (!typeDir.is_directory() || sscanf(typeDir.path().filename().string().c_str(), "%x", &type) != 1 || (wanted && type != wanted))
+            continue;
+        for (const auto& package : std::filesystem::directory_iterator(typeDir.path(), ec))
+        {
+            const std::string fileName = package.path().filename().string();
+            if (!package.is_directory() || fileName.size() > 41)
+                continue;
+            ContentItem item{ type, {}, fileName };
+            std::ifstream in(TitlePath(type, fileName), std::ios::binary);
+            std::string bytes((std::istreambuf_iterator<char>(in)), {});
+            item.displayName.assign(reinterpret_cast<const char16_t*>(bytes.data()), bytes.size() / 2);
+            if (item.displayName.empty())
+                item.displayName.assign(fileName.begin(), fileName.end());
+            e->items.push_back(std::move(item));
+        }
+    }
+    Log("content: enumerating %zu packages of type %08X", e->items.size(), wanted);
+    StoreIfNonNull(ctx.r8.u32, std::max(ctx.r7.u32, 1u) * kContentDataSize);
+    StoreIfNonNull(ctx.r9.u32, CreateHandle(e));
     Return(ctx, X_ERROR_SUCCESS);
 }
 
@@ -656,8 +750,25 @@ GUEST_EXPORT(XamCreateEnumeratorHandle)
 GUEST_EXPORT(XamEnumerate)
 {
     // (handle, flags, buffer, size, itemsReturned*, overlapped)
-    StoreIfNonNull(ctx.r7.u32, 0);
-    FinishUi(ctx, ctx.r8.u32, X_ERROR_NO_MORE_FILES);
+    auto e = std::dynamic_pointer_cast<EnumeratorObject>(GetHandle(ctx.r3.u32));
+    uint32_t count = 0;
+    if (e)
+    {
+        const uint32_t buffer = ctx.r5.u32, capacity = ctx.r6.u32 / kContentDataSize;
+        for (; count < capacity && e->next < e->items.size(); count++, e->next++)
+        {
+            const ContentItem& item = e->items[e->next];
+            const uint32_t d = buffer + count * kContentDataSize;
+            memset(GuestPtr(d), 0, kContentDataSize);
+            StoreBE32(d + 0, 1); // the hard drive
+            StoreBE32(d + 4, item.type);
+            for (size_t i = 0; i < item.displayName.size() && i < 127; i++)
+                *GuestPtr<uint16_t>(d + 8 + uint32_t(i) * 2) = __builtin_bswap16(uint16_t(item.displayName[i]));
+            memcpy(GuestPtr(d + 8 + 256), item.fileName.data(), item.fileName.size());
+        }
+    }
+    StoreIfNonNull(ctx.r7.u32, count);
+    FinishUi(ctx, ctx.r8.u32, count ? X_ERROR_SUCCESS : X_ERROR_NO_MORE_FILES);
 }
 
 // Tasks ----------------------------------------------------------------------------
@@ -681,6 +792,14 @@ GUEST_EXPORT(XamTaskCloseHandle) { CloseHandle(ctx.r3.u32); Return(ctx, X_STATUS
 GUEST_EXPORT(XMsgInProcessCall)
 {
     const uint32_t app = ctx.r3.u32, message = ctx.r4.u32, args = ctx.r5.u32;
+    if (app == 0xFC)
+    {
+        // XLiveBase: the title's profile manager starts with a request here (00058004) and
+        // gives up if it fails: no sign-in tracking, so "No Gamer Profiles" and no saves.
+        LOG_ONCE("XLiveBase message %08X answered with success", message);
+        Return(ctx, 0);
+        return;
+    }
     if (app != 0xFA)
     {
         LOG_ONCE("XMsgInProcessCall to app %X (message %08X) not supported", app, message);

@@ -7,3 +7,5 @@ void RuntimeInit(const std::filesystem::path& gameDir);
 
 const std::filesystem::path& GameDir();
 const std::filesystem::path& UserDir();
+// The signed-in profile's saves (\Device\Content).
+const std::filesystem::path& ContentDir();

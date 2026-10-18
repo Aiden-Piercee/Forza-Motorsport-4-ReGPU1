@@ -2,13 +2,19 @@
 
 Build state: boots, menus, race setup and races render natively. The game
 is fully playable with a controller or the keyboard, with sound (5.1, downmixed by
-Windows for stereo devices). There is no ultrawide support yet.
+Windows for stereo devices). Saves work.
 
 ## Run it
 
 Double-click `play.cmd` (or run `build\rel\fm2.exe` from the repository root).
 The game needs `game\` (the extracted disc) next to it. Logs are written to
 `out\play.log`.
+
+A launcher opens first: pick the profile name (your save slot; `Player` by
+default), resolution, aspect ratio, windowed or fullscreen, VSync and max FPS, then
+Play. The choices are kept in `Documents\fm2\settings.ini` for next time. Each
+profile name has its own saves (`Documents\fm2\profiles\<name>`); saves made
+before profiles existed belong to `Player`.
 
 The first start finds and compiles every shader in the game (about 3.5 minutes on
 16 threads) behind a loading screen with a progress bar. Let it finish; the game
@@ -43,8 +49,9 @@ The keyboard only works while the game window has focus.
 - Bright surfaces (the asphalt) may be overexposed; not yet compared with
   the console.
 - Face culling is off (only a performance cost).
-- The game runs at 60 fps; higher refresh rates are not supported yet.
-- Ultrawide (`FM2_RESOLUTION` wider than 16:9) is experimental: some objects at the
+- Races are limited to about 75 fps by the renderer's CPU time, whatever the max FPS
+  setting; menus reach it. A later optimisation pass will raise this.
+- Ultrawide (a resolution or aspect ratio wider than 16:9) is experimental: some objects at the
   sides of the screen still pop in late, and the HUD stays in the centre 16:9 area.
 - Looping sounds restart at the start of the 2 KB packet holding the loop point, not
   the exact sample: listen for clicks or stutters in engine and ambient loops.

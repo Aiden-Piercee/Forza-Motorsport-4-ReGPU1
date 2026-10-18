@@ -15,6 +15,7 @@
 
 #include "log.h"
 #include "render/presenter.h"
+#include "settings.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -51,20 +52,10 @@ struct Presenter
 Presenter g_p;
 }
 
-// Output size: FM2_RESOLUTION=<width>x<height> (any aspect, e.g. 3440x1440), else
-// FM2_RENDER_SCALE=<1-4> times the game's 1280x720.
+// The size the game renders at (settings: resolution and forced aspect ratio).
 void RenderSize(uint32_t& width, uint32_t& height)
 {
-    static const std::pair<uint32_t, uint32_t> size = [] {
-        uint32_t w = 0, h = 0;
-        if (const char* r = getenv("FM2_RESOLUTION"); r && sscanf(r, "%ux%u", &w, &h) == 2 && w >= 640 && h >= 360 && w <= 15360 && h <= 8640)
-            return std::pair{ w, h };
-        const char* v = getenv("FM2_RENDER_SCALE");
-        const uint32_t k = v ? std::clamp<uint32_t>(uint32_t(atoi(v)), 1, 4) : 1u;
-        return std::pair{ 1280 * k, 720 * k };
-    }();
-    width = size.first;
-    height = size.second;
+    GetSettings().RenderSize(width, height);
 }
 
 namespace
@@ -116,24 +107,34 @@ void CreateWindowAndDevice()
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.lpszClassName = L"fm2";
     RegisterClassW(&wc);
-    // The client area starts at the output size, shrunk (aspect kept) to fit the screen;
-    // the swap chain is stretched to whatever the window becomes.
-    RECT work{};
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-    uint32_t outW, outH;
-    RenderSize(outW, outH);
-    LONG cw = LONG(outW), ch = LONG(outH);
-    const LONG maxW = (work.right - work.left) * 9 / 10, maxH = (work.bottom - work.top) * 9 / 10;
-    if (cw > maxW || ch > maxH)
+    // The swap chain is the chosen resolution (the game's image is centred in it with black
+    // bars when an aspect ratio is forced). Windowed: the client area starts at that size,
+    // shrunk (aspect kept) to fit the screen. Fullscreen: a borderless window over the
+    // primary display. Either way the swap chain stretches to the window.
+    const Settings& settings = GetSettings();
+    const uint32_t outW = settings.width, outH = settings.height;
+    if (settings.fullscreen)
     {
-        const double f = std::min(double(maxW) / cw, double(maxH) / ch);
-        cw = LONG(cw * f);
-        ch = LONG(ch * f);
+        const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+        g_p.window = CreateWindowExW(0, L"fm2", L"Forza Motorsport 2", WS_POPUP | WS_VISIBLE, 0, 0, sw, sh, nullptr, nullptr, wc.hInstance, nullptr);
     }
-    RECT r{ 0, 0, cw, ch };
-    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    g_p.window = CreateWindowW(L"fm2", L"Forza Motorsport 2", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
-        r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+    else
+    {
+        RECT work{};
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+        LONG cw = LONG(outW), ch = LONG(outH);
+        const LONG maxW = (work.right - work.left) * 9 / 10, maxH = (work.bottom - work.top) * 9 / 10;
+        if (cw > maxW || ch > maxH)
+        {
+            const double f = std::min(double(maxW) / cw, double(maxH) / ch);
+            cw = LONG(cw * f);
+            ch = LONG(ch * f);
+        }
+        RECT r{ 0, 0, cw, ch };
+        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+        g_p.window = CreateWindowW(L"fm2", L"Forza Motorsport 2", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
+            r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+    }
 
     ComPtr<IDXGIFactory4> factory;
     Check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2");
@@ -349,8 +350,34 @@ bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, I
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    // The image is the render size; with a forced aspect ratio it is smaller than the back
+    // buffer and goes in the middle, on black.
+    const D3D12_RESOURCE_DESC sd = src->GetDesc(), bd = backBuffer->GetDesc();
+    const UINT offsetX = UINT((bd.Width - std::min(sd.Width, bd.Width)) / 2), offsetY = (bd.Height - std::min(sd.Height, bd.Height)) / 2;
+    if (offsetX || offsetY)
+    {
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        list->ResourceBarrier(1, &b);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_p.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += SIZE_T(i) * g_p.rtvStride;
+        const float black[4] = { 0, 0, 0, 1 };
+        list->ClearRenderTargetView(rtv, black, 0, nullptr);
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
     list->ResourceBarrier(1, &b);
-    list->CopyResource(backBuffer, src);
+    if (!offsetX && !offsetY && sd.Width == bd.Width && sd.Height == bd.Height)
+        list->CopyResource(backBuffer, src);
+    else
+    {
+        D3D12_TEXTURE_COPY_LOCATION dst{}, from{};
+        dst.pResource = backBuffer;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        from.pResource = src;
+        from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        const D3D12_BOX box{ 0, 0, 0, UINT(std::min(sd.Width, bd.Width)), std::min(sd.Height, bd.Height), 1 };
+        list->CopyTextureRegion(&dst, offsetX, offsetY, 0, &from, &box);
+    }
     if (overlay)
     {
         D3D12_TEXTURE_COPY_LOCATION dst{}, from{};
@@ -358,8 +385,10 @@ bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, I
         dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         from.pResource = overlay;
         from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        list->CopyTextureRegion(&dst, 24, 24, 0, &from, nullptr);
+        list->CopyTextureRegion(&dst, offsetX + 24, offsetY + 24, 0, &from, nullptr);
     }
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
     list->ResourceBarrier(1, &b);
     return true;
@@ -367,6 +396,21 @@ bool PresenterRecordCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* src, I
 
 void PresenterPresent()
 {
+    // Vsync: wait for the display's refresh; off: present at once (tearing allowed).
     if (g_p.ready)
-        g_p.swapChain->Present(0, DXGI_PRESENT_ALLOW_TEARING);
+    {
+        if (GetSettings().vsync)
+            g_p.swapChain->Present(1, 0);
+        else
+            g_p.swapChain->Present(0, DXGI_PRESENT_ALLOW_TEARING);
+    }
+}
+
+uint32_t DisplayRefreshHz()
+{
+    DEVMODEW mode{};
+    mode.dmSize = sizeof(mode);
+    if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1)
+        return mode.dmDisplayFrequency;
+    return 60;
 }

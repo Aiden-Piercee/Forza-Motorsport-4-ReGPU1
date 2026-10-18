@@ -12,11 +12,13 @@
 #include "kernel/thread.h"
 #include "loader.h"
 #include "render/presenter.h"
+#include "settings.h"
 
 namespace
 {
 std::filesystem::path g_gameDir;
 std::filesystem::path g_userDir;
+std::filesystem::path g_contentDir;
 uint32_t g_tscFrequency = 0;
 
 // KeTimeStampBundle: InterruptTime (100 ns since boot), SystemTime
@@ -69,12 +71,34 @@ void RuntimeInit(const std::filesystem::path& gameDir)
     else
         g_userDir = g_gameDir.parent_path() / "user";
     std::filesystem::create_directories(g_userDir / "cache");
-    std::filesystem::create_directories(g_userDir / "content");
 
     g_tscFrequency = MeasureTsc();
     Log("runtime: TSC %.3f MHz, user data in %s", g_tscFrequency / 1e6, g_userDir.string().c_str());
 
     std::thread(TimeStampThread).detach();
+    // The test launcher (launcher.cpp): settings before the window, GPU and audio start.
+    bool RunLauncher();
+    if (!RunLauncher())
+    {
+        Log("runtime: quit from the launcher");
+        std::_Exit(0);
+    }
+    // Saves: one content folder per profile (profiles\<name>\content). Saves from before
+    // profiles existed (the old shared content folder) become the default "Player" profile's.
+    std::string folder;
+    for (char c : GetSettings().profile)
+        folder += strchr("<>:\"/\\|?*", c) || c < 32 ? '_' : c;
+    g_contentDir = g_userDir / "profiles" / folder / "content";
+    std::error_code ec;
+    const auto legacy = g_userDir / "content";
+    if (GetSettings().profile == "Player" && !std::filesystem::exists(g_contentDir, ec) && std::filesystem::exists(legacy, ec))
+    {
+        std::filesystem::create_directories(g_contentDir.parent_path(), ec);
+        std::filesystem::rename(legacy, g_contentDir, ec);
+        Log("runtime: moved saves to the Player profile (%s)", ec ? ec.message().c_str() : "ok");
+    }
+    std::filesystem::create_directories(g_contentDir, ec);
+    Log("runtime: profile %s, saves in %s", GetSettings().profile.c_str(), g_contentDir.string().c_str());
     PresenterInit();
     GpuInit();
     AudioInit();
@@ -82,6 +106,7 @@ void RuntimeInit(const std::filesystem::path& gameDir)
 
 const std::filesystem::path& GameDir() { return g_gameDir; }
 const std::filesystem::path& UserDir() { return g_userDir; }
+const std::filesystem::path& ContentDir() { return g_contentDir; }
 uint32_t TscFrequency() { return g_tscFrequency; }
 
 void CompleteOverlapped(uint32_t overlapped, uint32_t result, uint32_t extendedError, uint32_t length)

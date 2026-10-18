@@ -61,11 +61,25 @@ The minimum column has not been tested yet.
 ## Status
 
 The game boots, plays its intro, and runs the menus, race setup and races natively at
-60 fps at up to 4K, and experimentally on ultrawide displays (`FM2_RESOLUTION`), with car and track
+up to 360 fps (menus included) and up to 4K, and experimentally on ultrawide displays, with car and track
 rendering, shadows, HDR resolves and the HUD, and full 5.1
 audio: the game's sound engine (FMOD) mixes into our render driver, which plays through
-XAudio2, and its XMA sound data is decoded with FFmpeg's XMA decoder. Higher frame rates
-are planned (see the scope document).
+XAudio2, and its XMA sound data is decoded with FFmpeg's XMA decoder. Game time follows
+the clock, so the game runs at real speed at any frame rate. Races are currently limited
+by the renderer's CPU time (around 75 fps on a fast desktop CPU); menus reach the cap.
+
+Saves work: the signed-in gamer profile is the profile name from the launcher (`Player`
+by default), and its saves live in `Documents\fm2\profiles\<name>\content`.
+
+## Launcher and settings
+
+A small launcher opens before the game with the player settings: profile name,
+resolution, aspect ratio (Auto, 16:9, 21:9, 32:9; the image gets black bars when it
+differs from the resolution), windowed or borderless fullscreen, VSync, and max FPS
+(30-360). Play saves them to `Documents\fm2\settings.ini`. With VSync on, the cap
+is also the display's refresh rate. `FM2_NO_LAUNCHER=1` skips the launcher and uses the
+saved settings; these variables override the file for one run: `FM2_PROFILE`,
+`FM2_RESOLUTION`, `FM2_RENDER_SCALE`, `FM2_MAX_FPS`, `FM2_VSYNC`, `FM2_FULLSCREEN`.
 
 ## Building
 
@@ -106,7 +120,7 @@ code (`out/ppc`, ~131 MB) is generated from your own copy and never committed.
 | `FM2_AUTOSTART=1` | Tap Start + A every 3 s |
 | `FM2_DUMP_SHADERS=1` | Save every distinct shader's microcode to `Documents/fm2/shaders` |
 | `FM2_DUMP_FRAME=<n>` | Write the n-th rendered frame to `frame.png` |
-| `FM2_RESOLUTION=<w>x<h>` | Render at that size, any aspect (e.g. `3440x1440`). Wider than 16:9 is **experimental**: the 3D view widens (Hor+), the HUD and menus keep 16:9 proportions in the centre, but some objects at the sides still pop in (game-side culling) |
+| `FM2_RESOLUTION=<w>x<h>` | Override the launcher resolution: render at that size, any aspect (e.g. `3440x1440`). Wider than 16:9 is **experimental**: the 3D view widens (Hor+), the HUD and menus keep 16:9 proportions in the centre, but some objects at the sides still pop in (game-side culling) |
 | `FM2_WIDE_FOV=<0-100>` | Ultrawide only: how far the view widens (100 full Hor+, 0 the 16:9 view zoomed to fill) |
 | `FM2_RENDER_SCALE=<1-4>` | Render at that multiple of 1280x720 (2 = 2560x1440, 3 = 3840x2160) |
 | `FM2_DUMP_AUDIO=<file.wav>` | Write everything the game plays (6-channel float, 48 kHz) to a WAV file |

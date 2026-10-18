@@ -3,6 +3,7 @@
 // (memory writes, fences, interrupts, waits) and skips everything that would
 // draw. Vblank interrupts run at 60 Hz. Phase 2 replaces drawing with a
 // native renderer hooked at the D3D level.
+#include <algorithm>
 #include <atomic>
 #include <map>
 #include <deque>
@@ -12,6 +13,8 @@
 #include <intrin.h>
 #include <windows.h>
 
+#include "render/presenter.h"
+#include "settings.h"
 #include "kernel/imports.h"
 #include "kernel/thread.h"
 #include "gpu/regs.h"
@@ -701,13 +704,36 @@ void CommandProcessorLoop(PPCContext& ctx)
     }
 }
 
+// Frames per second the game may present: max FPS, or the display's refresh rate if lower
+// and vsync is on.
+uint32_t FrameCap()
+{
+    static const uint32_t cap = [] {
+        const Settings& s = GetSettings();
+        uint32_t c = s.maxFps;
+        if (s.vsync)
+            c = std::min(c, DisplayRefreshHz());
+        Log("gpu: frame cap %u fps (max %u, vsync %s)", c, s.maxFps, s.vsync ? "on" : "off");
+        return std::max(c, 30u);
+    }();
+    return cap;
+}
+
 void VblankLoop()
 {
     SetThreadDescription(GetCurrentThread(), L"gpu vblank");
     auto next = Clock::now();
     for (;;)
     {
-        next += std::chrono::microseconds(16667);
+        // The title presents on vblanks: every one in races, every second one in menus. It
+        // keeps game time by the clock, not by frames, so vblanks run at twice the frame cap
+        // (120-720 Hz) and the limiter in VdSwap sets the frame rate for both.
+        static const int64_t periodUs = [] {
+            const char* v = getenv("FM2_VBLANK_HZ");
+            const int hz = v ? std::clamp(atoi(v), 30, 1000) : std::clamp(int(FrameCap()) * 2, 120, 720);
+            return int64_t(1000000 / hz);
+        }();
+        next += std::chrono::microseconds(periodUs);
         std::this_thread::sleep_until(next);
         RaiseInterrupt(0, 2);
     }
@@ -909,5 +935,17 @@ GUEST_EXPORT(VdSwap)
     }
     if (n == 1 || (n & (n - 1)) == 0 || n % 60 == 0)
         Log("gpu: VdSwap #%llu", (unsigned long long)n);
+    // Frame limiter (settings: max FPS, the display's refresh with vsync): the title's render
+    // thread waits for its next frame slot. Vblanks run faster than the cap, so menus (which
+    // present every second vblank) and races (every vblank) both reach it.
+    static const int64_t minFrameUs = int64_t(1000000 / FrameCap());
+    if (minFrameUs)
+    {
+        static auto next = Clock::now();
+        const auto now = Clock::now();
+        if (next > now)
+            std::this_thread::sleep_until(next);
+        next = std::max(next, now) + std::chrono::microseconds(minFrameUs);
+    }
     Return(ctx, 0);
 }

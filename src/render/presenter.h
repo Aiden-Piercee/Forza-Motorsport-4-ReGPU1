@@ -4,9 +4,12 @@
 
 // Window + D3D12 swap chain (FM2_HEADLESS=1 disables it).
 void PresenterInit();
-// The output size everything renders at (FM2_RESOLUTION or FM2_RENDER_SCALE); the swap
-// chain is that size and stretches to the window.
+// The size the game renders at (settings.h: resolution and forced aspect ratio). The swap
+// chain is the resolution; the image is centred in it and the swap chain stretches to the
+// window.
 void RenderSize(uint32_t& width, uint32_t& height);
+// The primary display's refresh rate (the frame cap with vsync on).
+uint32_t DisplayRefreshHz();
 // Called from VdSwap: the guest finished a frame.
 void PresenterSubmitFrame(uint64_t frame);
 // Shows a CPU-side RGBA8 image (scaled 1:1 into the 1280x720 back buffer).
