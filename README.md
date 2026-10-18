@@ -61,7 +61,7 @@ The minimum column has not been tested yet.
 ## Status
 
 The game boots, plays its intro, and runs the menus, race setup and races natively at
-60 fps at up to 4K and on ultrawide displays (`FM2_RESOLUTION`), with car and track
+60 fps at up to 4K, and experimentally on ultrawide displays (`FM2_RESOLUTION`), with car and track
 rendering, shadows, HDR resolves and the HUD, and full 5.1
 audio: the game's sound engine (FMOD) mixes into our render driver, which plays through
 XAudio2, and its XMA sound data is decoded with FFmpeg's XMA decoder. Higher frame rates
@@ -106,7 +106,8 @@ code (`out/ppc`, ~131 MB) is generated from your own copy and never committed.
 | `FM2_AUTOSTART=1` | Tap Start + A every 3 s |
 | `FM2_DUMP_SHADERS=1` | Save every distinct shader's microcode to `Documents/fm2/shaders` |
 | `FM2_DUMP_FRAME=<n>` | Write the n-th rendered frame to `frame.png` |
-| `FM2_RESOLUTION=<w>x<h>` | Render at that size, any aspect (e.g. `3440x1440`): the 3D view widens (Hor+), the HUD and menus keep 16:9 proportions in the centre |
+| `FM2_RESOLUTION=<w>x<h>` | Render at that size, any aspect (e.g. `3440x1440`). Wider than 16:9 is **experimental**: the 3D view widens (Hor+), the HUD and menus keep 16:9 proportions in the centre, but some objects at the sides still pop in (game-side culling) |
+| `FM2_WIDE_FOV=<0-100>` | Ultrawide only: how far the view widens (100 full Hor+, 0 the 16:9 view zoomed to fill) |
 | `FM2_RENDER_SCALE=<1-4>` | Render at that multiple of 1280x720 (2 = 2560x1440, 3 = 3840x2160) |
 | `FM2_DUMP_AUDIO=<file.wav>` | Write everything the game plays (6-channel float, 48 kHz) to a WAV file |
 | `FM2_TRACE_DRAWS=<n>` | Log every draw, skip, resolve, PM4 packet and texture upload of frame n |

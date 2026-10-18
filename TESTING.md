@@ -44,6 +44,8 @@ The keyboard only works while the game window has focus.
   the console.
 - Face culling is off (only a performance cost).
 - The game runs at 60 fps; higher refresh rates are not supported yet.
+- Ultrawide (`FM2_RESOLUTION` wider than 16:9) is experimental: some objects at the
+  sides of the screen still pop in late, and the HUD stays in the centre 16:9 area.
 - Looping sounds restart at the start of the 2 KB packet holding the loop point, not
   the exact sample: listen for clicks or stutters in engine and ambient loops.
 

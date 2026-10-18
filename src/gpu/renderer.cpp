@@ -51,6 +51,7 @@ using Microsoft::WRL::ComPtr;
 
 
 void LogAllHostThreadStacks(const char* why); // hang.cpp
+extern std::atomic<bool> g_cameraAspectWidened; // hooks/camera_aspect.cpp
 namespace
 {
 constexpr UINT kWidth = 1280, kHeight = 720;
@@ -81,6 +82,20 @@ LONG HostY(LONG v) { return LONG(std::lround(double(v) * ScaleY())); }
 D3D12_RECT ToHost(const D3D12_RECT& r)
 {
     return { HostX(r.left), HostY(r.top), HostX(r.right), HostY(r.bottom) };
+}
+
+// Wider than 16:9: the output is `wide` times as wide as 16:9 for its height. The view
+// extends horizontally by `extent` (1 + (wide - 1) x FM2_WIDE_FOV%): 100 is full Hor+ (the
+// most side view, but rectilinear stretch at the edges grows with FM2's wide camera); 0
+// keeps the 16:9 horizontal view and zooms in vertically instead.
+float OutputWide() { return float(OutputWidth()) * kHeight / (float(OutputHeight()) * kWidth); }
+float ViewExtent()
+{
+    static const float widePercent = [] {
+        const char* v = getenv("FM2_WIDE_FOV");
+        return v ? std::clamp(float(atof(v)), 0.0f, 100.0f) : 100.0f;
+    }();
+    return 1.0f + (std::max(OutputWide(), 1.0f) - 1.0f) * widePercent / 100.0f;
 }
 constexpr UINT kFrames = 3;
 constexpr UINT64 kRingSize = 64ull << 20;
@@ -3396,18 +3411,15 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         vc->vf[k][0] = uint32_t(dataOffset);
         vc->vf[k][1] = d1 & 3;
     }
-    // Wider than 16:9: the screen is `wide` times as wide as 16:9 for its height. The view
-    // extends horizontally by `extent` (1 + (wide - 1) x FM2_WIDE_FOV%): 100 is full Hor+ (the
-    // most side view, but rectilinear stretch at the edges grows fast with FM2's wide camera);
-    // 0 keeps the 16:9 horizontal view and zooms in vertically instead.
+    // Perspective geometry in a wide pass (see ViewExtent): the game's camera already projects
+    // at the wider aspect once hooks/camera_aspect.cpp widened it, so only the vertical zoom
+    // for FM2_WIDE_FOV < 100 remains; otherwise the view is narrowed here (Hor+ without the
+    // game's culling knowing).
     {
-        static const float widePercent = [] {
-            const char* v = getenv("FM2_WIDE_FOV");
-            return v ? std::clamp(float(atof(v)), 0.0f, 100.0f) : 100.0f;
-        }();
-        const float wide = WidePass() ? ScaleWide() / ScaleY() : 1.0f;
-        const float extent = 1.0f + (wide - 1.0f) * widePercent / 100.0f;
-        vc->vwide[0] = 1.0f / extent;
+        const float wide = WidePass() ? OutputWide() : 1.0f;
+        const float extent = WidePass() ? ViewExtent() : 1.0f;
+        const bool gameWidened = g_cameraAspectWidened.load(std::memory_order_relaxed);
+        vc->vwide[0] = gameWidened ? 1.0f : 1.0f / extent;
         vc->vwide[1] = wide / extent;
         static const bool noSqueeze = getenv("FM2_NO_HUD_SQUEEZE") != nullptr; // A/B: 2D stretched with the view
         vc->vwide[2] = noSqueeze ? 1.0f : 1.0f / wide;
@@ -3927,6 +3939,8 @@ void PrecompileAll()
 
 void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
 {
+    void MemScanOnSwap(uint64_t frame);
+    MemScanOnSwap(g_r.frame);
     if (!g_r.ok)
         return;
     PrecompileAll();
@@ -4160,4 +4174,11 @@ bool RendererTracing()
 {
     static const uint64_t traceFrame = getenv("FM2_TRACE_DRAWS") ? strtoull(getenv("FM2_TRACE_DRAWS"), nullptr, 10) : 0;
     return traceFrame && g_r.frame + 1 == traceFrame;
+}
+
+// The camera aspect the game is given (hooks/camera_aspect.cpp): 16/9 widened by the view
+// extent, so its projection and frustum culling cover the wider view.
+float GameAspect()
+{
+    return 16.0f / 9.0f * ViewExtent();
 }
