@@ -30,6 +30,8 @@ const char* TextureFormatName(uint32_t format);
 
 // Decodes mip 0 of a 2D texture to RGBA8 (row-major, width*height*4).
 bool DecodeTexture(const TextureFetch& fetch, std::vector<uint8_t>& rgba);
+// The same from texture data outside guest memory (e.g. an .xds file after its header).
+bool DecodeTexture(const TextureFetch& fetch, const uint8_t* source, std::vector<uint8_t>& rgba);
 
 // Bytes between the faces of a cube texture (each face is a padded 2D slice).
 uint32_t TextureFaceStride(const TextureFetch& fetch);

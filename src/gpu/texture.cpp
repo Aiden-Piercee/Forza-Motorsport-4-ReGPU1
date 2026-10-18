@@ -265,6 +265,11 @@ const char* TextureFormatName(uint32_t format)
 
 bool DecodeTexture(const TextureFetch& fetch, std::vector<uint8_t>& rgba)
 {
+    return DecodeTexture(fetch, GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address())), rgba);
+}
+
+bool DecodeTexture(const TextureFetch& fetch, const uint8_t* source, std::vector<uint8_t>& rgba)
+{
     FormatInfo info;
     if (fetch.Type() != 2 || !Info(fetch.Format(), info))
         return false;
@@ -278,7 +283,6 @@ bool DecodeTexture(const TextureFetch& fetch, std::vector<uint8_t>& rgba)
     uint32_t pitchBlocks = std::max(fetch.Pitch() / info.blockSize, blocksX);
     if (fetch.Tiled())
         pitchBlocks = (pitchBlocks + 31) & ~31u;
-    const uint8_t* source = GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address()));
 
     rgba.assign(size_t(width) * height * 4, 0);
     uint8_t block[32];

@@ -43,6 +43,7 @@
 #include "render/presenter.h"
 #include "gpu/renderer.h"
 #include "gpu/shader_scan.h"
+#include "gpu/boot_screen.h"
 #include "gpu/static_shaders.h"
 
 using Microsoft::WRL::ComPtr;
@@ -2632,6 +2633,79 @@ void HoldPresent()
 }
 }
 
+// Puts a full 1280x720 RGBA8 frame (the swap chain size) on screen: the first-boot screen,
+// shown before the game has drawn anything that HoldPresent could repeat.
+void BootPresent(const std::vector<uint8_t>& rgba)
+{
+    constexpr uint32_t w = 1280, h = 720;
+    static ComPtr<ID3D12Resource> texture, upload;
+    static uint8_t* uploadCpu = nullptr;
+    if (!g_r.device || rgba.size() != size_t(w) * h * 4)
+        return;
+    if (!g_hold.list)
+    {
+        if (FAILED(g_r.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_hold.allocator))) ||
+            FAILED(g_r.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_hold.allocator.Get(), nullptr, IID_PPV_ARGS(&g_hold.list))))
+            return;
+        g_hold.list->Close();
+        const UINT64 bytes = UINT64((kOverlayW * 4 + 255) & ~255u) * kOverlayH + 1024;
+        g_hold.upload = CreateBuffer(bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* mapped = nullptr;
+        g_hold.upload->Map(0, nullptr, &mapped);
+        g_hold.uploadCpu = static_cast<uint8_t*>(mapped);
+    }
+    if (!texture)
+    {
+        D3D12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = w;
+        desc.Height = h;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        if (FAILED(g_r.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture))))
+            return;
+        upload = CreateBuffer(UINT64(w) * 4 * h, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* mapped = nullptr;
+        upload->Map(0, nullptr, &mapped);
+        uploadCpu = static_cast<uint8_t*>(mapped);
+    }
+    memcpy(uploadCpu, rgba.data(), rgba.size()); // the row pitch (5120) is already 256-aligned
+    g_hold.allocator->Reset();
+    g_hold.list->Reset(g_hold.allocator.Get(), nullptr);
+    D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+    dst.pResource = texture.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.pResource = upload.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1, w * 4 };
+    g_hold.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = texture.Get();
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    g_hold.list->ResourceBarrier(1, &b);
+    const bool ok = PresenterRecordCopy(g_hold.list.Get(), texture.Get());
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    g_hold.list->ResourceBarrier(1, &b);
+    g_hold.list->Close();
+    if (!ok)
+        return;
+    ID3D12CommandList* lists[] = { g_hold.list.Get() };
+    g_r.queue->ExecuteCommandLists(1, lists);
+    PresenterPresent();
+    const UINT64 value = g_r.nextFence++;
+    g_r.queue->Signal(g_r.fence.Get(), value);
+    if (g_r.fence->GetCompletedValue() < value)
+    {
+        g_r.fence->SetEventOnCompletion(value, g_r.fenceEvent);
+        WaitForSingleObject(g_r.fenceEvent, 500);
+    }
+}
+
 void RendererPredictBegin()
 {
     PredictBeginImpl();
@@ -3362,6 +3436,10 @@ void PrecompileAll()
     const auto staticStart = std::chrono::steady_clock::now();
     size_t queued = 0;
     std::vector<const CompiledShader*> compiling;
+    // The first boot's search of the game files takes a few seconds: say so on screen.
+    std::vector<uint8_t> bootFrame;
+    if (!std::filesystem::exists(UserDir() / "static_shaders.bin") && BootScreenCompose(L"PREPARING SHADERS", 0, 0, bootFrame))
+        BootPresent(bootFrame);
     for (const ScannedShader& s : StaticShaders())
     {
         const uint64_t hash = Fnv(s.code.data(), s.code.size() * 4) ^ (s.pixel ? 1 : 0);
@@ -3407,8 +3485,13 @@ void PrecompileAll()
             lastShown = now;
             g_stats.staticDone = uint32_t(std::count_if(compiling.begin(), compiling.end(),
                 [](const CompiledShader* cs) { return cs->state.load() != CompiledShader::Pending; }));
-            g_hold.active = true;
-            HoldPresent();
+            if (BootScreenCompose(L"COMPILING SHADERS", g_stats.staticDone.load(), g_stats.staticTotal.load(), bootFrame))
+                BootPresent(bootFrame);
+            else
+            {
+                g_hold.active = true;
+                HoldPresent();
+            }
         }
         Sleep(5);
     }

@@ -31,6 +31,12 @@ int main(int argc, char** argv)
         }
     }
     RuntimeInit(gameDir);
+    if (getenv("FM2_BOOTSCREEN_PREVIEW"))
+    {
+        void BootScreenPreview();
+        BootScreenPreview();
+        return 0;
+    }
     ThreadSystemInit(g_title.tlsTemplate, g_title.tlsDataSize, g_title.tlsSlotCount);
 
     void StartThreadProfiler();
