@@ -43,6 +43,7 @@
 #include "render/presenter.h"
 #include "gpu/renderer.h"
 #include "gpu/shader_scan.h"
+#include "gpu/static_shaders.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -788,6 +789,7 @@ struct CompileStats
     std::atomic<uint32_t> shadersBuilt{ 0 }, shadersCached{ 0 }, pipelinesBuilt{ 0 }, pipelinesLoaded{ 0 };
     std::atomic<uint64_t> lastColdMs{ 0 };  // steady-clock ms of the last real compile
     std::atomic<uint32_t> warmTotal{ 0 }, warmDone{ 0 };
+    std::atomic<uint32_t> staticDone{ 0 }, staticTotal{ 0 }; // first boot: static shaders compiled / to compile
     std::mutex mutex;
     std::string current;                    // what the oldest in-flight job is
     std::chrono::steady_clock::time_point currentSince;
@@ -890,27 +892,53 @@ struct ShaderCompiler
     std::mutex mutex;
     std::condition_variable cv;
     std::deque<CompiledShader*> queue;
+    std::deque<CompiledShader*> background; // static shaders: compiled when nothing urgent waits
     std::vector<std::thread> workers;
-    std::atomic<int> jobs{ 0 }; // queued or compiling
+    std::atomic<int> jobs{ 0 };   // urgent, queued or compiling (holds wait for these)
+    std::atomic<int> waiting{ 0 }; // background, queued
 
     void Start()
     {
         std::filesystem::create_directories(UserDir() / "shadercache");
-        const unsigned n = std::max(2u, std::thread::hardware_concurrency() / 2);
+        // All but one core: the first boot compiles the whole game behind the overlay.
+        const unsigned n = std::max(2u, std::thread::hardware_concurrency() - 1);
         for (unsigned i = 0; i < n; i++)
             workers.emplace_back([this] { Run(); });
         for (auto& w : workers)
             w.detach();
     }
 
-    void Push(CompiledShader* cs)
+    void Push(CompiledShader* cs, bool later = false)
     {
-        jobs++;
         {
             std::lock_guard lock(mutex);
-            queue.push_back(cs);
+            if (later)
+            {
+                waiting++;
+                background.push_back(cs);
+            }
+            else
+            {
+                jobs++;
+                queue.push_back(cs);
+            }
         }
         cv.notify_one();
+    }
+
+    // Moves a background shader something now needs to the front of the urgent queue.
+    void Promote(const CompiledShader& cs)
+    {
+        if (cs.state.load(std::memory_order_relaxed) != CompiledShader::Pending || !waiting.load(std::memory_order_relaxed))
+            return;
+        std::lock_guard lock(mutex);
+        if (auto it = std::find(background.begin(), background.end(), &cs); it != background.end())
+        {
+            background.erase(it);
+            waiting--;
+            jobs++;
+            queue.push_front(const_cast<CompiledShader*>(&cs));
+        }
     }
 
     void Run()
@@ -919,18 +947,28 @@ struct ShaderCompiler
         for (;;)
         {
             CompiledShader* cs;
+            bool urgent;
             {
                 std::unique_lock lock(mutex);
-                cv.wait(lock, [this] { return !queue.empty(); });
-                cs = queue.front();
-                queue.pop_front();
+                cv.wait(lock, [this] { return !queue.empty() || !background.empty(); });
+                urgent = !queue.empty();
+                auto& from = urgent ? queue : background;
+                cs = from.front();
+                from.pop_front();
+                if (!urgent)
+                    waiting--;
             }
-            char label[64];
-            snprintf(label, sizeof(label), "%s %08llx", cs->pixel ? "pixel shader" : "vertex shader", (unsigned long long)(cs->hash >> 32));
-            g_stats.Begin(label);
-            Compile(*cs);
-            g_stats.End(true);
-            jobs--;
+            if (urgent)
+            {
+                char label[64];
+                snprintf(label, sizeof(label), "%s %08llx", cs->pixel ? "pixel shader" : "vertex shader", (unsigned long long)(cs->hash >> 32));
+                g_stats.Begin(label);
+                Compile(*cs);
+                g_stats.End(true);
+                jobs--;
+            }
+            else
+                Compile(*cs);
         }
     }
 
@@ -959,11 +997,16 @@ struct ShaderCompiler
     }
 } g_compiler;
 
-const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel)
+// background: queued behind everything a draw needs (the static shader set).
+const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel, bool background = false)
 {
     auto it = g_r.shaders.find(hash);
     if (it != g_r.shaders.end())
+    {
+        if (!background)
+            g_compiler.Promote(*it->second);
         return *it->second;
+    }
     static std::once_flag started;
     std::call_once(started, [] { g_compiler.Start(); });
     auto& slot = g_r.shaders[hash];
@@ -1051,7 +1094,7 @@ const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& code
             return cs;
         }
     }
-    g_compiler.Push(&cs);
+    g_compiler.Push(&cs, background);
     return cs;
 }
 
@@ -2137,11 +2180,11 @@ bool AdvanceLookahead(double budgetMs)
             const CompiledShader* vs = nullptr;
             const CompiledShader* ps = nullptr;
             if (auto f = g_r.shaders.find(it.key.vs); f != g_r.shaders.end())
-                vs = f->second.get();
+                g_compiler.Promote(*(vs = f->second.get()));
             else
                 vs = it.vsCode ? &GetShader(it.key.vs, *it.vsCode, false) : nullptr;
             if (auto f = g_r.shaders.find(it.key.ps); f != g_r.shaders.end())
-                ps = f->second.get();
+                g_compiler.Promote(*(ps = f->second.get()));
             else
                 ps = it.psCode ? &GetShader(it.key.ps, *it.psCode, true) : nullptr;
             if (!vs || !ps)
@@ -2200,7 +2243,9 @@ void DrainScan(double budgetMs)
         {
             const uint64_t hash = Fnv(s.code.data(), s.code.size() * 4) ^ (s.pixel ? 1 : 0);
             g_scanKnown.insert(hash);
-            GetShader(hash, s.code, s.pixel);
+            // Speculative (and partly stale memory): compiled when nothing urgent waits,
+            // promoted if a draw turns out to need it.
+            GetShader(hash, s.code, s.pixel, true);
         }
         if (budgetMs > 0 && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > budgetMs)
             return;
@@ -2372,6 +2417,11 @@ bool OverlayWanted(std::vector<std::string>& lines)
     if (g_stats.warmTotal.load())
     {
         snprintf(l, sizeof(l), "Warm-up    %u / %u pipelines", std::min(g_stats.warmDone.load(), g_stats.warmTotal.load()), g_stats.warmTotal.load());
+        lines.push_back(l);
+    }
+    if (g_stats.staticTotal.load())
+    {
+        snprintf(l, sizeof(l), "First boot %u / %u game shaders compiled", std::min(g_stats.staticDone.load(), g_stats.staticTotal.load()), g_stats.staticTotal.load());
         lines.push_back(l);
     }
     return true;
@@ -2587,6 +2637,7 @@ void RendererPredictBegin()
 
 void RendererPredictShader(uint32_t type, const uint32_t* microcodeBE, uint32_t dwords)
 {
+    dwords = ucode::UsedDwords(microcodeBE, dwords);
     const uint64_t hash = Fnv(microcodeBE, dwords * 4) ^ type;
     if (type == 0)
     {
@@ -2622,7 +2673,7 @@ void RendererPredictDraw(uint32_t initiator)
 bool RendererCompileIdle()
 {
     const uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-    const bool warming = g_stats.warmTotal.load() && g_stats.warmDone.load() < g_stats.warmTotal.load();
+    const bool warming = (g_stats.warmTotal.load() && g_stats.warmDone.load() < g_stats.warmTotal.load()) || g_stats.staticTotal.load();
     return g_stats.busy.load() == 0 && !warming && nowMs - g_stats.lastColdMs.load() > 2000;
 }
 
@@ -2634,7 +2685,7 @@ void RendererSaveCaches()
 void RendererOnShaderLoad(uint32_t type, const uint32_t* microcodeBE, uint32_t dwords)
 {
     std::vector<uint32_t>& code = type == 0 ? g_r.vsCode : g_r.psCode;
-    code.assign(microcodeBE, microcodeBE + dwords);
+    code.assign(microcodeBE, microcodeBE + ucode::UsedDwords(microcodeBE, dwords));
     (type == 0 ? g_r.vsHash : g_r.psHash) = Fnv(code.data(), code.size() * 4) ^ type;
 }
 
@@ -3294,8 +3345,65 @@ void PrecompileAll()
         Sleep(1);
     }
     g_hold.active = false;
+    // A warm start never has a long loading hold, so without this settled skipping
+    // never arms and each first-time effect in a race stalls for its compile.
+    if (!keys.empty())
+        g_lastLongHold = std::chrono::steady_clock::now();
     Log("precompile: done in %.1f s (%zu shaders loaded, %zu pipelines started)",
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), shadersInstalled, pipelinesStarted);
+
+    // Every shader in the game data goes to the compile queue as well. Compiles run on
+    // the background workers and the game doesn't wait for them; cached bytecode loads
+    // straight away, so only the first boot pays (FM2_NO_STATIC_SHADERS=1 skips this).
+    if (getenv("FM2_NO_STATIC_SHADERS"))
+        return;
+    const auto staticStart = std::chrono::steady_clock::now();
+    size_t queued = 0;
+    std::vector<const CompiledShader*> compiling;
+    for (const ScannedShader& s : StaticShaders())
+    {
+        const uint64_t hash = Fnv(s.code.data(), s.code.size() * 4) ^ (s.pixel ? 1 : 0);
+        if (g_r.shaders.count(hash))
+            continue;
+        g_scanKnown.insert(hash);
+        const CompiledShader& cs = GetShader(hash, s.code, s.pixel, true);
+        if (cs.state.load() == CompiledShader::Pending)
+            compiling.push_back(&cs);
+        queued++;
+    }
+    // Compiling them while the game runs halves the frame rate for minutes, so the first
+    // boot waits here with the overlay up; later boots find the bytecode cached and
+    // queue nothing.
+    const int toCompile = int(compiling.size());
+    Log("static shaders: %zu new, %d to compile (prepared in %.1f s)", queued, toCompile,
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - staticStart).count());
+    if (!toCompile)
+        return;
+    g_stats.staticTotal = uint32_t(toCompile);
+    g_stats.staticDone = 0;
+    const auto compileStart = std::chrono::steady_clock::now();
+    auto lastShown = std::chrono::steady_clock::time_point{};
+    for (size_t next = 0;;)
+    {
+        while (next < compiling.size() && compiling[next]->state.load() != CompiledShader::Pending)
+            next++;
+        if (next == compiling.size())
+            break;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastShown > std::chrono::milliseconds(100))
+        {
+            lastShown = now;
+            g_stats.staticDone = uint32_t(std::count_if(compiling.begin(), compiling.end(),
+                [](const CompiledShader* cs) { return cs->state.load() != CompiledShader::Pending; }));
+            g_hold.active = true;
+            HoldPresent();
+        }
+        Sleep(5);
+    }
+    g_hold.active = false;
+    g_stats.staticTotal = 0;
+    g_lastLongHold = std::chrono::steady_clock::now();
+    Log("static shaders: %d compiled in %.1f s", toCompile, std::chrono::duration<double>(std::chrono::steady_clock::now() - compileStart).count());
 }
 
 void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)

@@ -13,6 +13,7 @@
 #include <unordered_set>
 
 #include "gpu/regs.h"
+#include "gpu/ucode.h"
 #include "gpu/renderer.h"
 #include "gpu/texture.h"
 #include "kernel/runtime.h"
@@ -120,6 +121,7 @@ void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dw
     if (!dwords || dwords > 0x10000)
         return;
     RendererOnShaderLoad(uint32_t(type), microcodeBE, dwords);
+    dwords = ucode::UsedDwords(microcodeBE, dwords);
     const uint64_t hash = Fnv1a(microcodeBE, dwords) ^ uint64_t(type);
     if (!g_shaders.insert(hash).second)
         return;

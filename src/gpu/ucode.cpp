@@ -101,6 +101,22 @@ bool Cf::IsEnd() const
     return op() == CfOp::ExecEnd || op() == CfOp::CondExecEnd || op() == CfOp::CondExecPredEnd || op() == CfOp::CondExecPredCleanEnd;
 }
 
+uint32_t UsedDwords(const uint32_t* microcodeBE, uint32_t dwords)
+{
+    const Shader s = Parse(microcodeBE, dwords, false);
+    if (!s.valid)
+        return dwords;
+    uint32_t slots = 0;
+    for (const Cf& cf : s.cf)
+    {
+        if (cf.op() == CfOp::CondCall || cf.op() == CfOp::CondJmp || cf.op() == CfOp::Return)
+            return dwords;
+        if (cf.IsExec() && cf.count())
+            slots = std::max(slots, cf.address() + cf.count());
+    }
+    return slots && slots * 3 <= dwords ? slots * 3 : dwords;
+}
+
 const char* VectorOpName(uint32_t op) { return kVectorOps[op & 31]; }
 const char* ScalarOpName(uint32_t op) { return kScalarOps[op & 63]; }
 

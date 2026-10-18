@@ -61,16 +61,17 @@ void ScanRange(uint32_t begin, uint32_t end, std::vector<ScannedShader>& out)
         if (i + 3 + size > count)
             continue;
         const uint32_t* code = &words[i + 3];
-        const uint64_t hash = Fnv(code, size) ^ type;
+        const uint32_t used = ucode::UsedDwords(code, size);
+        const uint64_t hash = Fnv(code, used) ^ type;
         {
             std::lock_guard lock(g_mutex);
             if (!g_seen.insert(hash).second)
                 continue;
         }
-        const ucode::Shader parsed = ucode::Parse(code, size, type == 1);
+        const ucode::Shader parsed = ucode::Parse(code, used, type == 1);
         if (!parsed.valid)
             continue;
-        out.push_back({ type == 1, std::vector<uint32_t>(code, code + size) });
+        out.push_back({ type == 1, std::vector<uint32_t>(code, code + used) });
     }
 }
 }

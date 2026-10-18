@@ -94,6 +94,10 @@ struct Shader
 };
 
 Shader Parse(const uint32_t* microcodeBE, uint32_t dwords, bool pixel);
+// Dwords up to the last instruction slot the program uses. Loaded shaders carry a
+// per-load stamp after that, so hashes cover only this much. Returns dwords when the
+// control flow has calls or jumps or doesn't parse.
+uint32_t UsedDwords(const uint32_t* microcodeBE, uint32_t dwords);
 Alu DecodeAlu(const uint32_t* words);
 Fetch DecodeFetch(const uint32_t* words);
 std::string Disassemble(const Shader& shader);
