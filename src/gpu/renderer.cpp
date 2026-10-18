@@ -277,8 +277,10 @@ struct Renderer
 
     std::unordered_map<uint64_t, std::unique_ptr<CompiledShader>> shaders;
     std::unordered_map<PipelineKey, std::shared_ptr<PipelineEntry>, PipelineKeyHash> pipelines;
-    std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, CachedTexture> textures;
-    std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, CachedTexture> cubes;
+    // Keyed by address, format, width and height (TextureKey): looked up for every bound
+    // texture of every draw.
+    std::unordered_map<uint64_t, CachedTexture> textures;
+    std::unordered_map<uint64_t, CachedTexture> cubes;
     std::unordered_map<uint32_t, CachedTexture> mipChains; // resolved textures with their mips, by base
     // Bindless texture descriptors.
     struct BindlessEntry
@@ -351,6 +353,26 @@ void CountCreate(const char* what)
 }
 
 const bool g_dumpHlsl = getenv("FM2_DUMP_HLSL") != nullptr;
+
+// The last draw state set on the command list: draws skip setting what has not changed
+// (each D3D12 call costs driver time, and most draws share their neighbours' state).
+// Invalidated wherever the list is reset or the root signature changes.
+struct DrawState
+{
+    D3D12_VIEWPORT viewport{ -1, -1, -1, -1, -1, -1 };
+    D3D12_RECT scissor{ -1, -1, -1, -1 };
+    uint32_t stencilRef = ~0u;
+    float blendFactor[4] = { -1, -1, -1, -1 };
+    ID3D12PipelineState* pso = nullptr;
+    D3D12_GPU_DESCRIPTOR_HANDLE table2{}, table3{};
+    void Invalidate() { *this = DrawState{}; }
+} g_drawState;
+
+// Texture cache key: address (4 KB aligned), format (6 bits), width and height (13 bits each).
+uint64_t TextureKey(uint32_t address, uint32_t format, uint32_t w, uint32_t h)
+{
+    return uint64_t(address >> 12) << 32 | uint64_t(format & 0x3F) << 26 | uint64_t((w - 1) & 0x1FFF) << 13 | ((h - 1) & 0x1FFF);
+}
 
 uint64_t Fnv(const void* data, size_t bytes, uint64_t h = 0xCBF29CE484222325ull)
 {
@@ -844,6 +866,7 @@ void BeginFrameIfNeeded()
     ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get() };
     g_r.list->SetDescriptorHeaps(1, heaps);
     g_r.list->SetGraphicsRootSignature(g_r.rootSignature.Get());
+    g_drawState.Invalidate();
     SelectSurfaces(true);
     g_r.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_r.listOpen = true;
@@ -1756,7 +1779,7 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
     if (w != h || w > 2048)
         return nullptr;
     const uint32_t stride = TextureFaceStride(fetch);
-    CachedTexture& cached = g_r.cubes[{ fetch.Address(), fetch.Format(), w, h }];
+    CachedTexture& cached = g_r.cubes[TextureKey(fetch.Address(), fetch.Format(), w, h)];
     if (cached.resource && cached.checkedFrame == g_r.frame)
     {
         format = cached.format;
@@ -2012,7 +2035,7 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
     if (fetch.Type() != 2 || fetch.Dimension() != 1 || !TextureFormatSupported(fetch.Format()))
         return nullptr;
     const uint32_t w = fetch.Width(), h = fetch.Height();
-    auto& cached = g_r.textures[{ fetch.Address(), fetch.Format(), w, h }];
+    auto& cached = g_r.textures[TextureKey(fetch.Address(), fetch.Format(), w, h)];
     static const bool dumpAll = getenv("FM2_DUMP_TEXTURES") != nullptr;
     const bool forceDecode = dumpAll && RendererTracing();
     if (cached.resource && cached.checkedFrame == g_r.frame && !forceDecode)
@@ -2392,6 +2415,7 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     // Back to the main targets and root signature.
     g_r.list->OMSetRenderTargets(1, &g_r.rtv, FALSE, &g_r.dsv);
     g_r.list->SetGraphicsRootSignature(g_r.rootSignature.Get());
+    g_drawState.Invalidate();
 }
 
 // EDRAM resolve: copy a rectangle of the render target to the destination
@@ -3200,8 +3224,17 @@ struct Perf
 void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize);
 }
 
+// Per-draw timing (several clock reads per draw) only for FM2_PERF.
+const bool g_perfTiming = getenv("FM2_PERF") != nullptr;
+
 void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
+    if (!g_perfTiming)
+    {
+        DrawImpl(initiator, dmaBase, dmaSize);
+        g_perf.draws++;
+        return;
+    }
     const auto t0 = std::chrono::steady_clock::now();
     DrawImpl(initiator, dmaBase, dmaSize);
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -3214,6 +3247,8 @@ namespace
 {
 void Section(int i)
 {
+    if (!g_perfTiming)
+        return;
     const auto now = std::chrono::steady_clock::now();
     if (i > 0)
     {
@@ -3631,19 +3666,48 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         hostScissor.left = LONG(std::lround(centre + (scissor.left - double(kWidth) / 2) * s));
         hostScissor.right = LONG(std::lround(centre + (scissor.right - double(kWidth) / 2) * s));
     }
-    g_r.list->RSSetViewports(1, &vp);
-    g_r.list->RSSetScissorRects(1, &hostScissor);
-    g_r.list->OMSetStencilRef(gpureg::Get(RB_STENCILREFMASK) & 0xFF);
+    DrawState& ds = g_drawState;
+    if (memcmp(&ds.viewport, &vp, sizeof(vp)) != 0)
+    {
+        ds.viewport = vp;
+        g_r.list->RSSetViewports(1, &vp);
+    }
+    if (memcmp(&ds.scissor, &hostScissor, sizeof(hostScissor)) != 0)
+    {
+        ds.scissor = hostScissor;
+        g_r.list->RSSetScissorRects(1, &hostScissor);
+    }
+    if (const uint32_t ref = gpureg::Get(RB_STENCILREFMASK) & 0xFF; ref != ds.stencilRef)
+    {
+        ds.stencilRef = ref;
+        g_r.list->OMSetStencilRef(ref);
+    }
     {
         // RB_BLEND_RED..ALPHA: the constant colour for blend factors 12-15.
         const float factor[4] = { RegFloat(0x2105), RegFloat(0x2106), RegFloat(0x2107), RegFloat(0x2108) };
-        g_r.list->OMSetBlendFactor(factor);
+        if (memcmp(ds.blendFactor, factor, sizeof(factor)) != 0)
+        {
+            memcpy(ds.blendFactor, factor, sizeof(factor));
+            g_r.list->OMSetBlendFactor(factor);
+        }
     }
-    g_r.list->SetPipelineState(pso);
+    if (pso != ds.pso)
+    {
+        ds.pso = pso;
+        g_r.list->SetPipelineState(pso);
+    }
     g_r.list->SetGraphicsRootConstantBufferView(0, f.ring->GetGPUVirtualAddress() + vsOffset);
     g_r.list->SetGraphicsRootConstantBufferView(1, f.ring->GetGPUVirtualAddress() + psOffset);
-    g_r.list->SetGraphicsRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), f.descriptorBase, g_r.srvStride));
-    g_r.list->SetGraphicsRootDescriptorTable(3, Gpu(g_r.srvHeap.Get(), kBindlessBase, g_r.srvStride));
+    if (const D3D12_GPU_DESCRIPTOR_HANDLE t2 = Gpu(g_r.srvHeap.Get(), f.descriptorBase, g_r.srvStride); t2.ptr != ds.table2.ptr)
+    {
+        ds.table2 = t2;
+        g_r.list->SetGraphicsRootDescriptorTable(2, t2);
+    }
+    if (const D3D12_GPU_DESCRIPTOR_HANDLE t3 = Gpu(g_r.srvHeap.Get(), kBindlessBase, g_r.srvStride); t3.ptr != ds.table3.ptr)
+    {
+        ds.table3 = t3;
+        g_r.list->SetGraphicsRootDescriptorTable(3, t3);
+    }
     static const uint64_t traceFrame = getenv("FM2_TRACE_DRAWS") ? strtoull(getenv("FM2_TRACE_DRAWS"), nullptr, 10) : 0;
     if (traceFrame && g_r.frame + 1 == traceFrame)
     {
@@ -4018,8 +4082,16 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
             Log("swap: front buffer %08X, %s", frontBuffer, fromResolve ? "resolved" : "not resolved: showing the render target");
     }
 
-    static const uint64_t dumpFrame = getenv("FM2_DUMP_FRAME") ? strtoull(getenv("FM2_DUMP_FRAME"), nullptr, 10) : 0;
+    static uint64_t dumpFrame = getenv("FM2_DUMP_FRAME") ? strtoull(getenv("FM2_DUMP_FRAME"), nullptr, 10) : 0;
     ++g_r.frame;
+    // FM2_DUMP_AT=<seconds>: dump the first resolved frame after that long (comparable
+    // screenshots whatever the frame rate).
+    {
+        static const double dumpAt = getenv("FM2_DUMP_AT") ? atof(getenv("FM2_DUMP_AT")) : 0;
+        static const auto start = std::chrono::steady_clock::now();
+        if (dumpAt > 0 && !dumpFrame && fromResolve && std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= dumpAt)
+            dumpFrame = g_r.frame;
+    }
     g_tile = TileState{};
     static const bool dumpSecond = getenv("FM2_SKIP_VS") != nullptr;
     static const uint64_t dumpEvery = getenv("FM2_DUMP_EVERY") ? strtoull(getenv("FM2_DUMP_EVERY"), nullptr, 10) : 0;

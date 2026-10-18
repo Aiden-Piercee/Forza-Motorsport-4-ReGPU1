@@ -206,7 +206,7 @@ void WriteRegister(uint32_t index, uint32_t value)
 uint32_t ExecutePacket(uint32_t ptr)
 {
     const uint32_t header = LoadBE32(ptr);
-    g_gpu.lastPacket = ptr;
+    g_gpu.lastPacket.store(ptr, std::memory_order_relaxed); // diagnostics only: no fence per packet
     static const int slow = getenv("FM2_GPUSLOW") ? atoi(getenv("FM2_GPUSLOW")) : 0;
     for (int i = 0; i < slow; i++)
         _mm_pause();

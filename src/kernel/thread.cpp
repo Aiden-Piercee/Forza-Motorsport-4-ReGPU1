@@ -407,6 +407,12 @@ void StartThreadProfiler()
                 symbol->MaxNameLen = 255;
                 DWORD64 displacement = 0;
                 name = SymFromAddr(GetCurrentProcess(), c.Rip, &displacement, symbol) ? symbol->Name : "?";
+                // No symbol: name the module (a driver, for example).
+                HMODULE module = nullptr;
+                char path[MAX_PATH];
+                if (name == "?" && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                         reinterpret_cast<LPCSTR>(c.Rip), &module) && GetModuleFileNameA(module, path, MAX_PATH))
+                    name = std::string("? ") + (strrchr(path, 92) ? strrchr(path, 92) + 1 : path);
             }
             ResumeThread(handle);
             if (!ok)
