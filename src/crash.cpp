@@ -40,7 +40,7 @@ LONG WINAPI OnCrash(EXCEPTION_POINTERS* info)
         Log("CRASH: %s host %016llX = guest %llX", record->ExceptionInformation[0] ? "write to" : "read from", fault, guest);
     }
     if (thread && thread->ctx)
-        Log("CRASH: guest lr %08llX ctr %08llX r1 %08X r3 %08X", thread->ctx->lr, thread->ctx->ctr.u64, thread->ctx->r1.u32, thread->ctx->r3.u32);
+        Log("CRASH: guest lr %08llX r1 %08X r3 %08X", thread->ctx->lr, thread->ctx->r1.u32, thread->ctx->r3.u32); // (ctr is a local of the recompiled code)
 
     // Host call stack.
     CONTEXT context = *info->ContextRecord;

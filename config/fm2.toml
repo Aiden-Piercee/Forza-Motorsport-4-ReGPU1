@@ -6,13 +6,14 @@ file_path = "../game/default.xex"
 out_directory_path = "../out/ppc"
 switch_table_file_path = "fm2_switch_tables.toml"
 
-# Optimizations stay off until the recompilation boots.
+# Registers kept in host locals instead of the guest context (faster). Hooks, Lua's
+# setjmp/longjmp and the diagnostics read the GPRs and LR from the context, so those stay.
 skip_lr = false
 skip_msr = false
-ctr_as_local = false
-xer_as_local = false
-reserved_as_local = false
-cr_as_local = false
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+cr_as_local = true
 non_argument_as_local = false
 non_volatile_as_local = false
 

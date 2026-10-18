@@ -67,6 +67,10 @@ struct Gpu
         uint32_t frontBuffer; // physical address of the front buffer
     };
     std::deque<PendingSwap> pendingSwaps;
+    // The NOP blocks of the pending swaps, readable without the lock: the command processor
+    // checks every NOP against them (most NOPs are padding and match nothing).
+    std::atomic<uint32_t> swapBlocks[16]{};
+    std::atomic<uint32_t> swapBlockNext{ 0 };
     // Predicated tiling: type-3 packets with the predicate bit run only
     // when (binSelect & binMask) != 0. D3D replays each frame per tile and
     // predicates its once-per-frame packets (swap callbacks, fences).
@@ -227,6 +231,11 @@ uint32_t ExecutePacket(uint32_t ptr)
         return 3;
     case 2: // type 2: nop (VdSwap fills its block with these)
     {
+        bool candidate = false;
+        for (const auto& b : g_gpu.swapBlocks)
+            candidate |= b.load(std::memory_order_acquire) == (ptr & 0x1FFFFFFF);
+        if (!candidate)
+            return 1;
         std::lock_guard lock(g_gpu.swapMutex);
         for (size_t i = 0; i < g_gpu.pendingSwaps.size(); i++)
         {
@@ -929,6 +938,7 @@ GUEST_EXPORT(VdSwap)
         std::lock_guard lock(g_gpu.swapMutex);
         // r4: the front buffer's texture fetch constant (6 dwords).
         const uint32_t frontBuffer = ctx.r4.u32 ? (LoadBE32(ctx.r4.u32 + 4) & 0x1FFFF000) : 0;
+        g_gpu.swapBlocks[g_gpu.swapBlockNext++ % 16].store(buffer & 0x1FFFFFFF, std::memory_order_release);
         g_gpu.pendingSwaps.push_back({ buffer & 0x1FFFFFFF, n, frontBuffer });
         if (g_gpu.pendingSwaps.size() > 16)
             g_gpu.pendingSwaps.pop_front();
