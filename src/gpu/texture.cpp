@@ -332,6 +332,47 @@ bool DecodeTexture(const TextureFetch& fetch, const uint8_t* source, std::vector
     return true;
 }
 
+uint32_t TextureBCKind(uint32_t format)
+{
+    switch (format)
+    {
+    case k_DXT1: return 1;
+    case k_DXT2_3: return 2;
+    case k_DXT4_5: return 3;
+    case k_DXT5A: return 4;
+    default: return 0;
+    }
+}
+
+bool CopyTextureBlocks(const TextureFetch& fetch, uint8_t* dst, uint32_t dstRowPitch)
+{
+    FormatInfo info;
+    if (fetch.Type() != 2 || !TextureBCKind(fetch.Format()) || !Info(fetch.Format(), info))
+        return false;
+    const uint8_t* source = GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address()));
+    const uint32_t blocksX = (fetch.Width() + 3) / 4, blocksY = (fetch.Height() + 3) / 4;
+    const uint32_t blockBytes = 1u << info.log2Bytes;
+    uint32_t pitchBlocks = std::max(fetch.Pitch() / 4, blocksX);
+    if (fetch.Tiled())
+        pitchBlocks = (pitchBlocks + 31) & ~31u;
+    for (uint32_t by = 0; by < blocksY; by++)
+    {
+        uint8_t* row = dst + size_t(by) * dstRowPitch;
+        const int32_t rowOffset = fetch.Tiled() ? TiledOffset2DOuter(by, pitchBlocks, info.log2Bytes) : 0;
+        for (uint32_t bx = 0; bx < blocksX; bx++)
+        {
+            const size_t offset = fetch.Tiled() ? size_t(TiledOffset2DInner(bx, by, info.log2Bytes, rowOffset) >> info.log2Bytes) * blockBytes
+                                                : (size_t(by) * pitchBlocks + bx) * blockBytes;
+            // Swapped here, then written once: dst is upload memory (write-combined, never read).
+            uint8_t block[16];
+            memcpy(block, source + offset, blockBytes);
+            Swap(block, blockBytes, fetch.Endian());
+            memcpy(row + size_t(bx) * blockBytes, block, blockBytes);
+        }
+    }
+    return true;
+}
+
 uint32_t TextureFaceStride(const TextureFetch& fetch)
 {
     FormatInfo info;

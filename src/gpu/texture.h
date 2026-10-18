@@ -33,5 +33,12 @@ bool DecodeTexture(const TextureFetch& fetch, std::vector<uint8_t>& rgba);
 // The same from texture data outside guest memory (e.g. an .xds file after its header).
 bool DecodeTexture(const TextureFetch& fetch, const uint8_t* source, std::vector<uint8_t>& rgba);
 
+// Block-compressed formats the GPU samples natively: 1-4 for BC1-BC4 (DXT1, DXT3, DXT5,
+// DXT5A), 0 for formats that are decoded to RGBA8.
+uint32_t TextureBCKind(uint32_t format);
+// Copies mip 0 of a block-compressed texture as linear BC blocks (untiled, endian-swapped)
+// to dst, rows of blocks dstRowPitch bytes apart. No swizzle is applied (the GPU does it).
+bool CopyTextureBlocks(const TextureFetch& fetch, uint8_t* dst, uint32_t dstRowPitch);
+
 // Bytes between the faces of a cube texture (each face is a padded 2D slice).
 uint32_t TextureFaceStride(const TextureFetch& fetch);

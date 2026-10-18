@@ -159,6 +159,7 @@ struct CachedTexture
     uint64_t checkedFrame = ~0ull; // content already validated in this frame
     uint32_t width = 0, height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM; // cubes: matches their faces
+    bool native = false; // block-compressed on the GPU: the shader applies the fetch swizzle
 };
 
 // A resolve destination backed by a host texture: fetches of this guest
@@ -353,6 +354,105 @@ void CountCreate(const char* what)
 }
 
 const bool g_dumpHlsl = getenv("FM2_DUMP_HLSL") != nullptr;
+
+// Texture memory: textures are placed in large heaps instead of each getting a committed
+// resource (its own heap). Creating a committed resource costs the driver milliseconds,
+// which showed as hitches whenever new textures streamed in on the road ahead. Blocks are
+// 64 KB multiples, reused by size once the GPU is done with the texture that held them.
+struct TexturePool
+{
+    static constexpr uint64_t kHeapBytes = 128ull << 20;
+    struct Block
+    {
+        ID3D12Heap* heap = nullptr;
+        uint64_t offset = 0, size = 0;
+    };
+    std::vector<ComPtr<ID3D12Heap>> heaps;
+    uint64_t used = kHeapBytes; // in heaps.back()
+    std::unordered_map<uint64_t, std::vector<Block>> free; // by size
+    std::unordered_map<ID3D12Resource*, Block> live;
+    std::deque<std::pair<uint64_t, Block>> retired; // frame retired, block
+} g_texturePool;
+
+// A texture in the pool (or committed, if it does not fit a heap). Starts in `state`.
+ComPtr<ID3D12Resource> CreateTexture(const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state, const char* kind)
+{
+    static const bool committed = getenv("FM2_COMMITTED_TEXTURES") != nullptr; // A/B
+    TexturePool& pool = g_texturePool;
+    const D3D12_RESOURCE_ALLOCATION_INFO info = g_r.device->GetResourceAllocationInfo(0, 1, &desc);
+    const uint64_t size = (info.SizeInBytes + 0xFFFF) & ~0xFFFFull;
+    ComPtr<ID3D12Resource> r;
+    if (!committed && size <= TexturePool::kHeapBytes && info.Alignment <= 0x10000)
+    {
+        TexturePool::Block block;
+        auto& list = pool.free[size];
+        if (!list.empty())
+        {
+            block = list.back();
+            list.pop_back();
+        }
+        else
+        {
+            if (pool.used + size > TexturePool::kHeapBytes)
+            {
+                D3D12_HEAP_DESC hd{};
+                hd.SizeInBytes = TexturePool::kHeapBytes;
+                hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+                hd.Alignment = 0x10000;
+                hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+                ComPtr<ID3D12Heap> heap;
+                Check(g_r.device->CreateHeap(&hd, IID_PPV_ARGS(&heap)), "CreateHeap(textures)");
+                CountCreate("texture heap");
+                pool.heaps.push_back(heap);
+                pool.used = 0;
+            }
+            block = { pool.heaps.back().Get(), pool.used, size };
+            pool.used += size;
+        }
+        if (SUCCEEDED(g_r.device->CreatePlacedResource(block.heap, block.offset, &desc, state, nullptr, IID_PPV_ARGS(&r))))
+        {
+            pool.live[r.Get()] = block;
+            return r;
+        }
+        pool.free[size].push_back(block);
+    }
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+              IID_PPV_ARGS(&r)),
+        kind);
+    CountCreate(kind);
+    return r;
+}
+
+FrameResources& Frame();
+
+// Hands a texture to the frame's garbage; its pool block is reused once no frame in flight
+// can still read it.
+void RetireTexture(ComPtr<ID3D12Resource>&& r)
+{
+    if (!r)
+        return;
+    if (auto it = g_texturePool.live.find(r.Get()); it != g_texturePool.live.end())
+    {
+        g_texturePool.retired.push_back({ g_r.frame, it->second });
+        g_texturePool.live.erase(it);
+    }
+    Frame().garbage.push_back(std::move(r));
+}
+
+void ReclaimTextureBlocks()
+{
+    auto& retired = g_texturePool.retired;
+    while (!retired.empty() && retired.front().first + kFrames + 2 < g_r.frame)
+    {
+        g_texturePool.free[retired.front().second.size].push_back(retired.front().second);
+        retired.pop_front();
+    }
+}
+
+// Per-draw timing (several clock reads per draw) only for FM2_PERF.
+const bool g_perfTiming = getenv("FM2_PERF") != nullptr;
 
 // The last draw state set on the command list: draws skip setting what has not changed
 // (each D3D12 call costs driver time, and most draws share their neighbours' state).
@@ -761,7 +861,9 @@ UINT BindlessIndex(ID3D12Resource* resource, DXGI_FORMAT format, bool cube)
         return cube ? 1u : 0u; // full: draw with a null texture
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format = format;
-    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Shader4ComponentMapping = format == DXGI_FORMAT_BC4_UNORM
+        ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 0, 0, 0) // DXT5A: its one channel in all four
+        : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     if (cube)
     {
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
@@ -863,6 +965,7 @@ void BeginFrameIfNeeded()
     }
     f.descriptorsUsed = 2;
     EvictBindless();
+    ReclaimTextureBlocks();
     ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get() };
     g_r.list->SetDescriptorHeaps(1, heaps);
     g_r.list->SetGraphicsRootSignature(g_r.rootSignature.Get());
@@ -2015,8 +2118,9 @@ const ResolvedTexture* ResolvedFor(const TextureFetch& fetch)
 }
 
 // Decodes (if changed) and uploads a texture; returns its resource.
-ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
+ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format, bool& native)
 {
+    native = false;
     format = DXGI_FORMAT_R8G8B8A8_UNORM;
     if (const ResolvedTexture* resolvedTexture = ResolvedFor(fetch))
     {
@@ -2039,15 +2143,100 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
     static const bool dumpAll = getenv("FM2_DUMP_TEXTURES") != nullptr;
     const bool forceDecode = dumpAll && RendererTracing();
     if (cached.resource && cached.checkedFrame == g_r.frame && !forceDecode)
+    {
+        format = cached.format;
+        native = cached.native;
         return cached.resource.Get();
+    }
     cached.checkedFrame = g_r.frame;
+    // DXT formats stay compressed on the GPU (BC1-BC4): no decode, a quarter to an eighth of
+    // the upload. D3D12 needs block-aligned sizes; others are decoded to RGBA8.
+    static const bool noNativeBC = getenv("FM2_NO_NATIVE_BC") != nullptr;
+    const uint32_t bc = !noNativeBC && w % 4 == 0 && h % 4 == 0 && !forceDecode ? TextureBCKind(fetch.Format()) : 0;
     const uint8_t* source = GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address()));
     const size_t sourceBytes = std::max<size_t>(size_t(std::max(fetch.Pitch(), w)) * h / 2, 64); // conservative: >= 4 bpp
     // Only what changes the decoded image: sampler state (clamp, filter) varies per draw.
-    const uint64_t hash = ContentHash(source, sourceBytes) ^ (uint64_t(fetch.Swizzle()) << 8) ^ (uint64_t(fetch.Pitch()) << 24) ^
+    const uint64_t hash = ContentHash(source, sourceBytes) ^ (bc ? 0 : uint64_t(fetch.Swizzle()) << 8) ^ (uint64_t(fetch.Pitch()) << 24) ^
         (uint64_t(fetch.Tiled()) << 40) ^ (uint64_t(fetch.Endian()) << 44);
     if (cached.resource && cached.contentHash == hash && !forceDecode)
+    {
+        format = cached.format;
+        native = cached.native;
         return cached.resource.Get();
+    }
+    const auto uploadStart = std::chrono::steady_clock::now();
+    const bool wasNew = !cached.resource;
+    struct UploadLog
+    {
+        std::chrono::steady_clock::time_point start;
+        const TextureFetch& fetch;
+        bool isNew;
+        ~UploadLog()
+        {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            if (g_perfTiming && ms > 2.0)
+                Log("perf: texture %08X %s %ux%u %s took %.1f ms", fetch.Address(), TextureFormatName(fetch.Format()), fetch.Width(), fetch.Height(),
+                    isNew ? "new" : "changed", ms);
+        }
+    } uploadLog{ uploadStart, fetch, wasNew };
+    if (bc)
+    {
+        static const DXGI_FORMAT bcFormats[] = { DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_BC3_UNORM,
+            DXGI_FORMAT_BC4_UNORM };
+        const DXGI_FORMAT bcFormat = bcFormats[bc];
+        const uint32_t blockBytes = bc == 1 || bc == 4 ? 8 : 16;
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.Subresource = 0;
+        if (!cached.resource || cached.width != w || cached.height != h || cached.format != bcFormat)
+        {
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC td{};
+            td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            td.Width = w;
+            td.Height = h;
+            td.DepthOrArraySize = 1;
+            td.MipLevels = 1;
+            td.SampleDesc.Count = 1;
+            td.Format = bcFormat;
+            RetireTexture(std::move(cached.resource));
+            cached.resource = CreateTexture(td, D3D12_RESOURCE_STATE_COPY_DEST, "texture");
+            cached.width = w;
+            cached.height = h;
+            cached.format = bcFormat;
+        }
+        else
+        {
+            b.Transition.pResource = cached.resource.Get();
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            g_r.list->ResourceBarrier(1, &b);
+        }
+        const UINT rowPitch = ((w / 4) * blockBytes + 255) & ~255u;
+        const UINT64 offset = RingAlloc(UINT64(rowPitch) * (h / 4), 512);
+        if (offset == ~0ull)
+            return nullptr;
+        CopyTextureBlocks(fetch, Frame().ringCpu + offset, rowPitch);
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = cached.resource.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = Frame().ring.Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Offset = offset;
+        src.PlacedFootprint.Footprint = { bcFormat, w, h, 1, rowPitch };
+        g_r.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        b.Transition.pResource = cached.resource.Get();
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        g_r.list->ResourceBarrier(1, &b);
+        cached.contentHash = hash;
+        cached.native = true;
+        format = bcFormat;
+        native = true;
+        return cached.resource.Get();
+    }
 
     std::vector<uint8_t> rgba;
     if (!DecodeTexture(fetch, rgba))
@@ -2068,8 +2257,10 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
         Log("renderer: wrote texture.png (%s %ux%u, endian %u, tiled %u, pitch %u)", TextureFormatName(fetch.Format()), w, h, fetch.Endian(),
             fetch.Tiled(), fetch.Pitch());
     }
-    if (!cached.resource || cached.width != w || cached.height != h)
+    if (!cached.resource || cached.width != w || cached.height != h || cached.format != DXGI_FORMAT_R8G8B8A8_UNORM)
     {
+        cached.format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        cached.native = false;
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC td{};
@@ -2080,11 +2271,8 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
         td.MipLevels = 1;
         td.SampleDesc.Count = 1;
         td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        if (cached.resource)
-            Frame().garbage.push_back(std::move(cached.resource));
-        Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                  IID_PPV_ARGS(&cached.resource)),
-            "CreateCommittedResource(texture)"); CountCreate("texture");
+        RetireTexture(std::move(cached.resource));
+        cached.resource = CreateTexture(td, D3D12_RESOURCE_STATE_COPY_DEST, "texture");
         cached.width = w;
         cached.height = h;
     }
@@ -3224,8 +3412,6 @@ struct Perf
 void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize);
 }
 
-// Per-draw timing (several clock reads per draw) only for FM2_PERF.
-const bool g_perfTiming = getenv("FM2_PERF") != nullptr;
 
 void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
@@ -3583,17 +3769,18 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             }
         }
         DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        ID3D12Resource* texture = cube ? GetCubeTexture(fetch, format) : GetTexture(fetch, format);
+        bool native = false;
+        ID3D12Resource* texture = cube ? GetCubeTexture(fetch, format) : GetTexture(fetch, format, native);
         const uint32_t index = texture ? BindlessIndex(texture, format, cube) : (cube ? 1u : 0u);
         // w: dimension (1 2D, 3 cube); bit 31 + bits 8-19: the fetch swizzle, applied in the
         // shader for textures that live on the GPU (resolves). Decoded ones are swizzled already.
         static const bool noGpuSwizzle = getenv("FM2_NO_GPU_SWIZZLE") != nullptr;
         const ResolvedTexture* resolvedPtr = ResolvedFor(fetch);
-        const bool onGpu = !noGpuSwizzle && fetch.Type() == 2 && resolvedPtr != nullptr;
+        const bool onGpu = (!noGpuSwizzle && fetch.Type() == 2 && resolvedPtr != nullptr) || native;
         // Our resolved textures keep red and blue in place; when the title
         // resolved with the swap bit, its fetch swizzle expects them exchanged.
         uint32_t swizzle = fetch.Swizzle();
-        if (onGpu && resolvedPtr->swapped)
+        if (onGpu && resolvedPtr && resolvedPtr->swapped)
             for (uint32_t c = 0; c < 4; c++)
             {
                 const uint32_t sel = (swizzle >> (3 * c)) & 7;
@@ -3611,7 +3798,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // constant may declare a narrower image inside it (e.g. 163 of 192 columns):
         // the shader scales UVs so 0..1 spans the declared image, not the padding.
         pc->tbias[slot][2] = pc->tbias[slot][3] = 1.0f;
-        if (onGpu && !cube && resolvedPtr->width && resolvedPtr->height && resolvedPtr->resource)
+        if (onGpu && resolvedPtr && !cube && resolvedPtr->width && resolvedPtr->height && resolvedPtr->resource)
         {
             pc->tbias[slot][2] = std::min(1.0f, float(fetch.Width()) / float(resolvedPtr->width));
             pc->tbias[slot][3] = std::min(1.0f, float(fetch.Height()) / float(resolvedPtr->height));
@@ -3694,7 +3881,14 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (pso != ds.pso)
     {
         ds.pso = pso;
+        const auto t0 = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         g_r.list->SetPipelineState(pso);
+        if (g_perfTiming)
+        {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (ms > 1.0)
+                Log("perf: SetPipelineState took %.1f ms (vs %016llx ps %016llx)", ms, (unsigned long long)g_r.vsHash, (unsigned long long)g_r.psHash);
+        }
     }
     g_r.list->SetGraphicsRootConstantBufferView(0, f.ring->GetGPUVirtualAddress() + vsOffset);
     g_r.list->SetGraphicsRootConstantBufferView(1, f.ring->GetGPUVirtualAddress() + psOffset);
@@ -3781,7 +3975,16 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         for (uint32_t c : { 0u, 1u, 5u, 6u, 7u, 14u, 22u, 254u, 255u })
             Log("    pc%u = %g %g %g %g", c, pc->c[c][0], pc->c[c][1], pc->c[c][2], pc->c[c][3]);
     }
-    g_r.list->DrawInstanced(directIndex ? directVertices : UINT(list.size()), 1, 0, 0);
+    {
+        const auto t0 = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        g_r.list->DrawInstanced(directIndex ? directVertices : UINT(list.size()), 1, 0, 0);
+        if (g_perfTiming)
+        {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (ms > 1.0)
+                Log("perf: DrawInstanced took %.1f ms (vs %016llx ps %016llx)", ms, (unsigned long long)g_r.vsHash, (unsigned long long)g_r.psHash);
+        }
+    }
     Section(6);
     g_r.drawsThisFrame++;
 }
@@ -3809,7 +4012,8 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
         static double drawBefore = 0;
         const double frameDrawMs = drawNow >= drawBefore ? drawNow - drawBefore : drawNow;
         drawBefore = drawNow;
-        if (perf && dt > 25.0)
+        static const double slowMs = getenv("FM2_SLOW_MS") ? atof(getenv("FM2_SLOW_MS")) : 25.0; // slow-frame log threshold
+        if (perf && dt > slowMs)
             Log("perf: slow frame %llu: %.1f ms | draw %.1f ms (worst draw %.1f; shaders %.1f indices %.1f pipeline %.1f constants %.1f "
                 "textures %.1f submit %.1f), waited %.1f ms on %u builds, %u pipelines started, %u resources created",
                 (unsigned long long)frameNumber, dt, frameDrawMs, g_frameEvents.worstDrawMs, g_frameEvents.section[0], g_frameEvents.section[1],
