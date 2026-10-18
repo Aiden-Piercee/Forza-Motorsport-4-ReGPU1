@@ -98,6 +98,7 @@ struct CompiledShader
     std::atomic<int> state{ Pending }; // set by the compile worker
     uint64_t hash = 0, cacheKey = 0;
     bool pixel = false;
+    std::vector<uint32_t> ucodeBE; // saved to the shader cache once a pipeline uses it
     ComPtr<ID3DBlob> code;
     TranslatedShader info;
     bool IsReady() const { return state.load(std::memory_order_acquire) == Ready; }
@@ -854,7 +855,7 @@ struct Manifest
     void RecordShader(bool pixel, uint64_t hash, const std::vector<uint32_t>& codeBE)
     {
         std::lock_guard lock(mutex);
-        if (!shaderFiles.insert(hash).second)
+        if (codeBE.empty() || !shaderFiles.insert(hash).second)
             return;
         const auto path = UcodePath(pixel, hash);
         std::error_code ec;
@@ -970,7 +971,9 @@ const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& code
     CompiledShader& cs = *slot;
     cs.hash = hash;
     cs.pixel = pixel;
-    g_manifest.RecordShader(pixel, hash, codeBE);
+    // Not saved yet: the memory scan also finds stale copies in freed blocks (heap links
+    // over the first words), so only shaders a pipeline uses go into the cache.
+    cs.ucodeBE = codeBE;
     const ucode::Shader parsed = ucode::Parse(codeBE.data(), uint32_t(codeBE.size()), pixel);
     cs.info = TranslateShader(parsed);
     if (!cs.info.ok)
@@ -1290,6 +1293,8 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     pd.SampleDesc.Count = 1;
     auto entry = std::make_shared<PipelineEntry>();
     g_r.pipelines[key] = entry;
+    g_manifest.RecordShader(false, key.vs, vs.ucodeBE);
+    g_manifest.RecordShader(true, key.ps, ps.ucodeBE);
     g_manifest.RecordPipeline(key);
     static PipelinePool pool;
     char label[64];
@@ -3193,10 +3198,111 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
     }
 }
 
+// ---- Precompile (test build): before the game goes on, compile every stored shader and
+// build every stored pipeline, with the overlay up. The stored set is whatever earlier
+// runs recorded (shadercache/*.ucode and pipelines.manifest), so the more the game has
+// been played, the more is covered. FM2_NO_PRECOMPILE=1 turns it off.
+bool g_precompileDone = false;
+
+void PrecompileAll()
+{
+    if (g_precompileDone)
+        return;
+    g_precompileDone = true;
+    if (getenv("FM2_NO_PRECOMPILE"))
+        return;
+    const auto start = std::chrono::steady_clock::now();
+    // Only the shaders stored pipelines use: older caches also hold scan finds that never drew.
+    std::vector<PipelineKey> keys = g_manifest.pending;
+    std::vector<std::pair<bool, uint64_t>> shaders;
+    {
+        std::set<std::pair<bool, uint64_t>> used;
+        for (const PipelineKey& k : keys)
+            for (const auto s : { std::pair{ false, k.vs }, std::pair{ true, k.ps } })
+                if (used.insert(s).second)
+                    shaders.push_back(s);
+    }
+    g_stats.warmTotal = uint32_t(keys.size());
+    g_stats.warmDone = 0;
+    Log("precompile: %zu shaders and %zu pipelines stored", shaders.size(), keys.size());
+    size_t nextShader = 0, nextKey = 0;
+    size_t shadersInstalled = 0, pipelinesStarted = 0;
+    auto lastPresent = std::chrono::steady_clock::time_point{};
+    for (;;)
+    {
+        // Phase 1: load and translate shaders a batch at a time (compiles run on worker threads).
+        for (int batch = 0; batch < 64 && nextShader < shaders.size(); batch++, nextShader++)
+        {
+            const auto [pixel, hash] = shaders[nextShader];
+            if (g_r.shaders.count(hash))
+                continue;
+            std::vector<uint32_t> code;
+            if (Manifest::LoadShader(pixel, hash, code))
+            {
+                GetShader(hash, code, pixel);
+                shadersInstalled++;
+            }
+        }
+        // Phase 2: start pipelines whose shaders are ready.
+        for (int batch = 0; batch < 256 && nextKey < keys.size(); batch++)
+        {
+            const PipelineKey key = keys[nextKey];
+            const CompiledShader* vs = nullptr;
+            const CompiledShader* ps = nullptr;
+            if (auto f = g_r.shaders.find(key.vs); f != g_r.shaders.end())
+                vs = f->second.get();
+            if (auto f = g_r.shaders.find(key.ps); f != g_r.shaders.end())
+                ps = f->second.get();
+            if (!vs || !ps)
+            {
+                // Shader not loaded yet: load it now (translation queues the compile).
+                std::vector<uint32_t> code;
+                if (!vs && Manifest::LoadShader(false, key.vs, code))
+                    vs = &GetShader(key.vs, code, false);
+                code.clear();
+                if (!ps && Manifest::LoadShader(true, key.ps, code))
+                    ps = &GetShader(key.ps, code, true);
+            }
+            if (!vs || !ps || vs->state.load() == CompiledShader::Pending || ps->state.load() == CompiledShader::Pending)
+                break; // wait for this one to finish compiling before going on
+            if (vs->state.load() == CompiledShader::Ready && ps->state.load() == CompiledShader::Ready)
+            {
+                if (!g_r.pipelines.count(key))
+                {
+                    EnsurePipeline(*vs, *ps, key);
+                    pipelinesStarted++;
+                }
+            }
+            nextKey++;
+            g_stats.warmDone++;
+        }
+        // Done when every shader is loaded and every pipeline is built.
+        size_t building = 0;
+        for (auto& [k, e] : g_r.pipelines)
+            if (e->state.load() == 0)
+                building++;
+        const bool allSent = nextShader >= shaders.size() && nextKey >= keys.size();
+        if (allSent && g_compiler.jobs.load() == 0 && building == 0)
+            break;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastPresent > std::chrono::milliseconds(33))
+        {
+            lastPresent = now;
+            g_hold.active = true;
+            HoldPresent();
+        }
+        Sleep(1);
+    }
+    g_hold.active = false;
+    Log("precompile: done in %.1f s (%zu shaders loaded, %zu pipelines started)",
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), shadersInstalled, pipelinesStarted);
+}
+
 void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
 {
     if (!g_r.ok)
         return;
+    PrecompileAll();
     WarmupStep();
     BeginFrameIfNeeded();
     // Show the front buffer the title resolved to; fall back to the render
