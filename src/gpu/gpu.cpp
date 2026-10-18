@@ -206,6 +206,19 @@ void WriteRegister(uint32_t index, uint32_t value)
     }
 }
 
+// Bulk register writes from big-endian guest data (constant loads, register runs): the
+// register file is big-endian too, so a run clear of the scratch registers is a copy.
+void WriteRegisters(uint32_t index, uint32_t source, uint32_t count)
+{
+    if (index + count <= SCRATCH_REG0 || index >= SCRATCH_REG0 + 8)
+    {
+        memcpy(GuestPtr<uint8_t>(kRegisterBase + index * 4), GuestPtr<uint8_t>(source), size_t(count) * 4);
+        return;
+    }
+    for (uint32_t i = 0; i < count; i++)
+        WriteRegister(index + i, LoadBE32(source + i * 4));
+}
+
 // Executes one packet at ptr; returns its size in dwords.
 uint32_t ExecutePacket(uint32_t ptr)
 {
@@ -221,8 +234,11 @@ uint32_t ExecutePacket(uint32_t ptr)
         const uint32_t count = ((header >> 16) & 0x3FFF) + 1;
         const uint32_t base = header & 0x7FFF;
         const bool oneReg = header & 0x8000;
-        for (uint32_t i = 0; i < count; i++)
-            WriteRegister(oneReg ? base : base + i, LoadBE32(ptr + 4 + i * 4));
+        if (oneReg)
+            for (uint32_t i = 0; i < count; i++)
+                WriteRegister(base, LoadBE32(ptr + 4 + i * 4));
+        else
+            WriteRegisters(base, ptr + 4, count);
         return 1 + count;
     }
     case 1: // type 1: two register writes
@@ -443,8 +459,7 @@ uint32_t ExecutePacket(uint32_t ptr)
             const uint32_t type = (arg(0) >> 16) & 0xFF;
             index = (arg(0) & 0x7FF) + (type < 5 ? bases[type] : 0);
         }
-        for (uint32_t i = 1; i < count; i++)
-            WriteRegister(index + i - 1, arg(i));
+        WriteRegisters(index, data + 4, count - 1);
         break;
     }
     case 0x2F: // LOAD_ALU_CONSTANT: address, offset/type, size (dwords)
@@ -454,8 +469,7 @@ uint32_t ExecutePacket(uint32_t ptr)
         const uint32_t type = (arg(1) >> 16) & 0xFF;
         const uint32_t index = (arg(1) & 0x7FF) + (type < 5 ? bases[type] : 0);
         const uint32_t size = arg(2) & 0xFFF;
-        for (uint32_t i = 0; i < size; i++)
-            WriteRegister(index + i, LoadBE32(source + i * 4));
+        WriteRegisters(index, source, size);
         break;
     }
     case 0x27: // IM_LOAD: type|address, start/size
