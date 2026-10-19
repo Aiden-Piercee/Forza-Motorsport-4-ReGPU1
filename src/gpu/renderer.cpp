@@ -204,6 +204,7 @@ struct CachedTexture
     ComPtr<ID3D12Resource> resource;
     uint64_t contentHash = 0;
     uint64_t checkedFrame = ~0ull; // content already validated in this frame
+    uint32_t unchanged = 0;        // checks in a row that found the same content
     uint32_t width = 0, height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM; // cubes: matches their faces
     bool native = false; // block-compressed on the GPU: the shader applies the fetch swizzle
@@ -574,6 +575,30 @@ struct SlotBinding
     float tbias[4] = {};
     bool samplesResolve = false;
 };
+// A cache valid for one frame: entries carry the frame they were made in instead of the map
+// being cleared each frame (re-inserting freed nodes cost a heap allocation per entry).
+template <class V>
+struct FrameMap
+{
+    struct Entry
+    {
+        uint64_t frame;
+        V value;
+    };
+    std::unordered_map<uint64_t, Entry> map;
+    V* Find(uint64_t key, uint64_t frame)
+    {
+        auto it = map.find(key);
+        return it != map.end() && it->second.frame == frame ? &it->second.value : nullptr;
+    }
+    void Put(uint64_t key, uint64_t frame, const V& value)
+    {
+        if (map.size() > (1u << 15)) // (stale entries of old frames)
+            map.clear();
+        map[key] = { frame, value };
+    }
+};
+
 // Bindings by fetch constant: a texture bound by many draws (in any slot) is looked up once
 // per frame and resolve epoch (textures are still checked once per frame for changes).
 thread_local std::unordered_map<uint64_t, SlotBinding> g_bindings;
@@ -1016,18 +1041,12 @@ UINT BindlessIndexLocked(ID3D12Resource* resource, DXGI_FORMAT format, bool cube
 UINT BindlessIndex(ID3D12Resource* resource, DXGI_FORMAT format, bool cube)
 {
     const uint64_t key = uint64_t(reinterpret_cast<uintptr_t>(resource)) << 8 ^ uint64_t(format) << 1 ^ uint64_t(cube);
-    thread_local std::unordered_map<uint64_t, UINT> known;
-    thread_local uint64_t knownFrame = ~0ull;
-    if (knownFrame != g_r.frame)
-    {
-        known.clear();
-        knownFrame = g_r.frame;
-    }
-    if (auto it = known.find(key); it != known.end())
-        return it->second;
+    thread_local FrameMap<UINT> known;
+    if (const UINT* index = known.Find(key, g_r.frame))
+        return *index;
     std::lock_guard textureLock(g_textureMutex);
     const UINT index = BindlessIndexLocked(resource, format, cube);
-    known.emplace(key, index);
+    known.Put(key, g_r.frame, index);
     return index;
 }
 
@@ -1277,22 +1296,16 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
         }
     const uint64_t key = uint64_t(guest) << 32 | bytes;
     // Each recording thread keeps its own cache (cleared when the frame changes).
-    thread_local std::unordered_map<uint64_t, std::pair<UINT64, uint64_t>> uploads;
-    thread_local uint64_t uploadsFrame = ~0ull;
-    if (uploadsFrame != g_r.frame)
-    {
-        uploads.clear();
-        uploadsFrame = g_r.frame;
-    }
-    if (auto it = uploads.find(key); it != uploads.end() && it->second.second == sample)
-        return it->second.first;
+    thread_local FrameMap<std::pair<UINT64, uint64_t>> uploads;
+    if (const auto* known = uploads.Find(key, g_r.frame); known && known->second == sample)
+        return known->first;
     if (RendererTracing() && bytes > (16u << 10))
         Log("upload: %08X %u bytes (ring %llu)", guest, bytes, (unsigned long long)f.ringUsed.load());
     const UINT64 offset = RingAlloc(std::max<uint32_t>(bytes, 16) + 16, 16);
     if (offset == ~0ull)
         return offset;
     memcpy(f.ringCpu + offset, src, bytes);
-    uploads[key] = { offset, sample };
+    uploads.Put(key, g_r.frame, { offset, sample });
     return offset;
 }
 
@@ -1350,23 +1363,17 @@ bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t end
 // Each thread remembers this frame's index buffers (checked once per frame).
 bool GetIndexBuffer(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view)
 {
-    thread_local std::unordered_map<uint64_t, D3D12_INDEX_BUFFER_VIEW> known;
-    thread_local uint64_t knownFrame = ~0ull;
-    if (knownFrame != g_r.frame)
-    {
-        known.clear();
-        knownFrame = g_r.frame;
-    }
+    thread_local FrameMap<D3D12_INDEX_BUFFER_VIEW> known;
     const uint64_t key = uint64_t(base) << 32 ^ uint64_t(count) << 3 ^ uint64_t(is32) << 2 ^ endian;
-    if (auto it = known.find(key); it != known.end())
+    if (const auto* v = known.Find(key, g_r.frame))
     {
-        view = it->second;
+        view = *v;
         return true;
     }
     std::lock_guard textureLock(g_textureMutex);
     if (!GetIndexBufferLocked(base, count, is32, endian, view))
         return false;
-    known.emplace(key, view);
+    known.Put(key, g_r.frame, view);
     return true;
 }
 
@@ -2741,27 +2748,21 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format, bool&
         DXGI_FORMAT format;
         bool native;
     };
-    thread_local std::unordered_map<uint64_t, Known> known;
-    thread_local uint64_t knownFrame = ~0ull;
-    if (knownFrame != g_r.frame)
-    {
-        known.clear();
-        knownFrame = g_r.frame;
-    }
+    thread_local FrameMap<Known> known;
     // (Resolved textures can change within a frame: not cached.)
     const bool cacheable = !ResolvedFor(fetch) && !RendererTracing();
     const uint64_t key = TextureKey(fetch.Address(), fetch.Format(), fetch.Width(), fetch.Height()) ^ uint64_t(fetch.dwords[0]) << 7 ^
         uint64_t(fetch.dwords[3] & 0xFFF) << 41 ^ uint64_t(fetch.dwords[1] & 0xC0) << 50;
     if (cacheable)
-        if (auto it = known.find(key); it != known.end())
+        if (const Known* k = known.Find(key, g_r.frame))
         {
-            format = it->second.format;
-            native = it->second.native;
-            return it->second.resource;
+            format = k->format;
+            native = k->native;
+            return k->resource;
         }
     ID3D12Resource* r = GetTextureLocked(fetch, format, native);
     if (cacheable && r)
-        known[key] = { r, format, native };
+        known.Put(key, g_r.frame, { r, format, native });
     return r;
 }
 
@@ -2796,6 +2797,18 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         native = cached.native;
         return cached.resource.Get();
     }
+    // A texture unchanged for many checks (most of them: loaded once) is checked every 4th
+    // frame (staggered), not every frame: hashing all textures in use cost ~0.5 ms a frame.
+    // Ones that change (video, render-to-texture on the CPU) never get here.
+    static const bool checkAlways = getenv("FM2_CHECK_TEXTURES_ALWAYS") != nullptr; // A/B
+    const uint64_t textureKey = TextureKey(fetch.Address(), fetch.Format(), w, h);
+    if (cached.resource && !checkAlways && !forceDecode && cached.unchanged >= 30 && ((g_r.frame + (textureKey >> 32)) & 3) != 0)
+    {
+        cached.checkedFrame = g_r.frame;
+        format = cached.format;
+        native = cached.native;
+        return cached.resource.Get();
+    }
     cached.checkedFrame = g_r.frame;
     // DXT formats stay compressed on the GPU (BC1-BC4): no decode, a quarter to an eighth of
     // the upload. D3D12 needs block-aligned sizes; others are decoded to RGBA8.
@@ -2808,12 +2821,14 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         (uint64_t(fetch.Tiled()) << 40) ^ (uint64_t(fetch.Endian()) << 44);
     if (cached.resource && cached.contentHash == hash && !forceDecode)
     {
+        cached.unchanged++;
         format = cached.format;
         native = cached.native;
         return cached.resource.Get();
     }
     const auto uploadStart = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool wasNew = !cached.resource;
+    cached.unchanged = 0;
     struct UploadLog
     {
         std::chrono::steady_clock::time_point start;
@@ -3088,6 +3103,47 @@ bool BuildIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize, std:
 
 namespace
 {
+// Expanded index lists (strips with restarts, fans, points, rectangles), kept across frames
+// and keyed by the draw's index parameters and a sampled hash of the guest indices (like
+// index buffers); each is copied into the ring once per frame.
+struct IndexListEntry
+{
+    bool valid = false, ok = false;
+    uint64_t sample = 0;
+    std::vector<uint32_t> list;
+    uint64_t frame = ~0ull; // the frame `offset` belongs to
+    UINT64 offset = 0;
+};
+
+IndexListEntry* CachedIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
+{
+    const uint32_t source = (initiator >> 6) & 3, count = initiator >> 16;
+    const bool is32 = (initiator >> 11) & 1;
+    uint64_t key = 0xCBF29CE484222325ull;
+    for (uint32_t v : { initiator, dmaBase, dmaSize, gpureg::Get(VGT_INDX_OFFSET), gpureg::Get(PA_SU_SC_MODE_CNTL) & (1u << 21),
+             gpureg::Get(VGT_MULTI_PRIM_IB_RESET_INDX) })
+        key = (key ^ v) * 0x100000001B3ull;
+    uint64_t sample = 0;
+    if (source == 0)
+    {
+        const uint32_t available = (dmaSize & 0xFFFFFF) * (is32 ? 1 : 2);
+        const uint32_t bytes = std::min(count, available) * (is32 ? 4 : 2);
+        sample = ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(dmaBase & ~(is32 ? 3u : 1u))), bytes);
+    }
+    thread_local std::unordered_map<uint64_t, IndexListEntry> cache;
+    if (cache.size() > 8192)
+        cache.clear();
+    IndexListEntry& e = cache[key];
+    if (!e.valid || e.sample != sample)
+    {
+        e.valid = true;
+        e.sample = sample;
+        e.frame = ~0ull;
+        e.ok = BuildIndexList(initiator, dmaBase, dmaSize, e.list);
+    }
+    return e.ok ? &e : nullptr;
+}
+
 // Origin (screen rows) and screen rectangle of the tile pass being replayed.
 struct TileState
 {
@@ -4874,9 +4930,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     const bool directIndex = g_r.physical && !noDirectIndex && (indexSource == 0 || indexSource == 2) &&
         (prim == 4 || prim == 13 || (prim == 6 && !restartOn));
     const uint32_t directVertices = prim == 4 ? indexCount / 3 * 3 : prim == 13 ? indexCount / 4 * 6 : (indexCount >= 3 ? (indexCount - 2) * 3 : 0);
-    thread_local std::vector<uint32_t> list; // reused between draws
-    list.clear();
-    if (directIndex ? directVertices == 0 : (!BuildIndexList(initiator, dmaBase, dmaSize, list) || list.empty()))
+    IndexListEntry* indexEntry = directIndex ? nullptr : CachedIndexList(initiator, dmaBase, dmaSize);
+    static const std::vector<uint32_t> noList;
+    const std::vector<uint32_t>& list = indexEntry ? indexEntry->list : noList;
+    if (directIndex ? directVertices == 0 : (!indexEntry || list.empty()))
     {
         TraceSkip("primitive", initiator);
         g_r.skippedThisFrame++;
@@ -4950,14 +5007,25 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 
     Section(3);
     // Index list.
-    const UINT64 listOffset = directIndex ? 0 : RingAlloc(list.size() * 4, 16);
+    UINT64 listOffset = 0;
+    if (!directIndex)
+    {
+        if (indexEntry->frame != g_r.frame)
+        {
+            indexEntry->offset = RingAlloc(list.size() * 4, 16);
+            if (indexEntry->offset != ~0ull)
+            {
+                memcpy(f.ringCpu + indexEntry->offset, list.data(), list.size() * 4);
+                indexEntry->frame = g_r.frame;
+            }
+        }
+        listOffset = indexEntry->offset;
+    }
     if (listOffset == ~0ull)
     {
         TraceSkip("ring full", initiator);
         return;
     }
-    if (!directIndex)
-        memcpy(f.ringCpu + listOffset, list.data(), list.size() * 4);
 
     // Vertex constants: c[256], bools, fetch table, info.
     struct VSConstants
@@ -5149,7 +5217,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     const uint32_t usedSlots = ps.info.usedTextureSlots | vs.info.usedTextureSlots;
     if (g_bindingsFrame != g_r.frame || g_bindingsEpoch != g_resolveEpoch)
     {
-        g_bindings.clear();
+        if (g_bindings.size() > (1u << 15)) // (entries carry their frame and epoch)
+            g_bindings.clear();
         g_bindingsFrame = g_r.frame;
         g_bindingsEpoch = g_resolveEpoch;
     }
