@@ -2688,21 +2688,26 @@ ID3D12Resource* ResolvedMipChain(const TextureFetch& fetch, const ResolvedTextur
     }
     if (levels.size() < 2)
         return nullptr;
+    // The levels are host textures (scaled with the render resolution): the chain is too.
+    // (At game size it held each level's top-left corner only: Laguna Seca's track-wide
+    // shadow map read from the wrong place, black patches on the road.)
+    const uint32_t hw = std::max(uint32_t(uint64_t(level0.hostWidth) * w / std::max(level0.width, 1u)), 1u);
+    const uint32_t hh = std::max(uint32_t(uint64_t(level0.hostHeight) * h / std::max(level0.height, 1u)), 1u);
 
     auto& chain = g_r.mipChains[fetch.Address()];
     if (chain.resource && chain.checkedFrame == g_r.frame)
         return chain.resource.Get();
     chain.checkedFrame = g_r.frame;
     const UINT count = UINT(levels.size());
-    if (!chain.resource || chain.width != w || chain.height != h || chain.format != level0.format ||
+    if (!chain.resource || chain.width != hw || chain.height != hh || chain.format != level0.format ||
         chain.resource->GetDesc().MipLevels != count)
     {
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC td{};
         td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        td.Width = w;
-        td.Height = h;
+        td.Width = hw;
+        td.Height = hh;
         td.DepthOrArraySize = 1;
         td.MipLevels = UINT16(count);
         td.SampleDesc.Count = 1;
@@ -2713,8 +2718,8 @@ ID3D12Resource* ResolvedMipChain(const TextureFetch& fetch, const ResolvedTextur
                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
                   IID_PPV_ARGS(&chain.resource)),
             "CreateCommittedResource(mip chain)"); CountCreate("mip chain");
-        chain.width = w;
-        chain.height = h;
+        chain.width = hw;
+        chain.height = hh;
         chain.format = level0.format;
     }
     std::vector<D3D12_RESOURCE_BARRIER> b(count + 1);
@@ -2737,7 +2742,7 @@ ID3D12Resource* ResolvedMipChain(const TextureFetch& fetch, const ResolvedTextur
         dst.SubresourceIndex = i;
         src.pResource = levels[i]->resource.Get();
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        const D3D12_BOX box{ 0, 0, 0, std::max(w >> i, 1u), std::max(h >> i, 1u), 1 };
+        const D3D12_BOX box{ 0, 0, 0, std::min(std::max(hw >> i, 1u), levels[i]->hostWidth), std::min(std::max(hh >> i, 1u), levels[i]->hostHeight), 1 };
         C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
     }
     for (auto& x : b)
@@ -5068,7 +5073,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // Debug bisection: FM2_SKIP_DRAWS=a-b drops draws a..b-1 of the FM2_DUMP_FRAME frame.
         static uint32_t skipFrom = 0, skipTo = 0;
         static const bool parsed = [] { if (const char* s = getenv("FM2_SKIP_DRAWS")) sscanf(s, "%u-%u", &skipFrom, &skipTo); return true; }();
-        static const uint64_t dumpFrame = getenv("FM2_DUMP_FRAME") ? strtoull(getenv("FM2_DUMP_FRAME"), nullptr, 10) : 0;
+        static const uint64_t envDumpFrame = getenv("FM2_DUMP_FRAME") ? strtoull(getenv("FM2_DUMP_FRAME"), nullptr, 10) : 0;
+        const uint64_t dumpFrame = g_hotkeyFrame.load(std::memory_order_relaxed) ? g_hotkeyFrame.load(std::memory_order_relaxed) : envDumpFrame; // (F12)
         (void)parsed;
         // FM2_SKIP_VS=h1,h2,...: drop those vertex shaders in the frame after the dump
         // (written to frame2.png), for an A/B pair under the same camera.
@@ -5084,7 +5090,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             return v;
         }();
         const bool skipThis = g_r.frame == dumpFrame && std::find(skipVs.begin(), skipVs.end(), C().vsHash) != skipVs.end();
-        // FM2_SWEEP="start,step,count" (with FM2_DUMP_FRAME as the first frame): frame
+        // FM2_SWEEP="start,step,count" (with FM2_DUMP_FRAME or F12 as the first frame): frame
         // dumpFrame+i drops draws [start+i*step, start+(i+1)*step) and is written to
         // out/sweep/<i>.png, so one run compares many skips on near-identical frames.
         static uint32_t sweepStart = 0, sweepStep = 0, sweepCount = 0;
@@ -5405,6 +5411,11 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         const bool clamp = ((fetch.dwords[0] >> 10) & 7) != 0;
         const bool point = ((fetch.dwords[3] >> 19) & 3) == 0;
         pc->tinfo[slot][0] = (point ? (clamp ? 2 : 3) : (clamp ? 1 : 0)) | ((uint32_t(fetch.ExpAdjust()) & 0x3F) << 8);
+        // Clamp to border on both axes (modes 6, 7): the shader returns the border colour
+        // outside the image (dword 5 bits 0-1: 1 white, else black).
+        const uint32_t clampX = (fetch.dwords[0] >> 10) & 7, clampY = (fetch.dwords[0] >> 13) & 7;
+        if (clampX >= 6 && clampY >= 6)
+            pc->tinfo[slot][0] |= (1u << 16) | ((fetch.dwords[5] & 3) == 1 ? 1u << 17 : 0u);
         pc->tbias[slot][0] = fetch.LodBias();
         memcpy(&pc->tbias[slot][1], &index, 4);
         // A resolved texture is as wide as the pitch it was resolved with; the fetch
@@ -6101,7 +6112,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     // FM2_DUMP_RESOLVES=1 (with FM2_DUMP_FRAME): also write every resolved texture to out/res.
     static std::vector<ResolveDump> resolveDumps;
     resolveDumps.clear();
-    if (dump && (getenv("FM2_DUMP_RESOLVES") || g_hotkeyFrame.load()))
+    if (dump && (getenv("FM2_DUMP_RESOLVES") || (g_hotkeyFrame.load() && g_r.frame == dumpFrame)))
     {
         auto add = [&](uint32_t base, ResolvedTexture& r, int variant) {
             if (!r.resource)
