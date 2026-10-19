@@ -2354,7 +2354,8 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     pd.RasterizerState.FrontCounterClockwise = ((mode & 4) == 0) != flip;
     // Only real triangle primitives keep the guest winding; generated geometry
     // (rectangle corners, point sprites) is never culled.
-    pd.RasterizerState.CullMode = !cullable ? D3D12_CULL_MODE_NONE
+    static const bool noCull = getenv("FM2_NO_CULL") != nullptr; // A/B
+    pd.RasterizerState.CullMode = !cullable || noCull ? D3D12_CULL_MODE_NONE
         : (mode & 3) == 1 ? D3D12_CULL_MODE_FRONT : (mode & 3) == 2 ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1;

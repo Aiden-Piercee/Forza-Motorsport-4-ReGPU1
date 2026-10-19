@@ -48,7 +48,6 @@ The keyboard only works while the game window has focus.
 
 - Bright surfaces (the asphalt) may be overexposed; not yet compared with
   the console.
-- Face culling is off (only a performance cost).
 - Races run at about 140-165 fps with a full grid at 2560x1440 on a fast desktop; set
   Max FPS to 360 to see how far your machine goes. Report stutters with the track, car
   and place (out\play.log has the slow frames when run with FM2_PERF=1).
