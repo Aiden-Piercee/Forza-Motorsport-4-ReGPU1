@@ -42,6 +42,8 @@ constexpr uint32_t kPacketBits = 2048 * 8;
 constexpr uint32_t kBlockBytes = 256;
 constexpr uint32_t kPacketBytes = 2048;
 
+const bool g_traceXma = getenv("FM2_TRACE_XMA") != nullptr;
+
 uint32_t Field(uint32_t ctx, int dword, int lo, int bits)
 {
     return (LoadBE32(ctx + dword * 4) >> lo) & ((1u << bits) - 1);
@@ -67,6 +69,7 @@ struct Decoder
     std::vector<int16_t> pcm; // decoded, interleaved, not yet in the output ring
     size_t pcmRead = 0;
     bool flush = true; // start of a stream or a jump: reset before the next packet
+    bool starved = false;
 
     void Close()
     {
@@ -103,11 +106,13 @@ struct Decoder
     // Decodes one 2 KB packet and appends its samples.
     void Decode(const uint8_t* data)
     {
+        const bool wasFlush = flush;
         if (flush)
         {
             avcodec_flush_buffers(av);
             flush = false;
         }
+        const size_t pcmBefore = pcm.size();
         if (av_new_packet(packet, kPacketBytes) < 0)
             return;
         memcpy(packet->data, data, kPacketBytes);
@@ -131,6 +136,8 @@ struct Decoder
             }
             av_frame_unref(frame);
         }
+        if (g_traceXma)
+            Log("xma: decoded a packet: %zu frames (flush %d)", (pcm.size() - pcmBefore) / channels, int(wasFlush));
     }
 };
 
@@ -185,7 +192,13 @@ bool Step(uint32_t ctx)
     {
         current ^= 1;
         if (!Field(ctx, 0, 20 + current, 1))
+        {
+            if (g_traceXma && !d.starved)
+                Log("xma: %08X starved (both input buffers consumed)", ctx);
+            d.starved = true;
             return false; // starved: both input buffers consumed
+        }
+        d.starved = false;
         SetField(ctx, 4, 31, 1, current);
         SetField(ctx, 2, 0, 26, 32);
     }
@@ -283,6 +296,9 @@ GUEST_EXPORT(XMAInitializeContext)
     SetField(c, 3, 0, 26, in(0x2C));
     SetField(c, 4, 0, 26, in(0x30));
     SetField(c, 0, 12, 8, *GuestPtr<uint8_t>(init + 0x34));
+    if (g_traceXma)
+        Log("xma: init %08X in0 %08X x%u in1 %08X x%u offset %u out %08X blocks %u ch %u rate %u loop %u-%u x%u", c, in(0x00), in(0x04), in(0x08), in(0x0C),
+            in(0x10), in(0x14), in(0x18), in(0x24), in(0x28), in(0x2C), in(0x30), *GuestPtr<uint8_t>(init + 0x34));
     if (auto it = g_decoders.find(c); it != g_decoders.end())
     {
         it->second.flush = true;
@@ -295,6 +311,9 @@ GUEST_EXPORT(XMAInitializeContext)
 GUEST_EXPORT(XMAEnableContext)
 {
     std::lock_guard lock(g_mutex);
+    if (g_traceXma)
+        Log("xma: enable %08X (read offset %u, in0 %u in1 %u valid, current %u)", ctx.r3.u32, Field(ctx.r3.u32, 2, 0, 26), Field(ctx.r3.u32, 0, 20, 1),
+            Field(ctx.r3.u32, 0, 21, 1), Field(ctx.r3.u32, 4, 31, 1));
     g_enabled.insert(ctx.r3.u32);
     while (Step(ctx.r3.u32))
         ;
@@ -304,6 +323,8 @@ GUEST_EXPORT(XMAEnableContext)
 GUEST_EXPORT(XMADisableContext)
 {
     std::lock_guard lock(g_mutex);
+    if (g_traceXma)
+        Log("xma: disable %08X", ctx.r3.u32);
     g_enabled.erase(ctx.r3.u32);
     Return(ctx, 0);
 }
@@ -331,8 +352,16 @@ GUEST_EXPORT(XMASetInputBufferReadOffset)
 {
     // A seek: the decoder starts over at the new packet.
     std::lock_guard lock(g_mutex);
+    if (g_traceXma)
+        Log("xma: seek %08X to offset %u (was %u), in0 %08X x%u in1 %08X x%u, out %08X blocks %u write %u read %u, skip %u", ctx.r3.u32, ctx.r4.u32,
+            Field(ctx.r3.u32, 2, 0, 26), LoadBE32(ctx.r3.u32 + 20), Field(ctx.r3.u32, 0, 0, 12), LoadBE32(ctx.r3.u32 + 24), Field(ctx.r3.u32, 1, 0, 12),
+            LoadBE32(ctx.r3.u32 + 28), Field(ctx.r3.u32, 0, 22, 5), Field(ctx.r3.u32, 0, 27, 5), Field(ctx.r3.u32, 9, 0, 5), Field(ctx.r3.u32, 1, 17, 3));
     SetField(ctx.r3.u32, 2, 0, 26, ctx.r4.u32);
-    if (auto it = g_decoders.find(ctx.r3.u32); it != g_decoders.end())
+    // The title restarts the decoder at the first frame of each next pair of packets (a seek
+    // within a stream it reads in order). The codec keeps its overlap and its unfinished frame
+    // across that, as the hardware does; resetting it dropped most of every pair's audio.
+    static const bool flushOnSeek = getenv("FM2_XMA_SEEK_FLUSH") != nullptr;
+    if (auto it = g_decoders.find(ctx.r3.u32); it != g_decoders.end() && flushOnSeek)
         it->second.flush = true;
     Return(ctx, 0);
 }
@@ -353,7 +382,7 @@ GUEST_EXPORT(XMAGetOutputBufferWriteOffset)
     GUEST_EXPORT(XMASet##Name##Valid)                                \
     {                                                                \
         std::lock_guard lock(g_mutex);                               \
-        SetField(ctx.r3.u32, dword, bit, 1, 1);                      \
+        if (g_traceXma)                                                          Log("xma: %08X " #Name " valid", ctx.r3.u32);                    SetField(ctx.r3.u32, dword, bit, 1, 1);                      \
         Return(ctx, 0);                                              \
     }
 

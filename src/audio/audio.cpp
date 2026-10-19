@@ -29,6 +29,8 @@ constexpr uint32_t kTargetQueued = 4, kMaxQueued = 8;
 std::atomic<uint32_t> g_callback{ 0 };
 std::atomic<uint32_t> g_callbackArg{ 0 };
 std::shared_ptr<ThreadObject> g_audioThread;
+// FM2_TRACE_AUDIO=1: once a second, the callbacks run, frames submitted and frames dropped.
+std::atomic<uint32_t> g_statCallbacks{ 0 }, g_statSubmitted{ 0 }, g_statDropped{ 0 }, g_statSkipped{ 0 };
 
 struct Output : IXAudio2VoiceCallback
 {
@@ -80,8 +82,12 @@ struct Output : IXAudio2VoiceCallback
     // One title frame: planar big-endian floats to interleaved host floats.
     void Submit(uint32_t samples)
     {
+        g_statSubmitted++;
         if (!ok || queued.load() >= int(kRingFrames) - 1)
+        {
+            g_statDropped++;
             return;
+        }
         float* out = &ring[size_t(next) * kFrameSamples * kChannels];
         const uint32_t* in = GuestPtr<uint32_t>(samples);
         for (uint32_t c = 0; c < kChannels; c++)
@@ -126,22 +132,36 @@ void AudioLoop(PPCContext& ctx)
     timeBeginPeriod(1);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     auto next = Clock::now();
+    static const bool trace = getenv("FM2_TRACE_AUDIO") != nullptr;
+    auto lastStat = Clock::now();
     for (;;)
     {
         next += std::chrono::microseconds(5333);
         std::this_thread::sleep_until(next);
         const int queued = g_output.queued.load();
+        if (trace && Clock::now() - lastStat >= std::chrono::seconds(1))
+        {
+            lastStat = Clock::now();
+            Log("audio: 1 s: %u callbacks, %u frames submitted, %u dropped, %u ticks skipped, queued %d, loop %.0f ms behind", g_statCallbacks.exchange(0),
+                g_statSubmitted.exchange(0), g_statDropped.exchange(0), g_statSkipped.exchange(0), queued,
+                std::chrono::duration<double, std::milli>(Clock::now() - next).count());
+        }
         if (g_output.ok && queued > int(kMaxQueued))
+        {
+            g_statSkipped++;
             continue; // the device is behind: skip a tick
+        }
         const uint32_t cb = g_callback;
         if (!cb)
             continue;
         ctx.r3.u64 = g_callbackArg;
+        g_statCallbacks++;
         GuestCall(ctx, cb);
         // The device is about to run dry: one extra tick now.
         if (g_output.ok && queued < int(kTargetQueued) / 2)
         {
             ctx.r3.u64 = g_callbackArg;
+            g_statCallbacks++;
             GuestCall(ctx, cb);
         }
     }
