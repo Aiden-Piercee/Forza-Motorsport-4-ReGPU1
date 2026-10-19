@@ -373,6 +373,40 @@ bool CopyTextureBlocks(const TextureFetch& fetch, uint8_t* dst, uint32_t dstRowP
     return true;
 }
 
+bool TextureMipLevel(const TextureFetch& base, uint32_t level, TextureFetch& out)
+{
+    FormatInfo info;
+    if (!Info(base.Format(), info))
+        return false;
+    if (level == 0)
+    {
+        out = base;
+        return true;
+    }
+    const uint32_t w = base.Width(), h = base.Height();
+    if (!base.MipAddress() || level > base.MipMaxLevel() || !base.Tiled() || (w & (w - 1)) || (h & (h - 1)))
+        return false;
+    uint32_t address = base.MipAddress();
+    for (uint32_t l = 1;; l++)
+    {
+        const uint32_t lw = std::max(w >> l, 1u), lh = std::max(h >> l, 1u);
+        if (std::min(lw, lh) <= 16) // the packed tail (small levels share a tile): not read
+            return false;
+        if (l == level)
+        {
+            out = base;
+            out.dwords[0] &= ~(0x1FFu << 22); // pitch: the level's own width
+            out.dwords[1] = (out.dwords[1] & 0xFFF) | address;
+            out.dwords[2] = (out.dwords[2] & ~0x3FFFFFFu) | (lw - 1) | ((lh - 1) << 13);
+            return true;
+        }
+        // Each level is padded to 32x32 blocks (a tile) and 4 KB.
+        const uint32_t bx = (lw + info.blockSize - 1) / info.blockSize, by = (lh + info.blockSize - 1) / info.blockSize;
+        const uint32_t bytes = (((bx + 31) & ~31u) * ((by + 31) & ~31u)) << info.log2Bytes;
+        address += (bytes + 4095) & ~4095u;
+    }
+}
+
 uint32_t TextureFaceStride(const TextureFetch& fetch)
 {
     FormatInfo info;

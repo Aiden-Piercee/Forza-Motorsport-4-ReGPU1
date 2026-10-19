@@ -40,5 +40,9 @@ uint32_t TextureBCKind(uint32_t format);
 // to dst, rows of blocks dstRowPitch bytes apart. No swizzle is applied (the GPU does it).
 bool CopyTextureBlocks(const TextureFetch& fetch, uint8_t* dst, uint32_t dstRowPitch);
 
+// The fetch constant of mip level `level` (its address, size and pitch), for tiled
+// power-of-two textures down to the packed tail (levels 32 texels and up); false otherwise.
+bool TextureMipLevel(const TextureFetch& base, uint32_t level, TextureFetch& out);
+
 // Bytes between the faces of a cube texture (each face is a padded 2D slice).
 uint32_t TextureFaceStride(const TextureFetch& fetch);

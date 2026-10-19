@@ -2846,6 +2846,18 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
                     isNew ? "new" : "changed", ms);
         }
     } uploadLog{ uploadStart, fetch, wasNew };
+    // The title's own mip levels (distant surfaces sample the smaller, averaged ones: without
+    // them the road and grass shimmer and look grainy). Down to the packed tail.
+    static const bool noMips = getenv("FM2_NO_MIPS") != nullptr; // A/B
+    std::vector<TextureFetch> levels{ fetch };
+    for (uint32_t l = 1; !noMips && !forceDecode; l++)
+    {
+        TextureFetch level;
+        if (!TextureMipLevel(fetch, l, level))
+            break;
+        levels.push_back(level);
+    }
+    const UINT16 mipCount = UINT16(levels.size());
     if (bc)
     {
         static const DXGI_FORMAT bcFormats[] = { DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_BC3_UNORM,
@@ -2854,8 +2866,8 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         const uint32_t blockBytes = bc == 1 || bc == 4 ? 8 : 16;
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition.Subresource = 0;
-        if (!cached.resource || cached.width != w || cached.height != h || cached.format != bcFormat)
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        if (!cached.resource || cached.width != w || cached.height != h || cached.format != bcFormat || cached.resource->GetDesc().MipLevels != mipCount)
         {
             D3D12_HEAP_PROPERTIES hp{};
             hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -2864,7 +2876,7 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
             td.Width = w;
             td.Height = h;
             td.DepthOrArraySize = 1;
-            td.MipLevels = 1;
+            td.MipLevels = mipCount;
             td.SampleDesc.Count = 1;
             td.Format = bcFormat;
             RetireTexture(std::move(cached.resource));
@@ -2880,20 +2892,25 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
             b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
             C().list->ResourceBarrier(1, &b);
         }
-        const UINT rowPitch = ((w / 4) * blockBytes + 255) & ~255u;
-        const UINT64 offset = RingAlloc(UINT64(rowPitch) * (h / 4), 512);
-        if (offset == ~0ull)
-            return nullptr;
-        CopyTextureBlocks(fetch, Frame().ringCpu + offset, rowPitch);
-        D3D12_TEXTURE_COPY_LOCATION dst{};
-        dst.pResource = cached.resource.Get();
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        D3D12_TEXTURE_COPY_LOCATION src{};
-        src.pResource = Frame().ring.Get();
-        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        src.PlacedFootprint.Offset = offset;
-        src.PlacedFootprint.Footprint = { bcFormat, w, h, 1, rowPitch };
-        C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        for (UINT16 l = 0; l < mipCount; l++)
+        {
+            const uint32_t lw = levels[l].Width(), lh = levels[l].Height();
+            const UINT rowPitch = (((lw + 3) / 4) * blockBytes + 255) & ~255u;
+            const UINT64 offset = RingAlloc(UINT64(rowPitch) * ((lh + 3) / 4), 512);
+            if (offset == ~0ull)
+                return nullptr;
+            CopyTextureBlocks(levels[l], Frame().ringCpu + offset, rowPitch);
+            D3D12_TEXTURE_COPY_LOCATION dst{};
+            dst.pResource = cached.resource.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.SubresourceIndex = l;
+            D3D12_TEXTURE_COPY_LOCATION src{};
+            src.pResource = Frame().ring.Get();
+            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            src.PlacedFootprint.Offset = offset;
+            src.PlacedFootprint.Footprint = { bcFormat, (lw + 3) & ~3u, (lh + 3) & ~3u, 1, rowPitch };
+            C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
         b.Transition.pResource = cached.resource.Get();
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -2924,7 +2941,8 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         Log("renderer: wrote texture.png (%s %ux%u, endian %u, tiled %u, pitch %u)", TextureFormatName(fetch.Format()), w, h, fetch.Endian(),
             fetch.Tiled(), fetch.Pitch());
     }
-    if (!cached.resource || cached.width != w || cached.height != h || cached.format != DXGI_FORMAT_R8G8B8A8_UNORM)
+    if (!cached.resource || cached.width != w || cached.height != h || cached.format != DXGI_FORMAT_R8G8B8A8_UNORM ||
+        cached.resource->GetDesc().MipLevels != mipCount)
     {
         cached.format = DXGI_FORMAT_R8G8B8A8_UNORM;
         cached.native = false;
@@ -2935,7 +2953,7 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         td.Width = w;
         td.Height = h;
         td.DepthOrArraySize = 1;
-        td.MipLevels = 1;
+        td.MipLevels = mipCount;
         td.SampleDesc.Count = 1;
         td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         RetireTexture(std::move(cached.resource));
@@ -2948,30 +2966,37 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition.pResource = cached.resource.Get();
-        b.Transition.Subresource = 0;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
         C().list->ResourceBarrier(1, &b);
     }
-    const UINT rowPitch = (w * 4 + 255) & ~255u;
-    const UINT64 offset = RingAlloc(UINT64(rowPitch) * h, 512);
-    if (offset == ~0ull)
-        return nullptr;
-    for (uint32_t y = 0; y < h; y++)
-        memcpy(Frame().ringCpu + offset + UINT64(y) * rowPitch, &rgba[size_t(y) * w * 4], size_t(w) * 4);
-    D3D12_TEXTURE_COPY_LOCATION dst{};
-    dst.pResource = cached.resource.Get();
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    D3D12_TEXTURE_COPY_LOCATION src{};
-    src.pResource = Frame().ring.Get();
-    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint.Offset = offset;
-    src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1, rowPitch };
-    C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    for (UINT16 l = 0; l < mipCount; l++)
+    {
+        if (l > 0 && !DecodeTexture(levels[l], rgba))
+            return nullptr;
+        const uint32_t lw = levels[l].Width(), lh = levels[l].Height();
+        const UINT rowPitch = (lw * 4 + 255) & ~255u;
+        const UINT64 offset = RingAlloc(UINT64(rowPitch) * lh, 512);
+        if (offset == ~0ull)
+            return nullptr;
+        for (uint32_t y = 0; y < lh; y++)
+            memcpy(Frame().ringCpu + offset + UINT64(y) * rowPitch, &rgba[size_t(y) * lw * 4], size_t(lw) * 4);
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = cached.resource.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = l;
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = Frame().ring.Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Offset = offset;
+        src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, lw, lh, 1, rowPitch };
+        C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = cached.resource.Get();
-    b.Transition.Subresource = 0;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     C().list->ResourceBarrier(1, &b);
