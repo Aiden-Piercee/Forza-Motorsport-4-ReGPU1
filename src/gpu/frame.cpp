@@ -47,6 +47,8 @@ struct ShaderUpload
     uint64_t hash = 0;           // Fnv1a of the used dwords ^ type
 };
 std::unordered_map<uint64_t, ShaderUpload> g_uploads;
+// The same uploads by guest address: a repeat from the same place costs one compare.
+std::unordered_map<uint64_t, const ShaderUpload*> g_uploadsAt;
 
 uint64_t FastKey(const uint32_t* p, uint32_t dwords, uint32_t type)
 {
@@ -150,11 +152,18 @@ void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dw
 {
     if (!dwords || dwords > 0x10000)
         return;
+    const uint64_t at = uint64_t(guestAddress) << 32 ^ uint64_t(dwords) << 2 ^ uint32_t(type);
+    if (auto it = g_uploadsAt.find(at); it != g_uploadsAt.end() && memcmp(it->second->words.data(), microcodeBE, dwords * 4) == 0)
+    {
+        RendererSetShader(uint32_t(type), microcodeBE, it->second->used, it->second->hash);
+        return;
+    }
     const uint64_t key = FastKey(microcodeBE, dwords, uint32_t(type));
     auto it = g_uploads.find(key);
     if (it != g_uploads.end() && it->second.words.size() == dwords && memcmp(it->second.words.data(), microcodeBE, dwords * 4) == 0)
     {
         RendererSetShader(uint32_t(type), microcodeBE, it->second.used, it->second.hash);
+        g_uploadsAt[at] = &it->second;
         return; // seen before: already logged and dumped
     }
     const uint32_t raw = dwords;
@@ -162,8 +171,13 @@ void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dw
     const uint64_t hash = Fnv1a(microcodeBE, dwords) ^ uint64_t(type);
     RendererSetShader(uint32_t(type), microcodeBE, dwords, hash);
     if (g_uploads.size() > 8192)
+    {
         g_uploads.clear();
-    g_uploads[key] = ShaderUpload{ std::vector<uint32_t>(microcodeBE, microcodeBE + raw), dwords, hash };
+        g_uploadsAt.clear();
+    }
+    auto& entry = g_uploads[key];
+    entry = ShaderUpload{ std::vector<uint32_t>(microcodeBE, microcodeBE + raw), dwords, hash };
+    g_uploadsAt[at] = &entry;
     if (!g_shaders.insert(hash).second)
         return;
     if (g_shaders.size() % 50 == 1)

@@ -2169,7 +2169,7 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format, bool&
         native = cached.native;
         return cached.resource.Get();
     }
-    const auto uploadStart = std::chrono::steady_clock::now();
+    const auto uploadStart = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool wasNew = !cached.resource;
     struct UploadLog
     {
@@ -2178,8 +2178,10 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format, bool&
         bool isNew;
         ~UploadLog()
         {
+            if (!g_perfTiming)
+                return;
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-            if (g_perfTiming && ms > 2.0)
+            if (ms > 2.0)
                 Log("perf: texture %08X %s %ux%u %s took %.1f ms", fetch.Address(), TextureFormatName(fetch.Format()), fetch.Width(), fetch.Height(),
                     isNew ? "new" : "changed", ms);
         }

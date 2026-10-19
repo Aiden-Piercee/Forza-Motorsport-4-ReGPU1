@@ -398,8 +398,12 @@ void StartThreadProfiler()
             CONTEXT c{};
             c.ContextFlags = CONTEXT_CONTROL;
             const bool ok = GetThreadContext(handle, &c);
+            // Symbols are looked up after the thread runs again: the lookups take locks
+            // (heap, loader) that the suspended thread may hold.
+            ResumeThread(handle);
+            if (!ok)
+                continue;
             std::string name;
-            if (ok)
             {
                 alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256];
                 auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
@@ -414,9 +418,6 @@ void StartThreadProfiler()
                                          reinterpret_cast<LPCSTR>(c.Rip), &module) && GetModuleFileNameA(module, path, MAX_PATH))
                     name = std::string("? ") + (strrchr(path, 92) ? strrchr(path, 92) + 1 : path);
             }
-            ResumeThread(handle);
-            if (!ok)
-                continue;
             counts[name]++;
             samples++;
             if (std::chrono::steady_clock::now() - lastLog > std::chrono::seconds(5))
