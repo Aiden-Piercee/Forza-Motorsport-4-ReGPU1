@@ -58,8 +58,10 @@ public:
     }
     void OMSetRenderTargets(UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* rtvs, BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* dsv)
     {
-        // Only the forms the renderer uses: up to one render target, optional depth.
-        struct A { UINT n; BOOL single, hasDsv; D3D12_CPU_DESCRIPTOR_HANDLE rtv, dsv; } a{ n, single, dsv != nullptr, n ? *rtvs : D3D12_CPU_DESCRIPTOR_HANDLE{}, dsv ? *dsv : D3D12_CPU_DESCRIPTOR_HANDLE{} };
+        // Only the forms the renderer uses: up to two render targets (separate handles), optional depth.
+        struct A { UINT n; BOOL single, hasDsv; D3D12_CPU_DESCRIPTOR_HANDLE rtv[2], dsv; } a{ n, single, dsv != nullptr, {}, dsv ? *dsv : D3D12_CPU_DESCRIPTOR_HANDLE{} };
+        for (UINT i = 0; i < n && i < 2; i++)
+            a.rtv[i] = rtvs[i];
         Put(kTargets, &a, sizeof(a));
     }
     void SetPipelineState(ID3D12PipelineState* p) { Put(kPipeline, &p, sizeof(p)); }
@@ -239,9 +241,9 @@ private:
             }
             case kTargets:
             {
-                struct A { UINT n; BOOL single, hasDsv; D3D12_CPU_DESCRIPTOR_HANDLE rtv, dsv; };
+                struct A { UINT n; BOOL single, hasDsv; D3D12_CPU_DESCRIPTOR_HANDLE rtv[2], dsv; };
                 const A& c = At<A>(a);
-                l->OMSetRenderTargets(c.n, c.n ? &c.rtv : nullptr, c.single, c.hasDsv ? &c.dsv : nullptr);
+                l->OMSetRenderTargets(c.n, c.n ? c.rtv : nullptr, c.single, c.hasDsv ? &c.dsv : nullptr);
                 break;
             }
             case kPipeline: l->SetPipelineState(At<ID3D12PipelineState*>(a)); break;

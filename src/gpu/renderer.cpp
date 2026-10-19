@@ -80,6 +80,11 @@ uint32_t OutputHeight()
 // Upscaling: the 3D scene of a frame renders at this fraction of the output (1 otherwise);
 // after the scene is upscaled (UpscaleScene), the rest of the frame renders at full size.
 float g_sceneScale = 1.0f;
+// The scene of this frame is still being drawn and is upscaled when it is done (any
+// upscaler; with a temporal one, also at native scale for anti-aliasing).
+bool g_scenePhase = false;
+// A temporal upscaler this frame: the scene's main view draws with motion vectors and jitter.
+bool g_temporal = false;
 struct Upscale
 {
     bool tried = false, ready = false;
@@ -89,6 +94,24 @@ struct Upscale
     uint32_t tempWidth = 0, tempHeight = 0;
     bool switchedThisFrame = false;
     uint64_t retryFrame = 0; // after a frame with no scene to upscale (menus): native until then
+    // Temporal upscalers: the motion target (RG16F, output size; UV offsets to last frame),
+    // this frame's jitter (pixels and NDC) and the scene's render size.
+    ComPtr<ID3D12Resource> motion;
+    ComPtr<ID3D12DescriptorHeap> motionRtvHeap;
+    D3D12_CPU_DESCRIPTOR_HANDLE motionRtv{};
+    float jitterPx[2] = {}, jitterNdc[2] = {};
+    uint32_t renderWidth = 0, renderHeight = 0;
+    bool reset = true; // no usable history (first frame, after menus)
+    // Each draw's vertex constants, kept for the same draw in the next frame (keyed by
+    // shaders, vertex and index data and occurrence).
+    struct DrawConstants
+    {
+        uint32_t frame = 0;                    // the temporal frame that last drew it
+        D3D12_GPU_VIRTUAL_ADDRESS address[2]{}; // its vertex constants in that frame's ring, by frame parity
+    };
+    std::unordered_map<uint64_t, DrawConstants> constants;
+    std::unordered_map<uint64_t, uint32_t> occurrences;
+    uint32_t constantsFrame = 0;
 } g_upscale;
 
 float ScaleY() { return float(OutputHeight()) / float(kHeight) * g_sceneScale; }
@@ -167,6 +190,8 @@ struct CompiledShader
     std::vector<uint32_t> ucodeBE; // saved to the shader cache once a pipeline uses it
     ComPtr<ID3DBlob> code;
     TranslatedShader info;
+    const CompiledShader* hlslSource = nullptr; // canonical variants: the shader whose code (and HLSL) this reuses
+    mutable const CompiledShader* motion = nullptr; // its motion-vector variant, once looked up
     bool IsReady() const { return state.load(std::memory_order_acquire) == Ready; }
 };
 
@@ -278,6 +303,7 @@ struct Renderer
     ComPtr<ID3D12DescriptorHeap> rtvHeap, dsvHeap;
     ComPtr<ID3D12DescriptorHeap> blitRtvHeap;             // one RTV, rewritten per depth resolve
     ComPtr<ID3D12RootSignature> blitRootSignature;
+    ComPtr<ID3D12RootSignature> motionRootSignature; // root signature + b2 (motion-vector pipelines)
     ComPtr<ID3D12PipelineState> depthBlit;                // depth buffer -> R32_FLOAT
     ComPtr<ID3D12PipelineState> colorBlit8, colorBlit16;  // colour -> 8888 / RGBA16F, scaled
     // EDRAM surfaces: one host colour and one host depth target per EDRAM base
@@ -519,6 +545,8 @@ struct DrawState
     ID3D12PipelineState* pso = nullptr;
     D3D12_GPU_DESCRIPTOR_HANDLE table2{}, table3{};
     D3D_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    bool motionTargets = false; // the motion target is bound as the second render target
+    bool motionRoot = false;    // the motion root signature is set
     D3D12_INDEX_BUFFER_VIEW indexBuffer{};
     void Invalidate() { *this = DrawState{}; }
 } g_drawState;
@@ -687,7 +715,7 @@ void Init()
         bindless[i].RegisterSpace = 1 + i;
         bindless[i].OffsetInDescriptorsFromTableStart = 0;
     }
-    D3D12_ROOT_PARAMETER params[4]{};
+    D3D12_ROOT_PARAMETER params[5]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -724,6 +752,17 @@ void Init()
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)))
         Fatal("renderer: root signature: %s", error ? static_cast<const char*>(error->GetBufferPointer()) : "?");
     Check(d->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&g_r.rootSignature)), "CreateRootSignature");
+    // Motion-vector pipelines: the same plus b2, last frame's vertex constants of the draw.
+    params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[4].Descriptor.ShaderRegister = 2;
+    params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    rs.NumParameters = 5;
+    blob.Reset();
+    error.Reset();
+    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)))
+        Fatal("renderer: motion root signature: %s", error ? static_cast<const char*>(error->GetBufferPointer()) : "?");
+    Check(d->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&g_r.motionRootSignature)),
+        "CreateRootSignature(motion)");
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -818,6 +857,9 @@ FrameResources& Frame() { return g_r.frames[g_r.frameIndex]; }
 void TransitionColor(D3D12_RESOURCE_STATES to);
 
 // Gets (creating on first use) the host surface for an EDRAM base.
+bool TemporalInit();
+void BeginTemporalFrame();
+
 Renderer::Surface& GetSurface(bool depth, uint32_t base)
 {
     auto& map = depth ? g_r.depthSurfaces : g_r.colorSurfaces;
@@ -910,6 +952,7 @@ void SelectSurfaces(bool force)
     PassMark("pass colour %03X depth %03X", colorBase, depthBase);
     TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
     g_r.list->OMSetRenderTargets(1, &g_r.rtv, FALSE, &g_r.dsv);
+    g_drawState.motionTargets = false;
 }
 
 // Bindless texture descriptors: one per (resource, format, dimension), kept
@@ -1069,11 +1112,18 @@ void BeginFrameIfNeeded()
     }
     f.allocator->Reset();
     g_r.list->Reset(f.allocator.Get(), nullptr);
-    // This frame's scene scale (see UpscaleScene).
+    // This frame's scene phase and scale (see UpscaleScene).
     {
-        const float scale = GetSettings().upscaler == Settings::Upscaler::Fsr1 ? GetSettings().SceneScale() : 1.0f;
+        const Settings& st = GetSettings();
+        const bool temporalUpscaler = st.upscaler == Settings::Upscaler::Dlss || st.upscaler == Settings::Upscaler::Fsr3;
+        const float scale = st.SceneScale();
         g_upscale.switchedThisFrame = false;
-        g_sceneScale = scale < 1.0f && g_r.frame >= g_upscale.retryFrame ? scale : 1.0f;
+        g_scenePhase = st.upscaler != Settings::Upscaler::Off && (temporalUpscaler || scale < 1.0f) && g_r.frame >= g_upscale.retryFrame &&
+            (!temporalUpscaler || TemporalInit());
+        g_temporal = g_scenePhase && temporalUpscaler;
+        g_sceneScale = g_scenePhase ? scale : 1.0f;
+        if (g_temporal)
+            BeginTemporalFrame();
     }
     PassMark("frame start %u%u", 0, 0);
     if (perf && g_timestamps)
@@ -1666,6 +1716,7 @@ const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& code
                 cs.info.vertexFetchConstants = std::move(layout.vertexFetchConstants);
                 cs.cacheKey = base.cacheKey;
                 cs.code = base.code;
+                cs.hlslSource = &base;
                 cs.state = CompiledShader::Ready;
                 g_stats.shadersCached++;
                 path = "variant";
@@ -1763,6 +1814,136 @@ const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& code
     }
     g_compiler.Push(&cs, background);
     return cs;
+}
+
+// Motion-vector variant of a translated shader (temporal upscalers). Built by rewriting the
+// generated HLSL, so default shaders (and their caches) stay as they are:
+// - the vertex constants gain last frame's c[] (vcPrev, see DrawImpl) and the frame's
+//   jitter (vjitter, NDC units);
+// - the vertex shader runs the guest program a second time with vcPrev (GuestVSPrev), puts
+//   both clip positions in two more interpolants and jitters only the rasterized position;
+// - the pixel shader also writes the motion to SV_Target1 as a UV offset (previous minus
+//   current, in the 0..1 range of the target).
+// Empty when the shader's text is not in the expected shape.
+std::string MotionVariant(const std::string& hlsl, bool pixel)
+{
+    std::string h = hlsl;
+    auto replace = [&](const std::string& from, const std::string& to) {
+        const size_t at = h.find(from);
+        if (at == std::string::npos)
+            return false;
+        h.replace(at, from.size(), to);
+        return true;
+    };
+    if (!replace("    float4 vwide;\n};", "    float4 vwide;\n    float4 vjitter;\n};\ncbuffer VSPrevious : register(b2)\n{\n    float4 vcPrev[256];\n};") ||
+        !replace("    float2 pcoord : TEXCOORD16; // point sprite coordinate\n",
+            "    float2 pcoord : TEXCOORD16; // point sprite coordinate\n    float4 mcur : TEXCOORD17;\n    float4 mprev : TEXCOORD18;\n"))
+        return {};
+    if (pixel)
+    {
+        if (!replace("float4 main(VSOut input) : SV_Target0\n{", "struct PSMotionOut { float4 c : SV_Target0; float2 mv : SV_Target1; };\n"
+                                                                    "PSMotionOut main(VSOut input)\n{"))
+            return {};
+        const size_t at = h.rfind("    return oC[0];\n}");
+        if (at == std::string::npos)
+            return {};
+        h.replace(at, std::string("    return oC[0];\n}").size(),
+            "    PSMotionOut motionOut;\n"
+            "    motionOut.c = oC[0];\n"
+            "    float2 cur = input.mcur.xy / input.mcur.w, prev = input.mprev.xy / input.mprev.w;\n"
+            "    motionOut.mv = (prev - cur) * float2(0.5, -0.5);\n"
+            "    return motionOut;\n}");
+        return h;
+    }
+    // Vertex shader: GuestVSPrev, a copy of the guest program reading last frame's constants.
+    const std::string sig = "void GuestVS(uint vindex, out float4 opos, out float4 o[16], out float4 opts)\n{";
+    const size_t start = h.find(sig);
+    const size_t end = h.find("}\nvoid GuestVS(uint vindex, out float4 opos, out float4 o[16])\n", start);
+    if (start == std::string::npos || end == std::string::npos)
+        return {};
+    std::string prev = h.substr(start, end + 2 - start);
+    prev.replace(0, std::string("void GuestVS(").size(), "void GuestVSPrev(");
+    for (size_t at = 0; (at = prev.find("vc[", at)) != std::string::npos; at += 7)
+        prev.replace(at, 3, "vcPrev[");
+    h.insert(end + 2, prev);
+    // The viewport transform (from the target size to the clip position) as a function.
+    const std::string from = "    float2 size = float2(vinfo.zw);\n";
+    const std::string last = "    r.pos = float4(ndc * w, p.z * w, w);\n";
+    const size_t a = h.find(from), b = h.find(last);
+    const size_t mainAt = h.find("VSOut main(uint id : SV_VertexID)\n{");
+    if (a == std::string::npos || b == std::string::npos || mainAt == std::string::npos || b < a || a < mainAt)
+        return {};
+    std::string body = h.substr(a, b - a);
+    for (size_t at = 0; (at = body.find("r.pos", at)) != std::string::npos; at += 3)
+        body.replace(at, 5, "pos");
+    const std::string fn = "float4 ToClip(float4 pos, float2 pointOffset)\n{\n" + body + "    return float4(ndc * w, p.z * w, w);\n}\n";
+    h.replace(a, b + last.size() - a,
+        "    r.pos = ToClip(r.pos, pointOffset);\n"
+        "    r.mcur = r.pos;\n"
+        "    r.mprev = r.pos;\n"
+        "    if (!isPoint && !rect)\n"
+        "    {\n"
+        "        float4 q, qo[16], qpts;\n"
+        "        GuestVSPrev(e, q, qo, qpts);\n"
+        "        r.mprev = ToClip(q, pointOffset);\n"
+        "    }\n"
+        "    r.pos.xy += vjitter.xy * r.pos.w;\n");
+    h.insert(mainAt, fn);
+    // VSOut members the original code never sets.
+    return h;
+}
+
+// The motion-vector variant of a shader (compiled on first use; nullptr if it cannot be made).
+std::unordered_map<uint64_t, std::unique_ptr<CompiledShader>> g_motionShaders;
+const CompiledShader* MotionShaderLookup(const CompiledShader& base);
+const CompiledShader* MotionShader(const CompiledShader& base)
+{
+    if (base.motion && base.motion->state.load(std::memory_order_acquire) != CompiledShader::Pending)
+        return base.motion->state.load(std::memory_order_acquire) == CompiledShader::Failed ? nullptr : base.motion;
+    const CompiledShader* m = MotionShaderLookup(base);
+    base.motion = m;
+    return m;
+}
+
+const CompiledShader* MotionShaderLookup(const CompiledShader& base)
+{
+    const CompiledShader& source = base.hlslSource ? *base.hlslSource : base;
+    auto [it, inserted] = g_motionShaders.try_emplace(source.cacheKey);
+    if (!inserted)
+        return it->second->state.load(std::memory_order_acquire) == CompiledShader::Failed ? nullptr : it->second.get();
+    it->second = std::make_unique<CompiledShader>();
+    CompiledShader& cs = *it->second;
+    cs.hash = source.hash;
+    cs.pixel = source.pixel;
+    cs.info = source.info;
+    cs.info.hlsl = MotionVariant(source.info.hlsl, source.pixel);
+    if (cs.info.hlsl.empty())
+    {
+        LOG_ONCE("upscale: no motion-vector variant for %s %016llx", source.pixel ? "ps" : "vs", (unsigned long long)source.hash);
+        cs.state = CompiledShader::Failed;
+        return nullptr;
+    }
+    cs.cacheKey = Fnv(cs.info.hlsl.data(), cs.info.hlsl.size(), source.pixel ? 1 : 2);
+    if (auto b = g_bytecode.find(cs.cacheKey); b != g_bytecode.end())
+    {
+        cs.code = b->second;
+        cs.state = CompiledShader::Ready;
+        return &cs;
+    }
+    if (std::ifstream in{ ShaderCachePath(cs.cacheKey), std::ios::binary | std::ios::ate })
+    {
+        const auto size = size_t(in.tellg());
+        if (size && SUCCEEDED(D3DCreateBlob(size, &cs.code)))
+        {
+            in.seekg(0);
+            in.read(static_cast<char*>(cs.code->GetBufferPointer()), std::streamsize(size));
+            cs.state = CompiledShader::Ready;
+            g_bytecode.emplace(cs.cacheKey, cs.code);
+            return &cs;
+        }
+    }
+    g_compiler.Push(&cs, false);
+    return &cs;
 }
 
 D3D12_BLEND Blend(uint32_t f)
@@ -2049,11 +2230,26 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     pd.RTVFormats[0] = kColorFormat;
     pd.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     pd.SampleDesc.Count = 1;
+    const bool motion = key.flags & 4; // motion-vector variants: a second target for the motion
+    if (motion)
+    {
+        pd.pRootSignature = g_r.motionRootSignature.Get();
+        pd.NumRenderTargets = 2;
+        pd.RTVFormats[1] = DXGI_FORMAT_R16G16_FLOAT;
+        pd.BlendState.IndependentBlendEnable = TRUE;
+        auto& mv = pd.BlendState.RenderTarget[1];
+        mv = D3D12_RENDER_TARGET_BLEND_DESC{};
+        // Blended draws (glass, smoke) keep the motion of what is behind them.
+        mv.RenderTargetWriteMask = rt.BlendEnable ? 0 : D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN;
+    }
     auto entry = std::make_shared<PipelineEntry>();
     g_r.pipelines[key] = entry;
-    g_manifest.RecordShader(false, key.vs, vs.ucodeBE);
-    g_manifest.RecordShader(true, key.ps, ps.ucodeBE);
-    g_manifest.RecordPipeline(key);
+    if (!motion) // the manifest rebuilds pipelines from the base shaders
+    {
+        g_manifest.RecordShader(false, key.vs, vs.ucodeBE);
+        g_manifest.RecordShader(true, key.ps, ps.ucodeBE);
+        g_manifest.RecordPipeline(key);
+    }
     static PipelinePool pool;
     char label[64];
     snprintf(label, sizeof(label), "pipeline %08llx/%08llx", (unsigned long long)(key.vs >> 32), (unsigned long long)(key.ps >> 32));
@@ -2134,9 +2330,11 @@ bool SkippableDraw(bool depthOnly, uint32_t blend)
     return !opaque || GameSettled();
 }
 
-ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable)
+ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion = false)
 {
-    const PipelineKey key = MakePipelineKey(g_r.vsHash, g_r.psHash, depthOnly, cullable);
+    PipelineKey key = MakePipelineKey(g_r.vsHash, g_r.psHash, depthOnly, cullable);
+    if (motion)
+        key.flags |= 4;
     auto it = g_r.pipelines.find(key);
     if (it != g_r.pipelines.end() && it->second->state.load(std::memory_order_acquire) == 1)
         return it->second->pso.Get();
@@ -2898,6 +3096,84 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
 // EDRAM resolve: copy a rectangle of the render target to the destination
 // (as a host texture), then optionally clear colour and depth.
 // ---- Upscaling ---------------------------------------------------------------------------
+// Temporal upscalers (DLSS, FSR 3): the motion target, jitter, and the evaluation.
+bool InitUpscale();
+bool TemporalInit()
+{
+    if (!InitUpscale())
+        return false;
+    if (!g_upscale.motion)
+    {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = OutputWidth();
+        td.Height = OutputHeight();
+        td.DepthOrArraySize = 1;
+        td.MipLevels = 1;
+        td.SampleDesc.Count = 1;
+        td.Format = DXGI_FORMAT_R16G16_FLOAT;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_CLEAR_VALUE cv{};
+        cv.Format = td.Format;
+        if (FAILED(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv,
+                IID_PPV_ARGS(&g_upscale.motion))))
+            return false;
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hd.NumDescriptors = 1;
+        if (FAILED(g_r.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_upscale.motionRtvHeap))))
+            return false;
+        g_upscale.motionRtv = g_upscale.motionRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        g_r.device->CreateRenderTargetView(g_upscale.motion.Get(), nullptr, g_upscale.motionRtv);
+    }
+    return true;
+}
+
+float Halton(uint32_t index, uint32_t base)
+{
+    float f = 1.0f, r = 0.0f;
+    for (; index; index /= base)
+    {
+        f /= float(base);
+        r += f * float(index % base);
+    }
+    return r;
+}
+
+// Start of a temporal frame: jitter, a cleared motion target, the next constants map.
+void BeginTemporalFrame()
+{
+    g_upscale.renderWidth = uint32_t(std::lround(OutputWidth() * double(g_sceneScale)));
+    g_upscale.renderHeight = uint32_t(std::lround(OutputHeight() * double(g_sceneScale)));
+    // Phases: 8 per pixel of upscale area (DLSS guidance), at most 64.
+    const double ratio = double(OutputWidth()) / std::max(1u, g_upscale.renderWidth);
+    const uint32_t phases = std::clamp(uint32_t(std::ceil(8.0 * ratio * ratio)), 8u, 64u);
+    const uint32_t index = uint32_t(g_r.frame % phases) + 1;
+    static const bool noJitter = getenv("FM2_NO_JITTER") != nullptr;
+    g_upscale.jitterPx[0] = noJitter ? 0.0f : Halton(index, 2) - 0.5f;
+    g_upscale.jitterPx[1] = noJitter ? 0.0f : Halton(index, 3) - 0.5f;
+    g_upscale.jitterNdc[0] = 2.0f * g_upscale.jitterPx[0] / float(std::max(1u, g_upscale.renderWidth));
+    g_upscale.jitterNdc[1] = -2.0f * g_upscale.jitterPx[1] / float(std::max(1u, g_upscale.renderHeight));
+    g_upscale.constantsFrame++;
+    g_upscale.occurrences.clear();
+    if (g_upscale.constantsFrame % 600 == 0) // draws not seen for a while
+        std::erase_if(g_upscale.constants, [](const auto& e) { return e.second.frame + 2 < g_upscale.constantsFrame; });
+    const float zero[4] = {};
+    g_r.list->ClearRenderTargetView(g_upscale.motionRtv, zero, 0, nullptr);
+}
+
+void UpscaleResolved(uint32_t base);
+
+// The temporal upscale of the scene image at `base` (colour, depth, motion, jitter).
+// (Until DLSS and FSR 3 are wired in: FSR 1.)
+void TemporalEvaluate(uint32_t base)
+{
+    UpscaleResolved(base);
+    g_upscale.reset = false;
+}
+
 // The scene (everything up to the full-screen resolve of the main view) renders at
 // g_sceneScale; that resolved image is upscaled to the output size (FSR 1: EASU, then RCAS
 // sharpening) and post-processing and the HUD render at full size from it.
@@ -3068,8 +3344,12 @@ void UpscaleResolved(uint32_t base)
 // the frame (post-processing, HUD) at full size.
 void UpscaleScene(uint32_t base)
 {
-    UpscaleResolved(base);
+    if (g_temporal)
+        TemporalEvaluate(base);
+    else
+        UpscaleResolved(base);
     g_sceneScale = 1.0f;
+    g_scenePhase = false;
     g_upscale.switchedThisFrame = true;
 }
 
@@ -3140,7 +3420,7 @@ void Resolve()
         const bool swapRB = !depth && ((info >> 24) & 1);
         BlitResolve(depth, base, width, height, format, rect, depth ? 1.0f : std::ldexp(1.0f, bias));
         // The main view's full image (its last tile reaches the bottom): the scene is done.
-        if (g_sceneScale < 1.0f && !depth && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth) && rect.bottom >= LONG(kHeight))
+        if (g_scenePhase && !depth && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth) && rect.bottom >= LONG(kHeight))
             UpscaleScene(base);
         g_r.resolved[base].swapped = swapRB;
     }
@@ -4057,7 +4337,20 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     BeginFrameIfNeeded();
     SelectSurfaces(false);
-    ID3D12PipelineState* pso = GetPipeline(vs, ps, edramMode == 5, (initiator & 0x3F) != 8 && (initiator & 0x3F) != 1);
+    // Temporal upscaling: the main view's draws in the scene also write motion vectors (their
+    // shaders' motion variants, once compiled; until then the draw has no motion).
+    const bool cullable = (initiator & 0x3F) != 8 && (initiator & 0x3F) != 1;
+    const bool wantMotion = g_temporal && g_scenePhase && edramMode == 4 && WidePass();
+    const CompiledShader* mvs = wantMotion ? MotionShader(vs) : nullptr;
+    const CompiledShader* mps = wantMotion ? MotionShader(ps) : nullptr;
+    bool motion = mvs && mps && mvs->IsReady() && mps->IsReady();
+    D3D12_GPU_VIRTUAL_ADDRESS motionPrevious = 0; // last frame's vertex constants of this draw (b2)
+    ID3D12PipelineState* pso = motion ? GetPipeline(*mvs, *mps, false, cullable, true) : nullptr;
+    if (!pso)
+    {
+        motion = false;
+        pso = GetPipeline(vs, ps, edramMode == 5, cullable);
+    }
     if (!pso)
     {
         TraceSkip("pipeline", initiator);
@@ -4089,6 +4382,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         uint32_t vte[4];
         uint32_t vfl[32][4]; // vertex fetch layout of the bound shader
         float vwide[4];      // x: Hor+ factor (see hlsl.cpp)
+        float vjitter[4];     // motion-vector variants: this frame's jitter (NDC)
     };
     struct PSConstants
     {
@@ -4120,6 +4414,30 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             _mm_storeu_si128(dv + i, _mm_shuffle_epi8(_mm_loadu_si128(src + i), swap));
         for (uint32_t i = 0; i < np; i++)
             _mm_storeu_si128(dp + i, _mm_shuffle_epi8(_mm_loadu_si128(src + 256 + i), swap));
+        if (motion)
+        {
+            // This draw's constants for the next frame, and last frame's for its motion. The
+            // draw is known by its shaders, vertex and index data and how often it came up.
+            uint64_t key = g_r.vsHash * 0x9E3779B97F4A7C15ull ^ g_r.psHash ^ (uint64_t(dmaBase) << 20) ^ initiator;
+            for (uint32_t k : vs.info.vertexFetchConstants)
+            {
+                key = (key ^ gpureg::Get(gpureg::FetchConstants + k * 2)) * 0xFF51AFD7ED558CCDull;
+                break; // the first vertex buffer is enough to tell draws apart
+            }
+            key ^= uint64_t(g_upscale.occurrences[key]++) * 0xC2B2AE3D27D4EB4Full;
+            // Last frame's constants are still in last frame's ring (it is reused only after
+            // kFrames): the draw reads them there (b2).
+            auto& entry = g_upscale.constants[key];
+            const uint32_t parity = g_upscale.constantsFrame & 1;
+            const D3D12_GPU_VIRTUAL_ADDRESS now = f.ring->GetGPUVirtualAddress() + vsOffset;
+            const bool known = entry.frame + 1 == g_upscale.constantsFrame && !g_upscale.reset;
+            motionPrevious = known ? entry.address[parity ^ 1] : now;
+            entry.address[parity] = now;
+            entry.frame = g_upscale.constantsFrame;
+            vc->vjitter[0] = g_upscale.jitterNdc[0];
+            vc->vjitter[1] = g_upscale.jitterNdc[1];
+            vc->vjitter[2] = vc->vjitter[3] = 0;
+        }
     }
     for (uint32_t i = 0; i < 8; i++)
         vc->b[i] = pc->b[i] = gpureg::Get(gpureg::BoolConstants + i);
@@ -4387,6 +4705,19 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             g_r.list->OMSetBlendFactor(factor);
         }
     }
+    if (motion != ds.motionRoot)
+    {
+        // Motion pipelines have their own root signature; switching clears the root arguments.
+        ds.motionRoot = motion;
+        g_r.list->SetGraphicsRootSignature(motion ? g_r.motionRootSignature.Get() : g_r.rootSignature.Get());
+        ds.table2 = ds.table3 = D3D12_GPU_DESCRIPTOR_HANDLE{};
+    }
+    if (motion != ds.motionTargets)
+    {
+        ds.motionTargets = motion;
+        const D3D12_CPU_DESCRIPTOR_HANDLE targets[2] = { g_r.rtv, g_upscale.motionRtv };
+        g_r.list->OMSetRenderTargets(motion ? 2 : 1, targets, FALSE, &g_r.dsv);
+    }
     if (pso != ds.pso)
     {
         ds.pso = pso;
@@ -4401,6 +4732,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     g_r.list->SetGraphicsRootConstantBufferView(0, f.ring->GetGPUVirtualAddress() + vsOffset);
     g_r.list->SetGraphicsRootConstantBufferView(1, f.ring->GetGPUVirtualAddress() + psOffset);
+    if (motion)
+        g_r.list->SetGraphicsRootConstantBufferView(4, motionPrevious);
     if (const D3D12_GPU_DESCRIPTOR_HANDLE t2 = Gpu(g_r.srvHeap.Get(), f.descriptorBase, g_r.srvStride); t2.ptr != ds.table2.ptr)
     {
         ds.table2 = t2;
@@ -4788,11 +5121,13 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     BeginFrameIfNeeded();
     // A frame that rendered small but never resolved a scene (a menu): upscale what it shows
     // and stay at full size for a while (menus are drawn sharp at full size).
-    if (g_sceneScale < 1.0f && !g_upscale.switchedThisFrame)
+    if (g_scenePhase && !g_upscale.switchedThisFrame)
     {
         UpscaleResolved(frontBuffer);
         g_sceneScale = 1.0f;
+        g_scenePhase = false;
         g_upscale.retryFrame = g_r.frame + 120;
+        g_upscale.reset = true; // the next scene has no usable history
     }
     // Show the front buffer the title resolved to; fall back to the render
     // target if it was never resolved.
