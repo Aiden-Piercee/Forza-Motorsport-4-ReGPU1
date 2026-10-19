@@ -91,10 +91,13 @@ Balanced 59%, Performance 50%, Ultra performance 33% (per axis). Menus without a
 stay at full resolution.
 
 - **AMD FSR 1** (spatial: edge-adaptive upscale plus RCAS sharpening) works on any GPU.
-- DLSS, DLAA and FSR 3 (temporal, with motion vectors) are planned.
+- **AMD FSR 3** and **NVIDIA DLSS** (temporal) use per-pixel motion vectors: each scene
+  draw also runs its vertex shader with that draw's constants from the previous frame.
+  FSR 3 runs on any GPU; DLSS needs an RTX GPU (FSR 1 is used when it is unavailable).
+  At the Native preset DLSS runs as DLAA and FSR 3 as native anti-aliasing.
 
 This game's GPU cost is mostly per-draw work rather than pixels, so upscaling gains the
-most at 4K or on slower GPUs. Variables: `FM2_UPSCALER=off|fsr1`, `FM2_UPSCALE_QUALITY=0-4`,
+most at 4K or on slower GPUs. Variables: `FM2_UPSCALER=off|fsr1|fsr3|dlss`, `FM2_UPSCALE_QUALITY=0-4`,
 `FM2_SHARPNESS=0-1` (settings.ini: `upscaler`, `upscale_quality`, `sharpness`).
 
 ## Building

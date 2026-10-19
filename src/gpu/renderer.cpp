@@ -35,6 +35,7 @@
 
 #include "gpu/hlsl.h"
 #include "gpu/dlss.h"
+#include "gpu/fsr3.h"
 #include "gpu/recorded_list.h"
 #include "fsr1_cs.h"
 #include <DirectXPackedVector.h>
@@ -3216,11 +3217,11 @@ void BeginTemporalFrame()
 
 void UpscaleResolved(uint32_t base);
 
-// DLSS on the scene image at `base`: colour (render size), depth and motion (top left of
+// DLSS or FSR 3 on the scene image at `base`: colour (render size), depth and motion (top left of
 // output-sized textures); the upscaled image replaces it like UpscaleResolved.
-bool EvaluateDlss(uint32_t base)
+bool EvaluateTemporal(uint32_t base, bool dlss)
 {
-    if (!DlssInit(g_r.device))
+    if (dlss && !DlssInit(g_r.device))
         return false;
     auto it = g_r.resolved.find(base);
     if (it == g_r.resolved.end() || !it->second.resource)
@@ -3300,7 +3301,8 @@ bool EvaluateDlss(uint32_t base)
     barrier(g_upscale.motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     barrier(in.output, read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     // NGX records into the real command list (after everything recorded so far).
-    const bool ok = DlssEvaluate(g_r.list->Real(), setup, in);
+    const bool ok = dlss ? DlssEvaluate(g_r.list->Real(), setup, in)
+                         : Fsr3Evaluate(g_r.device, g_r.list->Real(), setup, in, GetSettings().sharpness);
     barrier(in.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
     if (dlaa && ok)
     {
@@ -3333,9 +3335,7 @@ bool EvaluateDlss(uint32_t base)
 // where the chosen upscaler is not available.
 void TemporalEvaluate(uint32_t base)
 {
-    bool done = false;
-    if (GetSettings().upscaler == Settings::Upscaler::Dlss)
-        done = EvaluateDlss(base);
+    const bool done = EvaluateTemporal(base, GetSettings().upscaler == Settings::Upscaler::Dlss);
     if (!done)
         UpscaleResolved(base);
     g_upscale.reset = false;

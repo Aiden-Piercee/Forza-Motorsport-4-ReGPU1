@@ -45,7 +45,10 @@ if(NOT EXISTS "${FM2_DLSS}/include/nvsdk_ngx.h")
 endif()
 add_executable(fm2 ${FM2_SOURCES})
 target_include_directories(fm2 PRIVATE src "${FM2_GENERATED}" "${FM2_DLSS}/include")
-target_link_libraries(fm2 PRIVATE "${FM2_DLSS}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
+target_link_libraries(fm2 PRIVATE "${FM2_DLSS}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib" "${FM2_FFX}/signedbin/amd_fidelityfx_loader_dx12.lib")
+target_include_directories(fm2 PRIVATE "${FM2_FFX}/api/include" "${FM2_FFX}/upscalers/include")
+add_custom_command(TARGET fm2 POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${FM2_FFX}/signedbin/amd_fidelityfx_loader_dx12.dll" "${FM2_FFX}/signedbin/amd_fidelityfx_upscaler_dx12.dll" $<TARGET_FILE_DIR:fm2>)
 add_custom_command(TARGET fm2 POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${FM2_DLSS}/lib/Windows_x86_64/rel/nvngx_dlss.dll" $<TARGET_FILE_DIR:fm2>)
 target_link_libraries(fm2 PRIVATE fm2_ppc XenonUtils synchronization winmm onecore d3d12 dxgi d3dcompiler)
