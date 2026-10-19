@@ -65,8 +65,9 @@ up to 360 fps (menus included) and up to 4K, and experimentally on ultrawide dis
 rendering, shadows, HDR resolves and the HUD, and full 5.1
 audio: the game's sound engine (FMOD) mixes into our render driver, which plays through
 XAudio2, and its XMA sound data is decoded with FFmpeg's XMA decoder. Game time follows
-the clock, so the game runs at real speed at any frame rate. Races are currently limited
-by the renderer's CPU time (around 75 fps on a fast desktop CPU); menus reach the cap.
+the clock, so the game runs at real speed at any frame rate. A race with a full grid runs
+at about 140-165 fps at 2560x1440 on a fast desktop (Nurburgring free run 180-240 fps),
+where the GPU and the command processor are close to equal limits; menus reach the cap.
 
 Saves work: the signed-in gamer profile is the profile name from the launcher (`Player`
 by default), and its saves live in `Documents\fm2\profiles\<name>\content`.
@@ -120,6 +121,11 @@ code (`out/ppc`, ~131 MB) is generated from your own copy and never committed.
 | `FM2_AUTOSTART=1` | Tap Start + A every 3 s |
 | `FM2_DUMP_SHADERS=1` | Save every distinct shader's microcode to `Documents/fm2/shaders` |
 | `FM2_DUMP_FRAME=<n>` | Write the n-th rendered frame to `frame.png` |
+| `FM2_DUMP_AT=<seconds>` | Write the first frame after that long to `frame.png` (comparable screenshots at any frame rate) |
+| `FM2_PERF=1` | Once a second: fps, renderer time by section, thread CPU, GPU time; slow frames with their cause (`FM2_SLOW_MS` sets the threshold, default 25) |
+| `FM2_GPU_PASSES=1` | GPU time per pass (between render target switches and resolves), every 2 s |
+| `FM2_PROFILE=<thread id>` | Sample that guest thread's host instruction pointer and log the top functions every 5 s |
+| `FM2_NO_NATIVE_BC`, `FM2_NO_INDEXED`, `FM2_NO_RECORD_THREAD`, `FM2_NO_SLOT_MEMO`, `FM2_COMMITTED_TEXTURES`, `FM2_ALL_CONSTANTS` | Turn off one renderer optimisation (A/B checks) |
 | `FM2_RESOLUTION=<w>x<h>` | Override the launcher resolution: render at that size, any aspect (e.g. `3440x1440`). Wider than 16:9 is **experimental**: the 3D view widens (Hor+), the HUD and menus keep 16:9 proportions in the centre, but some objects at the sides still pop in (game-side culling) |
 | `FM2_WIDE_FOV=<0-100>` | Ultrawide only: how far the view widens (100 full Hor+, 0 the 16:9 view zoomed to fill) |
 | `FM2_RENDER_SCALE=<1-4>` | Render at that multiple of 1280x720 (2 = 2560x1440, 3 = 3840x2160) |

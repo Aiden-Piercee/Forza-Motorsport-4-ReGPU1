@@ -49,8 +49,9 @@ The keyboard only works while the game window has focus.
 - Bright surfaces (the asphalt) may be overexposed; not yet compared with
   the console.
 - Face culling is off (only a performance cost).
-- Races are limited to about 75 fps by the renderer's CPU time, whatever the max FPS
-  setting; menus reach it. A later optimisation pass will raise this.
+- Races run at about 140-165 fps with a full grid at 2560x1440 on a fast desktop; set
+  Max FPS to 360 to see how far your machine goes. Report stutters with the track, car
+  and place (out\play.log has the slow frames when run with FM2_PERF=1).
 - Ultrawide (a resolution or aspect ratio wider than 16:9) is experimental: some objects at the
   sides of the screen still pop in late, and the HUD stays in the centre 16:9 area.
 - Looping sounds restart at the start of the 2 KB packet holding the loop point, not
