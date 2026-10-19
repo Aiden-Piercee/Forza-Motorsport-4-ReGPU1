@@ -62,6 +62,13 @@ public:
     void IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY t) { Put(kTopology, &t, sizeof(t)); }
     void SetDescriptorHeaps(UINT n, ID3D12DescriptorHeap* const* h) { Put(kHeaps, &n, sizeof(n), h, sizeof(*h) * n); }
     void DrawInstanced(UINT v, UINT i, UINT sv, UINT si) { UINT a[4] = { v, i, sv, si }; Put(kDraw, a, sizeof(a)); }
+    void DrawIndexedInstanced(UINT n, UINT i, UINT si, INT bv, UINT sinst) { UINT a[5] = { n, i, si, UINT(bv), sinst }; Put(kDrawIndexed, a, sizeof(a)); }
+    void IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* v) { Put(kIndexBuffer, v, sizeof(*v)); }
+    void CopyBufferRegion(ID3D12Resource* dst, UINT64 dstOffset, ID3D12Resource* src, UINT64 srcOffset, UINT64 bytes)
+    {
+        struct A { ID3D12Resource* dst; UINT64 dstOffset; ID3D12Resource* src; UINT64 srcOffset, bytes; } a{ dst, dstOffset, src, srcOffset, bytes };
+        Put(kCopyBuffer, &a, sizeof(a));
+    }
     void EndQuery(ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i) { struct A { ID3D12QueryHeap* h; D3D12_QUERY_TYPE t; UINT i; } a{ h, t, i }; Put(kEndQuery, &a, sizeof(a)); }
     void ResolveQueryData(ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT start, UINT n, ID3D12Resource* dst, UINT64 offset)
     {
@@ -98,7 +105,7 @@ private:
     enum Op : uint32_t
     {
         kBarrier, kCopyTexture, kRootSignature, kTable, kCbv, kRoot32, kTargets, kPipeline, kViewports, kScissors, kStencilRef, kBlendFactor,
-        kTopology, kHeaps, kDraw, kEndQuery, kResolveQuery, kClearRtv, kClearDsv, kCreateRtv, kCreateDsv
+        kTopology, kHeaps, kDraw, kEndQuery, kResolveQuery, kClearRtv, kClearDsv, kCreateRtv, kCreateDsv, kDrawIndexed, kIndexBuffer, kCopyBuffer
     };
     static constexpr size_t kChunk = 64 << 10;
 
@@ -259,6 +266,20 @@ private:
                 struct A { D3D12_CPU_DESCRIPTOR_HANDLE rtv; FLOAT c[4]; UINT n; };
                 const A& c = At<A>(a);
                 l->ClearRenderTargetView(c.rtv, c.c, c.n, c.n ? reinterpret_cast<const D3D12_RECT*>(a + sizeof(A)) : nullptr);
+                break;
+            }
+            case kDrawIndexed:
+            {
+                const UINT* d = reinterpret_cast<const UINT*>(a);
+                l->DrawIndexedInstanced(d[0], d[1], d[2], INT(d[3]), d[4]);
+                break;
+            }
+            case kIndexBuffer: l->IASetIndexBuffer(reinterpret_cast<const D3D12_INDEX_BUFFER_VIEW*>(a)); break;
+            case kCopyBuffer:
+            {
+                struct A { ID3D12Resource* dst; UINT64 dstOffset; ID3D12Resource* src; UINT64 srcOffset, bytes; };
+                const A& c = At<A>(a);
+                l->CopyBufferRegion(c.dst, c.dstOffset, c.src, c.srcOffset, c.bytes);
                 break;
             }
             case kCreateRtv:

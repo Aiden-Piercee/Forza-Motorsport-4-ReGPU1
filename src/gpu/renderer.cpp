@@ -337,6 +337,22 @@ const char* g_waitWhat = "?";
 bool g_drawSamplesResolve = false;
 // FM2_PERF: GPU time per frame from timestamps at the start and end of each frame's list.
 ComPtr<ID3D12QueryHeap> g_timestamps;
+
+// FM2_GPU_PASSES=1: GPU time per pass (between render target switches and resolves),
+// summed by pass and logged every 2 s, to find where GPU time goes.
+const bool g_gpuPasses = getenv("FM2_GPU_PASSES") != nullptr;
+constexpr UINT kPassMarks = 1024;
+ComPtr<ID3D12QueryHeap> g_passQueries;
+ComPtr<ID3D12Resource> g_passReadback;
+struct PassMarkInfo
+{
+    char label[48];
+    uint32_t draws; // draws in the pass this mark starts (filled at the next mark)
+};
+std::vector<PassMarkInfo> g_passMarks[3];
+uint32_t g_passDraws = 0;
+std::map<std::string, std::pair<double, uint64_t>> g_passTotals; // ms, draws
+uint64_t g_passFrames = 0;
 ComPtr<ID3D12Resource> g_timestampReadback;
 double g_gpuFrameMs = 0, g_gpuFrameMaxMs = 0;
 uint32_t g_gpuFrames = 0;
@@ -485,6 +501,8 @@ struct DrawState
     float blendFactor[4] = { -1, -1, -1, -1 };
     ID3D12PipelineState* pso = nullptr;
     D3D12_GPU_DESCRIPTOR_HANDLE table2{}, table3{};
+    D3D_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    D3D12_INDEX_BUFFER_VIEW indexBuffer{};
     void Invalidate() { *this = DrawState{}; }
 } g_drawState;
 
@@ -837,6 +855,25 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
 
 // Binds the surfaces for the current RB_COLOR_INFO / RB_DEPTH_INFO bases
 // (the list must be open).
+FrameResources& Frame();
+
+void PassMark(const char* fmt, uint32_t a, uint32_t b)
+{
+    if (!g_gpuPasses || !g_passQueries)
+        return;
+    const UINT frameIndex = UINT(&Frame() - g_r.frames);
+    auto& marks = g_passMarks[frameIndex];
+    if (marks.size() >= kPassMarks)
+        return;
+    if (!marks.empty())
+        marks.back().draws = g_passDraws;
+    g_passDraws = 0;
+    PassMarkInfo m{};
+    snprintf(m.label, sizeof(m.label), fmt, a, b);
+    g_r.list->EndQuery(g_passQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * kPassMarks + UINT(marks.size()));
+    marks.push_back(m);
+}
+
 void SelectSurfaces(bool force)
 {
     const uint32_t colorBase = gpureg::Get(RB_COLOR_INFO) & 0xFFF, depthBase = gpureg::Get(RB_DEPTH_INFO) & 0xFFF;
@@ -853,6 +890,7 @@ void SelectSurfaces(bool force)
     g_r.dsv = z.view;
     g_r.colorBase = colorBase;
     g_r.depthBase = depthBase;
+    PassMark("pass colour %03X depth %03X", colorBase, depthBase);
     TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
     g_r.list->OMSetRenderTargets(1, &g_r.rtv, FALSE, &g_r.dsv);
 }
@@ -940,6 +978,57 @@ void BeginFrameIfNeeded()
         g_r.device->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_timestamps));
         g_timestampReadback = CreateBuffer(8 * 2 * kFrames, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     }
+    if (g_gpuPasses && !g_passQueries)
+    {
+        D3D12_QUERY_HEAP_DESC qd{};
+        qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qd.Count = kPassMarks * kFrames;
+        g_r.device->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_passQueries));
+        g_passReadback = CreateBuffer(8ull * kPassMarks * kFrames, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+    if (g_gpuPasses && g_passMarks[frameIndex].size() > 1)
+    {
+        // This slot's previous frame has completed: add up its passes.
+        auto& marks = g_passMarks[frameIndex];
+        uint64_t* t = nullptr;
+        const D3D12_RANGE range{ size_t(frameIndex) * kPassMarks * 8, size_t(frameIndex + 1) * kPassMarks * 8 };
+        if (SUCCEEDED(g_passReadback->Map(0, &range, reinterpret_cast<void**>(&t))))
+        {
+            UINT64 frequency = 1;
+            g_r.queue->GetTimestampFrequency(&frequency);
+            const uint64_t* ts = t + size_t(frameIndex) * kPassMarks;
+            for (size_t i = 0; i + 1 < marks.size(); i++)
+            {
+                auto& total = g_passTotals[marks[i].label];
+                total.first += double(ts[i + 1] - ts[i]) * 1000.0 / double(frequency);
+                total.second += marks[i].draws;
+            }
+            const D3D12_RANGE none{ 0, 0 };
+            g_passReadback->Unmap(0, &none);
+            g_passFrames++;
+        }
+        marks.clear();
+        static auto lastLog = std::chrono::steady_clock::now();
+        if (std::chrono::steady_clock::now() - lastLog > std::chrono::seconds(2) && g_passFrames)
+        {
+            lastLog = std::chrono::steady_clock::now();
+            std::vector<std::pair<double, std::string>> top;
+            double sum = 0;
+            for (auto& [label, total] : g_passTotals)
+            {
+                top.push_back({ total.first, label });
+                sum += total.first;
+            }
+            std::sort(top.rbegin(), top.rend());
+            Log("gpu passes: %.2f ms/frame over %llu frames", sum / g_passFrames, (unsigned long long)g_passFrames);
+            for (size_t i = 0; i < top.size() && i < 14; i++)
+                Log("gpu passes: %6.3f ms  %5.0f draws  %s", top[i].first / g_passFrames, double(g_passTotals[top[i].second].second) / g_passFrames,
+                    top[i].second.c_str());
+            g_passTotals.clear();
+            g_passFrames = 0;
+        }
+    }
+    g_passMarks[frameIndex].clear();
     if (perf && f.timed && g_timestampReadback)
     {
         // This slot's previous frame has completed (waited for above).
@@ -963,6 +1052,7 @@ void BeginFrameIfNeeded()
     }
     f.allocator->Reset();
     g_r.list->Reset(f.allocator.Get(), nullptr);
+    PassMark("frame start %u%u", 0, 0);
     if (perf && g_timestamps)
         g_r.list->EndQuery(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 2);
     f.ringUsed = 0;
@@ -1044,6 +1134,149 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
     memcpy(f.ringCpu + offset, src, bytes);
     f.uploads[key] = { offset, sample };
     return offset;
+}
+
+// Index buffers for indexed draws: the guest's big-endian indices, swapped once into an
+// arena on the GPU and checked for changes once per frame (sampled, like textures). Real
+// indexed draws let the GPU reuse transformed vertices; the vertex shader then gets the
+// index as its vertex ID ("auto" index mode, see hlsl.cpp).
+struct IndexArena
+{
+    static constexpr uint64_t kBytes = 128ull << 20;
+    ComPtr<ID3D12Resource> buffer;
+    uint64_t used = 0;
+    std::unordered_map<uint32_t, std::vector<uint64_t>> free; // offsets by size class (log2)
+    struct Entry
+    {
+        uint64_t offset = 0, hash = 0, checkedFrame = ~0ull;
+        uint32_t sizeClass = 0;
+        D3D12_GPU_VIRTUAL_ADDRESS staged = 0; // this frame's copy in the upload ring (frame stagedFrame)
+        uint64_t stagedFrame = ~0ull;
+    };
+    std::unordered_map<uint64_t, Entry> entries;
+    bool full = false;
+    // Copies into the arena, made at the end of the frame in one batch (a barrier
+    // on the arena mid-frame would drain the GPU each time new geometry streams in).
+    struct Copy
+    {
+        ID3D12Resource* ring;
+        uint64_t from, to, bytes;
+    };
+    std::vector<Copy> pending;
+} g_indexArena;
+
+// This frame's index uploads, copied into the arena once its draws are recorded.
+void FlushIndexCopies()
+{
+    IndexArena& arena = g_indexArena;
+    if (arena.pending.empty())
+        return;
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = arena.buffer.Get();
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_INDEX_BUFFER;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    g_r.list->ResourceBarrier(1, &b);
+    for (const auto& c : arena.pending)
+        g_r.list->CopyBufferRegion(arena.buffer.Get(), c.to, c.ring, c.from, c.bytes);
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    g_r.list->ResourceBarrier(1, &b);
+    arena.pending.clear();
+}
+
+// The view of the guest index buffer at physical address `base` (count indices), swapped
+// into the arena; false when it cannot be cached (the draw fetches indices itself).
+bool GetIndexBuffer(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view)
+{
+    IndexArena& arena = g_indexArena;
+    const uint32_t bytes = count * (is32 ? 4 : 2);
+    if (!bytes || bytes > (16u << 20))
+        return false;
+    if (arena.full && arena.entries.size())
+    {
+        // Start over: copies in this frame run after the frames in flight are done.
+        arena.entries.clear();
+        arena.free.clear();
+        arena.used = 0;
+        arena.full = false;
+    }
+    if (!arena.buffer)
+    {
+        arena.buffer = CreateBuffer(IndexArena::kBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+        if (!arena.buffer)
+            return false;
+    }
+    const uint64_t key = uint64_t(base) << 32 ^ uint64_t(bytes) << 3 ^ uint64_t(is32) << 2 ^ endian;
+    auto [it, inserted] = arena.entries.try_emplace(key);
+    IndexArena::Entry& e = it->second;
+    if (inserted)
+    {
+        uint32_t sizeClass = 8; // 256 bytes
+        while ((1ull << sizeClass) < bytes)
+            sizeClass++;
+        auto& list = arena.free[sizeClass];
+        if (!list.empty())
+        {
+            e.offset = list.back();
+            list.pop_back();
+        }
+        else if (arena.used + (1ull << sizeClass) <= IndexArena::kBytes)
+        {
+            e.offset = arena.used;
+            arena.used += 1ull << sizeClass;
+        }
+        else
+        {
+            arena.entries.erase(it);
+            arena.full = true;
+            return false;
+        }
+        e.sizeClass = sizeClass;
+    }
+    view = { arena.buffer->GetGPUVirtualAddress() + e.offset, bytes, is32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT };
+    if (e.checkedFrame == g_r.frame)
+    {
+        if (e.stagedFrame == g_r.frame)
+            view.BufferLocation = e.staged;
+        return true;
+    }
+    e.checkedFrame = g_r.frame;
+    const uint8_t* src = GuestPtr<uint8_t>(GpuPhysToGuest(base));
+    const uint64_t hash = ContentHash(src, bytes);
+    if (!inserted && hash == e.hash)
+        return true;
+    // Swap into the upload ring (as the vertex shader would read them), then copy.
+    const UINT64 offset = RingAlloc((bytes + 15) & ~15u, 16);
+    if (offset == ~0ull)
+        return false;
+    uint8_t* dst = Frame().ringCpu + offset;
+    if (is32)
+        for (uint32_t i = 0; i < count; i++)
+        {
+            uint32_t v;
+            memcpy(&v, src + i * 4, 4);
+            if (endian == 2)
+                v = __builtin_bswap32(v);
+            else if (endian == 1)
+                v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+            memcpy(dst + i * 4, &v, 4);
+        }
+    else
+        for (uint32_t i = 0; i < count; i++)
+        {
+            uint16_t v;
+            memcpy(&v, src + i * 2, 2);
+            if (endian == 1 || endian == 2)
+                v = __builtin_bswap16(v);
+            memcpy(dst + i * 2, &v, 2);
+        }
+    // This frame draws from the upload ring; the arena gets the copy at the end of the frame.
+    e.staged = Frame().ring->GetGPUVirtualAddress() + offset;
+    e.stagedFrame = g_r.frame;
+    view.BufferLocation = e.staged;
+    arena.pending.push_back({ Frame().ring.Get(), offset, e.offset, bytes });
+    e.hash = hash;
+    return true;
 }
 
 // Compile activity, for the on-screen overlay and FM2_PERF.
@@ -2639,6 +2872,7 @@ void Resolve()
         Init();
     BeginFrameIfNeeded();
     SelectSurfaces(false);
+    PassMark("resolve to %08X (colour %03X)", gpureg::Get(RB_COPY_DEST_BASE), g_r.colorBase);
     const uint32_t control = gpureg::Get(RB_COPY_CONTROL);
     const uint32_t command = (control >> 20) & 3;
 
@@ -3444,6 +3678,7 @@ void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     {
         DrawImpl(initiator, dmaBase, dmaSize);
         g_perf.draws++;
+        g_passDraws++;
         return;
     }
     const auto t0 = std::chrono::steady_clock::now();
@@ -3745,7 +3980,25 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     vc->voffset[2] = RegFloat(PA_CL_VPORT_ZOFFSET);
     vc->vte[0] = gpureg::Get(PA_CL_VTE_CNTL);
     vc->vte[1] = vc->vte[2] = vc->vte[3] = 0;
-    if (directIndex)
+    // Triangle lists and restart-free strips from an index buffer: a real indexed draw.
+    static const bool noIndexed = getenv("FM2_NO_INDEXED") != nullptr;
+    D3D12_INDEX_BUFFER_VIEW indexView{};
+    uint32_t indexedCount = 0;
+    if (directIndex && !noIndexed && indexSource == 0 && (prim == 4 || prim == 6))
+    {
+        const bool is32 = (initiator >> 11) & 1;
+        const uint32_t available = dmaSize & 0xFFFFFF;
+        const uint32_t count = std::min(indexCount, available);
+        indexedCount = prim == 4 ? count / 3 * 3 : count;
+        if (indexedCount < 3 || !GetIndexBuffer(dmaBase & 0x1FFFFFFF & ~(is32 ? 3u : 1u), count, is32, dmaSize >> 30, indexView))
+            indexedCount = 0;
+    }
+    if (indexedCount)
+    {
+        vc->vte[1] = 1u | 8u; // the vertex ID is the index
+        vc->vte[3] = gpureg::Get(VGT_INDX_OFFSET);
+    }
+    else if (directIndex)
     {
         const bool is32 = (initiator >> 11) & 1;
         vc->vte[1] = 1u | (prim == 6 ? 2u : 0u) | (prim == 13 ? 64u : 0u) | (is32 ? 4u : 0u) | (indexSource == 2 ? 8u : 0u) | ((dmaSize >> 30) << 4);
@@ -4022,7 +4275,23 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     {
         const auto t0 = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        g_r.list->DrawInstanced(directIndex ? directVertices : UINT(list.size()), 1, 0, 0);
+        const D3D_PRIMITIVE_TOPOLOGY topology = indexedCount && prim == 6 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        if (topology != g_drawState.topology)
+        {
+            g_drawState.topology = topology;
+            g_r.list->IASetPrimitiveTopology(topology);
+        }
+        if (indexedCount)
+        {
+            if (memcmp(&indexView, &g_drawState.indexBuffer, sizeof(indexView)) != 0)
+            {
+                g_drawState.indexBuffer = indexView;
+                g_r.list->IASetIndexBuffer(&indexView);
+            }
+            g_r.list->DrawIndexedInstanced(indexedCount, 1, 0, 0, 0);
+        }
+        else
+            g_r.list->DrawInstanced(directIndex ? directVertices : UINT(list.size()), 1, 0, 0);
         if (g_perfTiming)
         {
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -4412,6 +4681,15 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         g_r.list->ResourceBarrier(1, &b);
     }
 
+    FlushIndexCopies(); // this frame's index uploads into the arena, after its draws
+    if (g_gpuPasses && g_passQueries && !g_passMarks[UINT(&Frame() - g_r.frames)].empty())
+    {
+        const UINT frameIndex = UINT(&Frame() - g_r.frames);
+        PassMark("frame end %u%u", 0, 0);
+        const UINT n = UINT(g_passMarks[frameIndex].size());
+        g_r.list->ResolveQueryData(g_passQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * kPassMarks, n, g_passReadback.Get(),
+            UINT64(frameIndex) * kPassMarks * 8);
+    }
     if (g_timestamps)
     {
         const UINT frameIndex = UINT(&Frame() - g_r.frames);
