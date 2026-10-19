@@ -18,6 +18,8 @@ void RendererPredictDraw(uint32_t initiator);
 bool RendererCompileIdle();
 // Flushes the pipeline library to disk (called when the tour finishes).
 void RendererSaveCaches();
+// The display gamma table entry `index` (10:10:10 RGB), applied when presenting.
+void RendererSetGammaEntry(uint32_t index, uint32_t rgb10);
 // Benchmark: frame times are recorded while on; the report summarises them.
 void BenchmarkRecord(bool on);
 void BenchmarkWriteReport(const char* path);

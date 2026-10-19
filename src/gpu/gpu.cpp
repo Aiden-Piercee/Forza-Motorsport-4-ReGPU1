@@ -560,9 +560,18 @@ constexpr uint32_t SCRATCH_ADDR = 0x01DD;
 
 // Register writes from the command stream. Scratch registers with their
 // mask bit set are mirrored to memory: D3D's fences rely on it.
+// The display's gamma table (DC_LUT_*): the title writes the entry index, then the entry
+// (10:10:10 RGB). The presenter applies it, as the display hardware does.
+constexpr uint32_t DC_LUT_RW_INDEX = 0x1922, DC_LUT_30_COLOR = 0x1925;
+uint32_t g_lutIndex = 0;
+
 void WriteRegister(uint32_t index, uint32_t value)
 {
     SetReg(index, value);
+    if (index == DC_LUT_RW_INDEX)
+        g_lutIndex = value & 0xFF;
+    else if (index == DC_LUT_30_COLOR)
+        RendererSetGammaEntry(g_lutIndex++ & 0xFF, value);
     if (seg::g_open)
     {
         const uint32_t be[2] = { index, __builtin_bswap32(value) };
@@ -597,7 +606,8 @@ void WriteRegister(uint32_t index, uint32_t value)
 // register file is big-endian too, so a run clear of the scratch registers is a copy.
 void WriteRegisters(uint32_t index, uint32_t source, uint32_t count)
 {
-    if (index + count <= SCRATCH_REG0 || index >= SCRATCH_REG0 + 8)
+    const bool lut = index <= DC_LUT_30_COLOR && index + count > DC_LUT_RW_INDEX;
+    if (!lut && (index + count <= SCRATCH_REG0 || index >= SCRATCH_REG0 + 8))
     {
         memcpy(GuestPtr<uint8_t>(kRegisterBase + index * 4), GuestPtr<uint8_t>(source), size_t(count) * 4);
         if (seg::g_open)

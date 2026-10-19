@@ -56,6 +56,28 @@ void DepthCopyMain(uint3 id : SV_DispatchThreadID)
     dst[p] = src.Load(int3(p, 0)).rrrr;
 }
 
+// The display gamma table, as the console's display applies it to the front buffer: 17
+// points (con0..con3, rcasCon.x; floats) at 0, 1/16 .. 1, linear between; outSize the size.
+float GammaCurve(float x, float p[17])
+{
+    const float f = saturate(x) * 16.0;
+    const uint i = min(uint(f), 15u);
+    return lerp(p[i], p[i + 1], f - float(i));
+}
+
+[numthreads(8, 8, 1)]
+void GammaMain(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= outSize.xy))
+        return;
+    const uint4 q[5] = { con0, con1, con2, con3, rcasCon };
+    float p[17];
+    [unroll] for (uint k = 0; k < 17; k++)
+        p[k] = asfloat(q[k / 4][k % 4]);
+    const float4 c = src.Load(int3(id.xy, 0));
+    dst[id.xy] = float4(GammaCurve(c.r, p), GammaCurve(c.g, p), GammaCurve(c.b, p), c.a);
+}
+
 // 64 threads, each a 2x2 quad of a 16x16 tile (the layout FSR 1 is written for).
 [numthreads(64, 1, 1)]
 void EasuMain(uint3 lid : SV_GroupThreadID, uint3 gid : SV_GroupID)

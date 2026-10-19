@@ -92,7 +92,7 @@ struct Upscale
 {
     bool tried = false, ready = false;
     ComPtr<ID3D12RootSignature> root;
-    ComPtr<ID3D12PipelineState> easu, rcas, depthCopy;
+    ComPtr<ID3D12PipelineState> easu, rcas, depthCopy, gamma;
     ComPtr<ID3D12Resource> dlaaOut; // DLAA output (scene size), copied back into the scene image
     ComPtr<ID3D12Resource> depth; // temporal: the scene's depth as R32 (render size, top left)
     ComPtr<ID3D12Resource> temp; // EASU output (RGBA16F)
@@ -3644,9 +3644,86 @@ bool InitUpscale()
     pd.CS = { kDepthCopyMain, sizeof(kDepthCopyMain) };
     if (FAILED(g_r.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_upscale.depthCopy))))
         return false;
+    pd.CS = { kGammaMain, sizeof(kGammaMain) };
+    if (FAILED(g_r.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_upscale.gamma))))
+        return false;
     g_upscale.ready = true;
     Log("upscale: FSR 1 ready (scene at %.0f%% of %ux%u)", GetSettings().SceneScale() * 100.0f, OutputWidth(), OutputHeight());
     return true;
+}
+
+// ---- Display gamma ---------------------------------------------------------------------
+// The console's display maps the front buffer through a 256-entry table the title uploads
+// (DC_LUT_30_COLOR); FM2's darkens slightly (about x^1.15, with a darker toe). Without it the
+// picture is ~20% brighter than the console's. FM2_NO_GAMMA=1 shows the front buffer as is.
+std::atomic<uint32_t> g_gammaTable[256];
+std::atomic<bool> g_gammaSet{ false };
+ComPtr<ID3D12Resource> g_gammaOut;
+
+// Returns the graded copy of `image` (in COPY_SOURCE state), or null to show it as is.
+ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image)
+{
+    static const bool off = getenv("FM2_NO_GAMMA") != nullptr;
+    if (off || !g_gammaSet.load(std::memory_order_relaxed) || !InitUpscale())
+        return nullptr;
+    // 17 points of the table (green; the title writes equal channels), at x = k/16.
+    float points[17];
+    bool identity = true;
+    for (uint32_t k = 0; k <= 16; k++)
+    {
+        const float at = k * 255.0f / 16.0f;
+        const uint32_t i = std::min(uint32_t(at), 254u);
+        const float t = at - float(i);
+        const float a = float((g_gammaTable[i].load(std::memory_order_relaxed) >> 10) & 0x3FF) / 1023.0f;
+        const float b = float((g_gammaTable[i + 1].load(std::memory_order_relaxed) >> 10) & 0x3FF) / 1023.0f;
+        points[k] = a + (b - a) * t;
+        identity &= std::fabs(points[k] - k / 16.0f) < 0.002f;
+    }
+    if (identity)
+        return nullptr;
+    const D3D12_RESOURCE_DESC desc = image->GetDesc();
+    FrameResources& f = Frame();
+    if (f.descriptorsUsed + 2 > kDescriptorsPerFrame)
+        return nullptr;
+    if (!g_gammaOut || g_gammaOut->GetDesc().Width != desc.Width || g_gammaOut->GetDesc().Height != desc.Height)
+    {
+        D3D12_RESOURCE_DESC td = desc;
+        td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        RetireTexture(std::move(g_gammaOut));
+        g_gammaOut = CreateTexture(td, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "gamma");
+    }
+    const UINT slots = f.descriptorBase + f.descriptorsUsed;
+    f.descriptorsUsed += 2;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    g_r.device->CreateShaderResourceView(image, &srv, Cpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g_r.device->CreateUnorderedAccessView(g_gammaOut.Get(), nullptr, &uav, Cpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
+    uint32_t c[24] = {};
+    memcpy(c, points, sizeof(points));
+    c[20] = uint32_t(desc.Width);
+    c[21] = desc.Height;
+    C().list->SetComputeRootSignature(g_upscale.root.Get());
+    C().list->SetComputeRoot32BitConstants(0, 24, c, 0);
+    C().list->SetPipelineState(g_upscale.gamma.Get());
+    C().list->SetComputeRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
+    C().list->SetComputeRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
+    C().list->Dispatch(UINT((desc.Width + 7) / 8), (desc.Height + 7) / 8, 1);
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = g_gammaOut.Get();
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    C().list->ResourceBarrier(1, &b);
+    g_drawState.Invalidate(); // the compute pipeline replaced the draw's
+    return g_gammaOut.Get();
 }
 
 // Upscales the resolved image at `base` (rendered at the scene scale) to the output size in
@@ -5931,9 +6008,11 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     auto it = g_r.resolved.find(frontBuffer);
     const bool fromResolve = it != g_r.resolved.end() && it->second.width == kWidth && it->second.height == kHeight &&
         it->second.format == DXGI_FORMAT_R8G8B8A8_UNORM;
+    ID3D12Resource* graded = nullptr; // the front buffer through the display's gamma table
     if (fromResolve)
     {
         image = it->second.resource.Get();
+        graded = GradeFrontBuffer(image);
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition.pResource = image;
@@ -5947,7 +6026,8 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     if (fromResolve)
         g_hold.image = it->second.resource;
     ID3D12Resource* overlay = fromResolve ? PrepareOverlay() : nullptr;
-    const bool presenting = fromResolve && PresenterRecordCopy(C().list->Real(), image, overlay, kOverlayW, kOverlayH);
+    ID3D12Resource* shown = graded ? graded : image;
+    const bool presenting = fromResolve && PresenterRecordCopy(C().list->Real(), shown, overlay, kOverlayW, kOverlayH);
     {
         static const uint64_t traceFrame = getenv("FM2_TRACE_DRAWS") ? strtoull(getenv("FM2_TRACE_DRAWS"), nullptr, 10) : 0;
         if (traceFrame && g_r.frame + 1 == traceFrame)
@@ -5977,7 +6057,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, OutputWidth(), OutputHeight(), 1, (OutputWidth() * 4 + 255) & ~255u };
         D3D12_TEXTURE_COPY_LOCATION src{};
-        src.pResource = image;
+        src.pResource = shown;
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
@@ -6033,6 +6113,13 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         C().list->ResourceBarrier(1, &b);
+        if (graded)
+        {
+            b.Transition.pResource = graded;
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            C().list->ResourceBarrier(1, &b);
+        }
     }
 
     FlushIndexCopies(); // this frame's index uploads into the arena, after its draws
@@ -6176,4 +6263,13 @@ bool RendererTracing()
 float GameAspect()
 {
     return 16.0f / 9.0f * ViewExtent();
+}
+
+void RendererSetGammaEntry(uint32_t index, uint32_t rgb10)
+{
+    if (index < 256)
+    {
+        g_gammaTable[index].store(rgb10, std::memory_order_relaxed);
+        g_gammaSet.store(true, std::memory_order_relaxed);
+    }
 }
