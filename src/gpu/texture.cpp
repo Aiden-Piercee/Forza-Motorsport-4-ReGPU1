@@ -268,6 +268,29 @@ bool DecodeTexture(const TextureFetch& fetch, std::vector<uint8_t>& rgba)
     return DecodeTexture(fetch, GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address())), rgba);
 }
 
+// Packed mips (fetch dword 5 bit 11): a tiled texture whose smaller side is 16 texels or
+// less lies inside one 32x32-texel tile, at an offset (as Xenia's GetPackedMipOffset): the
+// wider side's first 16 texels, then the image. Returns the offset of mip 0 in blocks.
+void PackedMipOffset(const TextureFetch& fetch, uint32_t blockSize, uint32_t& xBlocks, uint32_t& yBlocks)
+{
+    xBlocks = yBlocks = 0;
+    if (!fetch.Tiled() || !((fetch.dwords[5] >> 11) & 1))
+        return;
+    auto log2Ceil = [](uint32_t v) {
+        uint32_t l = 0;
+        while ((1u << l) < v)
+            l++;
+        return l;
+    };
+    const uint32_t lw = log2Ceil(fetch.Width()), lh = log2Ceil(fetch.Height());
+    if (std::min(lw, lh) > 4)
+        return;
+    if (lw > lh)
+        yBlocks = 16 / blockSize;
+    else
+        xBlocks = 16 / blockSize;
+}
+
 bool DecodeTexture(const TextureFetch& fetch, const uint8_t* source, std::vector<uint8_t>& rgba)
 {
     FormatInfo info;
@@ -284,17 +307,19 @@ bool DecodeTexture(const TextureFetch& fetch, const uint8_t* source, std::vector
     if (fetch.Tiled())
         pitchBlocks = (pitchBlocks + 31) & ~31u;
 
+    uint32_t packX, packY;
+    PackedMipOffset(fetch, info.blockSize, packX, packY);
     rgba.assign(size_t(width) * height * 4, 0);
     uint8_t block[32];
     uint8_t texels[16][4];
     for (uint32_t by = 0; by < blocksY; by++)
     {
-        const int32_t rowOffset = fetch.Tiled() ? TiledOffset2DOuter(by, pitchBlocks, info.log2Bytes) : 0;
+        const int32_t rowOffset = fetch.Tiled() ? TiledOffset2DOuter(by + packY, pitchBlocks, info.log2Bytes) : 0;
         for (uint32_t bx = 0; bx < blocksX; bx++)
         {
             size_t offset;
             if (fetch.Tiled())
-                offset = size_t(TiledOffset2DInner(bx, by, info.log2Bytes, rowOffset) >> info.log2Bytes) * blockBytes;
+                offset = size_t(TiledOffset2DInner(bx + packX, by + packY, info.log2Bytes, rowOffset) >> info.log2Bytes) * blockBytes;
             else
                 offset = (size_t(by) * pitchBlocks + bx) * blockBytes;
             memcpy(block, source + offset, blockBytes);
@@ -355,13 +380,15 @@ bool CopyTextureBlocks(const TextureFetch& fetch, uint8_t* dst, uint32_t dstRowP
     uint32_t pitchBlocks = std::max(fetch.Pitch() / 4, blocksX);
     if (fetch.Tiled())
         pitchBlocks = (pitchBlocks + 31) & ~31u;
+    uint32_t packX, packY;
+    PackedMipOffset(fetch, 4, packX, packY);
     for (uint32_t by = 0; by < blocksY; by++)
     {
         uint8_t* row = dst + size_t(by) * dstRowPitch;
-        const int32_t rowOffset = fetch.Tiled() ? TiledOffset2DOuter(by, pitchBlocks, info.log2Bytes) : 0;
+        const int32_t rowOffset = fetch.Tiled() ? TiledOffset2DOuter(by + packY, pitchBlocks, info.log2Bytes) : 0;
         for (uint32_t bx = 0; bx < blocksX; bx++)
         {
-            const size_t offset = fetch.Tiled() ? size_t(TiledOffset2DInner(bx, by, info.log2Bytes, rowOffset) >> info.log2Bytes) * blockBytes
+            const size_t offset = fetch.Tiled() ? size_t(TiledOffset2DInner(bx + packX, by + packY, info.log2Bytes, rowOffset) >> info.log2Bytes) * blockBytes
                                                 : (size_t(by) * pitchBlocks + bx) * blockBytes;
             // Swapped here, then written once: dst is upload memory (write-combined, never read).
             uint8_t block[16];
