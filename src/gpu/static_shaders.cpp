@@ -20,6 +20,7 @@
 #include <unordered_set>
 
 #include "kernel/runtime.h"
+#include "loader.h"
 #include "zip.h"
 #include "log.h"
 #include "memory.h"
@@ -140,15 +141,55 @@ void ScanBytes(const uint8_t* bytes, size_t size, Found& found, bool executable 
 }
 
 constexpr uint32_t kFileMagic = 0x53534D46; // 'FMSS'
-constexpr uint32_t kFileVersion = 4; // 2: executable at dword alignment; 4: its shaders that start with a branch
+constexpr uint32_t kFileVersion = 5; // 2: executable at dword alignment; 4: its shaders that start with a branch; 5: data files signature
+
+// The files to search: the game's own, then the downloadable content and the title update
+// (their tracks and cars bring their own shaders).
+std::vector<std::filesystem::path> SourceFiles()
+{
+    std::vector<std::filesystem::path> files;
+    std::error_code ec;
+    for (const std::filesystem::path& root : { GameDir(), DlcDir(), TitleUpdateDir() })
+        for (auto it = std::filesystem::recursive_directory_iterator(root, ec); !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec))
+        {
+            if (!it->is_regular_file(ec))
+                continue;
+            std::string ext = it->path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](char c) { return char(tolower(c)); });
+            if (ext == ".zip" || ext == ".bin")
+                files.push_back(it->path());
+        }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+// Which files (names and sizes) and which executable the saved list was made from: adding
+// DLC or the title update makes the next boot search again.
+uint32_t SourcesSignature(const std::vector<std::filesystem::path>& files)
+{
+    uint64_t h = 0xCBF29CE484222325ull;
+    auto mix = [&](const void* p, size_t n) { h = (h ^ Fnv(static_cast<const uint8_t*>(p), n)) * 0x100000001B3ull; };
+#ifdef FM2_TITLE_UPDATE
+    mix("tu", 2);
+#endif
+    for (const auto& f : files)
+    {
+        std::error_code ec;
+        const std::string name = f.filename().string();
+        const uint64_t size = std::filesystem::file_size(f, ec);
+        mix(name.data(), name.size());
+        mix(&size, sizeof(size));
+    }
+    return uint32_t(h ^ (h >> 32));
+}
 
 std::filesystem::path SavedPath() { return UserDir() / "static_shaders.bin"; }
 
-bool LoadSaved(std::vector<ScannedShader>& out)
+bool LoadSaved(std::vector<ScannedShader>& out, uint32_t signature)
 {
     std::ifstream in(SavedPath(), std::ios::binary);
-    uint32_t head[3];
-    if (!in.read(reinterpret_cast<char*>(head), sizeof(head)) || head[0] != kFileMagic || head[1] != kFileVersion)
+    uint32_t head[4];
+    if (!in.read(reinterpret_cast<char*>(head), sizeof(head)) || head[0] != kFileMagic || head[1] != kFileVersion || head[3] != signature)
         return false;
     out.resize(head[2]);
     for (auto& s : out)
@@ -164,10 +205,10 @@ bool LoadSaved(std::vector<ScannedShader>& out)
     return true;
 }
 
-void Save(const std::vector<ScannedShader>& shaders)
+void Save(const std::vector<ScannedShader>& shaders, uint32_t signature)
 {
     std::ofstream out(SavedPath(), std::ios::binary);
-    const uint32_t head[3] = { kFileMagic, kFileVersion, uint32_t(shaders.size()) };
+    const uint32_t head[4] = { kFileMagic, kFileVersion, uint32_t(shaders.size()), signature };
     out.write(reinterpret_cast<const char*>(head), sizeof(head));
     for (const auto& s : shaders)
     {
@@ -178,26 +219,26 @@ void Save(const std::vector<ScannedShader>& shaders)
 }
 }
 
+bool StaticShadersSaved()
+{
+    std::vector<ScannedShader> unused;
+    std::ifstream in(SavedPath(), std::ios::binary);
+    uint32_t head[4];
+    return in.read(reinterpret_cast<char*>(head), sizeof(head)) && head[0] == kFileMagic && head[1] == kFileVersion &&
+        head[3] == SourcesSignature(SourceFiles());
+}
+
 std::vector<ScannedShader> StaticShaders()
 {
     std::vector<ScannedShader> result;
-    if (LoadSaved(result))
+    const std::vector<std::filesystem::path> files = SourceFiles();
+    const uint32_t signature = SourcesSignature(files);
+    if (LoadSaved(result, signature))
     {
         Log("static shaders: %zu loaded from %s", result.size(), SavedPath().string().c_str());
         return result;
     }
     const auto start = std::chrono::steady_clock::now();
-    std::vector<std::filesystem::path> files;
-    std::error_code ec;
-    for (auto it = std::filesystem::recursive_directory_iterator(GameDir(), ec); !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec))
-    {
-        if (!it->is_regular_file(ec))
-            continue;
-        std::string ext = it->path().extension().string();
-        std::transform(ext.begin(), ext.end(), ext.begin(), [](char c) { return char(tolower(c)); });
-        if (ext == ".zip" || ext == ".bin")
-            files.push_back(it->path());
-    }
     Found found;
     std::atomic<size_t> next{ 0 };
     std::vector<std::thread> workers;
@@ -225,7 +266,7 @@ std::vector<ScannedShader> StaticShaders()
     // the UI, title and effect shaders, only dword aligned.
     ScanBytes(GuestPtr<uint8_t>(0x82000000), 0x2000000, found, true);
     result = std::move(found.shaders);
-    Save(result);
+    Save(result, signature);
     Log("static shaders: %zu found (%zu in %zu data files, %zu in the executable) in %.1f s", result.size(), fromFiles, files.size(),
         result.size() - fromFiles, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
     return result;

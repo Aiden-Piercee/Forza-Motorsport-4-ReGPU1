@@ -5952,7 +5952,7 @@ void PrecompileAll()
     std::vector<const CompiledShader*> compiling;
     // The first boot's search of the game files takes a few seconds: say so on screen.
     std::vector<uint8_t> bootFrame;
-    if (!std::filesystem::exists(UserDir() / "static_shaders.bin") && BootScreenCompose(L"PREPARING SHADERS", 0, 0, bootFrame))
+    if (!StaticShadersSaved() && BootScreenCompose(L"PREPARING SHADERS", 0, 0, bootFrame))
         BootPresent(bootFrame);
     for (const ScannedShader& s : StaticShaders())
     {
