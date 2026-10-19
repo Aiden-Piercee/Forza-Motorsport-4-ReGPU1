@@ -45,6 +45,17 @@ void RcasPixel(uint2 p)
     dst[p] = float4(r, g, b, 1);
 }
 
+// The scene's depth (a depth-stencil surface) as a plain R32 texture for the temporal
+// upscalers: con0.xy offset of the rectangle, outSize its size.
+[numthreads(8, 8, 1)]
+void DepthCopyMain(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= outSize.xy))
+        return;
+    const uint2 p = id.xy + con0.xy;
+    dst[p] = src.Load(int3(p, 0)).rrrr;
+}
+
 // 64 threads, each a 2x2 quad of a 16x16 tile (the layout FSR 1 is written for).
 [numthreads(64, 1, 1)]
 void EasuMain(uint3 lid : SV_GroupThreadID, uint3 gid : SV_GroupID)

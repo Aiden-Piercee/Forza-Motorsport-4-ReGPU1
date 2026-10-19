@@ -34,6 +34,7 @@
 #include <wrl/client.h>
 
 #include "gpu/hlsl.h"
+#include "gpu/dlss.h"
 #include "gpu/recorded_list.h"
 #include "fsr1_cs.h"
 #include <DirectXPackedVector.h>
@@ -89,7 +90,8 @@ struct Upscale
 {
     bool tried = false, ready = false;
     ComPtr<ID3D12RootSignature> root;
-    ComPtr<ID3D12PipelineState> easu, rcas;
+    ComPtr<ID3D12PipelineState> easu, rcas, depthCopy;
+    ComPtr<ID3D12Resource> depth; // temporal: the scene's depth as R32 (render size, top left)
     ComPtr<ID3D12Resource> temp; // EASU output (RGBA16F)
     uint32_t tempWidth = 0, tempHeight = 0;
     bool switchedThisFrame = false;
@@ -3127,8 +3129,55 @@ bool TemporalInit()
             return false;
         g_upscale.motionRtv = g_upscale.motionRtvHeap->GetCPUDescriptorHandleForHeapStart();
         g_r.device->CreateRenderTargetView(g_upscale.motion.Get(), nullptr, g_upscale.motionRtv);
+        td.Format = DXGI_FORMAT_R32_FLOAT;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                IID_PPV_ARGS(&g_upscale.depth))))
+            return false;
     }
     return true;
+}
+
+// A tile of the scene was resolved (its depth may be cleared next): keep its depth.
+void CopySceneDepth(const D3D12_RECT& gameRect)
+{
+    const D3D12_RECT r = ToHost(gameRect);
+    FrameResources& f = Frame();
+    if (!g_upscale.depth || !g_r.depth || r.right <= r.left || r.bottom <= r.top || f.descriptorsUsed + 2 > kDescriptorsPerFrame)
+        return;
+    const UINT slots = f.descriptorBase + f.descriptorsUsed;
+    f.descriptorsUsed += 2;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    g_r.device->CreateShaderResourceView(g_r.depth.Get(), &srv, Cpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_R32_FLOAT;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g_r.device->CreateUnorderedAccessView(g_upscale.depth.Get(), nullptr, &uav, Cpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = g_r.depth.Get();
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    g_r.list->ResourceBarrier(1, &b);
+    uint32_t c[24] = {};
+    c[0] = uint32_t(r.left);
+    c[1] = uint32_t(r.top);
+    c[20] = uint32_t(r.right - r.left);
+    c[21] = uint32_t(r.bottom - r.top);
+    g_r.list->SetComputeRootSignature(g_upscale.root.Get());
+    g_r.list->SetComputeRoot32BitConstants(0, 24, c, 0);
+    g_r.list->SetPipelineState(g_upscale.depthCopy.Get());
+    g_r.list->SetComputeRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
+    g_r.list->SetComputeRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
+    g_r.list->Dispatch((c[20] + 7) / 8, (c[21] + 7) / 8, 1);
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    g_r.list->ResourceBarrier(1, &b);
+    g_drawState.Invalidate(); // the compute pipeline replaced the draw's
 }
 
 float Halton(uint32_t index, uint32_t base)
@@ -3166,11 +3215,104 @@ void BeginTemporalFrame()
 
 void UpscaleResolved(uint32_t base);
 
-// The temporal upscale of the scene image at `base` (colour, depth, motion, jitter).
-// (Until DLSS and FSR 3 are wired in: FSR 1.)
+// DLSS on the scene image at `base`: colour (render size), depth and motion (top left of
+// output-sized textures); the upscaled image replaces it like UpscaleResolved.
+bool EvaluateDlss(uint32_t base)
+{
+    if (!DlssInit(g_r.device))
+        return false;
+    auto it = g_r.resolved.find(base);
+    if (it == g_r.resolved.end() || !it->second.resource)
+        return false;
+    ResolvedTexture& dest = it->second;
+    if (dest.format != DXGI_FORMAT_R8G8B8A8_UNORM && dest.format != DXGI_FORMAT_R16G16B16A16_FLOAT)
+        return false;
+    const ComPtr<ID3D12Resource> color = dest.resource;
+    const uint32_t inWidth = dest.hostWidth, inHeight = dest.hostHeight;
+    const float savedScale = g_sceneScale;
+    g_sceneScale = 1.0f;
+    const uint32_t outWidth = uint32_t(HostX(LONG(dest.width))), outHeight = uint32_t(HostY(LONG(dest.height)));
+    g_sceneScale = savedScale;
+    if (outWidth < inWidth || outHeight < inHeight)
+        return false;
+    const uint64_t frame = dest.frame;
+    const DXGI_FORMAT format = dest.format;
+    const bool swapped = dest.swapped;
+    // DLAA (native scale) writes a second texture of the same size: the variant pool keys on
+    // size, so the output is a distinct resource only when the sizes differ.
+    if (outWidth == inWidth && outHeight == inHeight)
+        return false; // (DLAA: see below)
+    EnsureResolved(dest, dest.width, dest.height, outWidth, outHeight, format);
+    dest.frame = frame;
+    dest.swapped = swapped;
+
+    DlssSetup setup;
+    setup.renderWidth = inWidth;
+    setup.renderHeight = inHeight;
+    setup.outputWidth = outWidth;
+    setup.outputHeight = outHeight;
+    setup.quality = GetSettings().quality;
+    setup.hdr = format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    DlssFrame in{};
+    in.color = color.Get();
+    in.depth = g_upscale.depth.Get();
+    in.motion = g_upscale.motion.Get();
+    in.output = dest.resource.Get();
+    static const float jitterSign = getenv("FM2_DLSS_JITTER_FLIP") ? -1.0f : 1.0f;
+    in.jitterX = g_upscale.jitterPx[0] * jitterSign;
+    in.jitterY = g_upscale.jitterPx[1] * jitterSign;
+    in.motionScaleX = float(inWidth);
+    in.motionScaleY = float(inHeight);
+    in.frameTimeMs = float(std::chrono::duration<double, std::milli>(now - last).count());
+    in.reset = g_upscale.reset;
+    last = now;
+
+    auto barrier = [](ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = r;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = from;
+        b.Transition.StateAfter = to;
+        g_r.list->ResourceBarrier(1, &b);
+    };
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    barrier(g_upscale.depth.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    barrier(g_upscale.motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    barrier(in.output, read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // NGX records into the real command list (after everything recorded so far).
+    const bool ok = DlssEvaluate(g_r.list->Real(), setup, in);
+    barrier(in.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
+    barrier(g_upscale.motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    barrier(g_upscale.depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // NGX may have changed the list's heaps, root signatures and pipeline: set ours again.
+    ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get() };
+    g_r.list->SetDescriptorHeaps(1, heaps);
+    g_r.list->SetGraphicsRootSignature(g_r.rootSignature.Get());
+    g_r.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_drawState.Invalidate();
+    SelectSurfaces(true);
+    if (!ok) // keep the image: show the small one upscaled by FSR 1 instead
+    {
+        dest.resource = color;
+        dest.hostWidth = inWidth;
+        dest.hostHeight = inHeight;
+        return false;
+    }
+    return true;
+}
+
+// The temporal upscale of the scene image at `base` (colour, depth, motion, jitter); FSR 1
+// where the chosen upscaler is not available.
 void TemporalEvaluate(uint32_t base)
 {
-    UpscaleResolved(base);
+    bool done = false;
+    if (GetSettings().upscaler == Settings::Upscaler::Dlss)
+        done = EvaluateDlss(base);
+    if (!done)
+        UpscaleResolved(base);
     g_upscale.reset = false;
 }
 
@@ -3221,6 +3363,9 @@ bool InitUpscale()
         return false;
     pd.CS = { kRcasMain, sizeof(kRcasMain) };
     if (FAILED(g_r.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_upscale.rcas))))
+        return false;
+    pd.CS = { kDepthCopyMain, sizeof(kDepthCopyMain) };
+    if (FAILED(g_r.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_upscale.depthCopy))))
         return false;
     g_upscale.ready = true;
     Log("upscale: FSR 1 ready (scene at %.0f%% of %ux%u)", GetSettings().SceneScale() * 100.0f, OutputWidth(), OutputHeight());
@@ -3419,6 +3564,9 @@ void Resolve()
         // fetch swizzle swaps them back when the title samples it.
         const bool swapRB = !depth && ((info >> 24) & 1);
         BlitResolve(depth, base, width, height, format, rect, depth ? 1.0f : std::ldexp(1.0f, bias));
+        // Temporal upscaling: each tile of the main view keeps its depth before it is cleared.
+        if (g_temporal && g_scenePhase && !depth && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth))
+            CopySceneDepth(rect);
         // The main view's full image (its last tile reaches the bottom): the scene is done.
         if (g_scenePhase && !depth && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth) && rect.bottom >= LONG(kHeight))
             UpscaleScene(base);
