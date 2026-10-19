@@ -34,6 +34,7 @@
 #include <wrl/client.h>
 
 #include "gpu/hlsl.h"
+#include "gpu/recorded_list.h"
 #include "gpu/regs.h"
 #include "gpu/texture.h"
 #include "gpu/ucode.h"
@@ -241,7 +242,9 @@ struct Renderer
 {
     ID3D12Device* device = nullptr;
     ID3D12CommandQueue* queue = nullptr;
-    ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12GraphicsCommandList> realList;
+    RecordedList recorder;
+    RecordedList* list = &recorder; // see recorded_list.h
     ComPtr<ID3D12Heap> physicalHeap;     // the guest's physical memory section, mapped for the GPU
     ComPtr<ID3D12Resource> physical;     // 512 MB raw buffer over it (null if unsupported)
     ComPtr<ID3D12Fence> fence;
@@ -745,9 +748,10 @@ void Init()
         f.ring->Map(0, nullptr, reinterpret_cast<void**>(&f.ringCpu));
         f.descriptorBase = i * kDescriptorsPerFrame;
     }
-    Check(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_r.frames[0].allocator.Get(), nullptr, IID_PPV_ARGS(&g_r.list)),
+    Check(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_r.frames[0].allocator.Get(), nullptr, IID_PPV_ARGS(&g_r.realList)),
         "CreateCommandList");
-    g_r.list->Close();
+    g_r.realList->Close();
+    g_r.recorder.Init(g_r.realList.Get());
     Check(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_r.fence)), "CreateFence");
     g_r.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     PresenterUseRenderer();
@@ -796,7 +800,7 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
         D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc{};
         dsvDesc.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
         dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-        g_r.device->CreateDepthStencilView(s.resource.Get(), &dsvDesc, s.view);
+        g_r.list->CreateDepthStencilView(g_r.device, s.resource.Get(), dsvDesc, s.view); // in order with the recorded commands
     }
     else
     {
@@ -808,7 +812,7 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
             "CreateCommittedResource(colour surface)"); CountCreate("colour surface");
         s.view = g_r.rtvHeap->GetCPUDescriptorHandleForHeapStart();
         s.view.ptr += SIZE_T(index) * g_r.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        g_r.device->CreateRenderTargetView(s.resource.Get(), nullptr, s.view);
+        g_r.list->CreateRenderTargetView(g_r.device, s.resource.Get(), s.view); // in order with the recorded commands
     }
     Log("renderer: EDRAM %s surface at base %03X", depth ? "depth" : "colour", base);
     return s;
@@ -2561,7 +2565,7 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     srv.Texture2D.MipLevels = 1;
     g_r.device->CreateShaderResourceView(depth ? g_r.depth.Get() : g_r.color.Get(), &srv, Cpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
     const auto rtv = g_r.blitRtvHeap->GetCPUDescriptorHandleForHeapStart();
-    g_r.device->CreateRenderTargetView(dest.resource.Get(), nullptr, rtv);
+    g_r.list->CreateRenderTargetView(g_r.device, dest.resource.Get(), rtv); // in order with the recorded commands
 
     D3D12_RESOURCE_BARRIER b[2]{};
     UINT barriers = 1;
@@ -3165,7 +3169,7 @@ ID3D12Resource* PrepareOverlayOn(ID3D12GraphicsCommandList* list, const std::fun
 // The frame path stages through the frame's upload ring.
 ID3D12Resource* PrepareOverlay()
 {
-    return PrepareOverlayOn(g_r.list.Get(), [](UINT64 bytes) {
+    return PrepareOverlayOn(g_r.list->Real(), [](UINT64 bytes) {
         OverlayUpload u;
         const UINT64 offset = RingAlloc(bytes, 512);
         if (offset == ~0ull)
@@ -4282,7 +4286,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     if (fromResolve)
         g_hold.image = it->second.resource;
     ID3D12Resource* overlay = fromResolve ? PrepareOverlay() : nullptr;
-    const bool presenting = fromResolve && PresenterRecordCopy(g_r.list.Get(), image, overlay, kOverlayW, kOverlayH);
+    const bool presenting = fromResolve && PresenterRecordCopy(g_r.list->Real(), image, overlay, kOverlayW, kOverlayH);
     {
         static const uint64_t traceFrame = getenv("FM2_TRACE_DRAWS") ? strtoull(getenv("FM2_TRACE_DRAWS"), nullptr, 10) : 0;
         if (traceFrame && g_r.frame + 1 == traceFrame)
@@ -4378,7 +4382,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         Frame().timed = true;
     }
     g_r.list->Close();
-    ID3D12CommandList* lists[] = { g_r.list.Get() };
+    ID3D12CommandList* lists[] = { g_r.list->Real() };
     g_r.queue->ExecuteCommandLists(1, lists);
     if (presenting)
         PresenterPresent();
