@@ -814,6 +814,14 @@ void Init()
     for (UINT i = 0; i < 4; i++)
     {
         samplers[i].Filter = filters[i];
+        // Linear filtering is anisotropic, as the title asks for the road and ground: plain
+        // trilinear picks blurred levels at grazing angles (blotchy asphalt).
+        static const bool noAniso = getenv("FM2_NO_ANISO") != nullptr; // A/B
+        if (filters[i] == D3D12_FILTER_MIN_MAG_MIP_LINEAR && !noAniso)
+        {
+            samplers[i].Filter = D3D12_FILTER_ANISOTROPIC;
+            samplers[i].MaxAnisotropy = 16;
+        }
         samplers[i].AddressU = samplers[i].AddressV = samplers[i].AddressW = modes[i];
         samplers[i].MaxLOD = D3D12_FLOAT32_MAX;
         samplers[i].ShaderRegister = i;
