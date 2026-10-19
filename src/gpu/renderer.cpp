@@ -91,6 +91,7 @@ struct Upscale
     bool tried = false, ready = false;
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> easu, rcas, depthCopy;
+    ComPtr<ID3D12Resource> dlaaOut; // DLAA output (scene size), copied back into the scene image
     ComPtr<ID3D12Resource> depth; // temporal: the scene's depth as R32 (render size, top left)
     ComPtr<ID3D12Resource> temp; // EASU output (RGBA16F)
     uint32_t tempWidth = 0, tempHeight = 0;
@@ -3238,11 +3239,27 @@ bool EvaluateDlss(uint32_t base)
     const uint64_t frame = dest.frame;
     const DXGI_FORMAT format = dest.format;
     const bool swapped = dest.swapped;
-    // DLAA (native scale) writes a second texture of the same size: the variant pool keys on
-    // size, so the output is a distinct resource only when the sizes differ.
-    if (outWidth == inWidth && outHeight == inHeight)
-        return false; // (DLAA: see below)
-    EnsureResolved(dest, dest.width, dest.height, outWidth, outHeight, format);
+    // DLAA (native scale): the output must be another texture; the pool keys variants on
+    // size, so a same-size output gets its own texture, copied back after.
+    const bool dlaa = outWidth == inWidth && outHeight == inHeight;
+    if (dlaa)
+    {
+        if (!g_upscale.dlaaOut || g_upscale.dlaaOut->GetDesc().Width != outWidth || g_upscale.dlaaOut->GetDesc().Height != outHeight ||
+            g_upscale.dlaaOut->GetDesc().Format != format)
+        {
+            if (g_upscale.dlaaOut)
+                Frame().garbage.push_back(std::move(g_upscale.dlaaOut));
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC td = color->GetDesc();
+            td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            if (FAILED(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&g_upscale.dlaaOut))))
+                return false;
+        }
+    }
+    else
+        EnsureResolved(dest, dest.width, dest.height, outWidth, outHeight, format);
     dest.frame = frame;
     dest.swapped = swapped;
 
@@ -3259,7 +3276,7 @@ bool EvaluateDlss(uint32_t base)
     in.color = color.Get();
     in.depth = g_upscale.depth.Get();
     in.motion = g_upscale.motion.Get();
-    in.output = dest.resource.Get();
+    in.output = dlaa ? g_upscale.dlaaOut.Get() : dest.resource.Get();
     static const float jitterSign = getenv("FM2_DLSS_JITTER_FLIP") ? -1.0f : 1.0f;
     in.jitterX = g_upscale.jitterPx[0] * jitterSign;
     in.jitterY = g_upscale.jitterPx[1] * jitterSign;
@@ -3285,6 +3302,14 @@ bool EvaluateDlss(uint32_t base)
     // NGX records into the real command list (after everything recorded so far).
     const bool ok = DlssEvaluate(g_r.list->Real(), setup, in);
     barrier(in.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
+    if (dlaa && ok)
+    {
+        barrier(in.output, read, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        barrier(color.Get(), read, D3D12_RESOURCE_STATE_COPY_DEST);
+        g_r.list->Real()->CopyResource(color.Get(), in.output);
+        barrier(color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, read);
+        barrier(in.output, D3D12_RESOURCE_STATE_COPY_SOURCE, read);
+    }
     barrier(g_upscale.motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     barrier(g_upscale.depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     // NGX may have changed the list's heaps, root signatures and pipeline: set ours again.
@@ -3294,7 +3319,7 @@ bool EvaluateDlss(uint32_t base)
     g_r.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_drawState.Invalidate();
     SelectSurfaces(true);
-    if (!ok) // keep the image: show the small one upscaled by FSR 1 instead
+    if (!ok && !dlaa) // keep the image: show the small one upscaled by FSR 1 instead
     {
         dest.resource = color;
         dest.hostWidth = inWidth;

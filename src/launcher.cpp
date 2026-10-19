@@ -26,8 +26,8 @@ const std::pair<uint32_t, uint32_t> kAspects[] = { { 0, 0 }, { 16, 9 }, { 21, 9 
 const wchar_t* kAspectNames[] = { L"Auto (match resolution)", L"16:9", L"21:9", L"32:9" };
 const uint32_t kFps[] = { 30, 60, 120, 144, 165, 240, 360 };
 // Upscalers offered so far (DLSS and FSR 3 follow), and the quality presets.
-const std::pair<Settings::Upscaler, const wchar_t*> kUpscalers[] = { { Settings::Upscaler::Off, L"Off (native)" }, { Settings::Upscaler::Fsr1, L"AMD FSR 1" } };
-const wchar_t* kQualities[] = { L"Native (sharpen only)", L"Quality (67%)", L"Balanced (59%)", L"Performance (50%)", L"Ultra performance (33%)" };
+const std::pair<Settings::Upscaler, const wchar_t*> kUpscalers[] = { { Settings::Upscaler::Off, L"Off (native)" }, { Settings::Upscaler::Fsr1, L"AMD FSR 1" }, { Settings::Upscaler::Dlss, L"NVIDIA DLSS (DLAA at native)" } };
+const wchar_t* kQualities[] = { L"Native (DLAA / sharpen)", L"Quality (67%)", L"Balanced (59%)", L"Performance (50%)", L"Ultra performance (33%)" };
 
 struct State
 {
