@@ -82,6 +82,21 @@ is also the display's refresh rate. `FM2_NO_LAUNCHER=1` skips the launcher and u
 saved settings; these variables override the file for one run: `FM2_PROFILE`,
 `FM2_RESOLUTION`, `FM2_RENDER_SCALE`, `FM2_MAX_FPS`, `FM2_VSYNC`, `FM2_FULLSCREEN`.
 
+### Upscaling
+
+Upscaling renders the 3D scene smaller and upscales it to the output resolution right
+after the scene is finished; post-processing and the HUD are drawn at full resolution on
+top, so text and gauges stay sharp. The quality preset sets the scene size: Quality 67%,
+Balanced 59%, Performance 50%, Ultra performance 33% (per axis). Menus without a 3D scene
+stay at full resolution.
+
+- **AMD FSR 1** (spatial: edge-adaptive upscale plus RCAS sharpening) works on any GPU.
+- DLSS, DLAA and FSR 3 (temporal, with motion vectors) are planned.
+
+This game's GPU cost is mostly per-draw work rather than pixels, so upscaling gains the
+most at 4K or on slower GPUs. Variables: `FM2_UPSCALER=off|fsr1`, `FM2_UPSCALE_QUALITY=0-4`,
+`FM2_SHARPNESS=0-1` (settings.ini: `upscaler`, `upscale_quality`, `sharpness`).
+
 ## Building
 
 Needs Visual Studio 2022 Build Tools, LLVM (clang-cl), CMake, Ninja, Python 3, and an
@@ -91,6 +106,14 @@ FFmpeg Windows x64 **LGPL shared** build (for XMA audio decoding), for example
 `thirdparty/ffmpeg/include`, `lib` and `bin` exist. The build copies the DLLs it needs
 next to `fm2.exe`; FFmpeg is linked dynamically and stays under its own LGPL license
 (`thirdparty/ffmpeg/LICENSE.txt`).
+
+The upscalers need the AMD FidelityFX SDK and the NVIDIA DLSS SDK in `thirdparty/`
+(not committed; FSR 1's shaders are compiled from the FidelityFX headers at build time):
+
+```
+git clone --depth 1 --branch v2.3.0 https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git thirdparty/fidelityfx
+git clone --depth 1 --branch v310.9.16 https://github.com/NVIDIA/DLSS.git thirdparty/dlss
+```
 
 ```
 git submodule update --init --recursive

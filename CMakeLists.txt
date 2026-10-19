@@ -25,8 +25,22 @@ target_compile_options(fm2_ppc PUBLIC -msse4.1 -fno-strict-aliasing)
 target_compile_options(fm2_ppc PRIVATE -gline-tables-only "/FI${CMAKE_SOURCE_DIR}/src/ppc_hooks.h")
 
 file(GLOB_RECURSE FM2_SOURCES CONFIGURE_DEPENDS src/*.cpp)
+
+# Upscalers: AMD FidelityFX SDK (MIT) and NVIDIA DLSS SDK, fetched into thirdparty/ (see README).
+set(FM2_FFX "${CMAKE_SOURCE_DIR}/thirdparty/fidelityfx/Kits/FidelityFX")
+if(NOT EXISTS "${FM2_FFX}/upscalers/fsr3/include/gpu/fsr1/ffx_fsr1.h")
+    message(FATAL_ERROR "thirdparty/fidelityfx is missing: clone FidelityFX-SDK v2.3.0 there (see README)")
+endif()
+# FSR 1 compute shaders, compiled with fxc at build time and embedded.
+set(FM2_GENERATED "${CMAKE_BINARY_DIR}/generated")
+add_custom_command(OUTPUT "${FM2_GENERATED}/fsr1_cs.h"
+    COMMAND py -3 -I "${CMAKE_SOURCE_DIR}/tools/embed_hlsl.py" "${CMAKE_SOURCE_DIR}/src/gpu/fsr1.hlsl" "${FM2_GENERATED}/fsr1_cs.h"
+            EasuMain,RcasMain "${FM2_FFX}/api/internal/gpu" "${FM2_FFX}/upscalers/fsr3/include/gpu/fsr1"
+    DEPENDS "${CMAKE_SOURCE_DIR}/src/gpu/fsr1.hlsl" "${CMAKE_SOURCE_DIR}/tools/embed_hlsl.py"
+    COMMENT "Compiling FSR 1 shaders")
+list(APPEND FM2_SOURCES "${FM2_GENERATED}/fsr1_cs.h")
 add_executable(fm2 ${FM2_SOURCES})
-target_include_directories(fm2 PRIVATE src)
+target_include_directories(fm2 PRIVATE src "${FM2_GENERATED}")
 target_link_libraries(fm2 PRIVATE fm2_ppc XenonUtils synchronization winmm onecore d3d12 dxgi d3dcompiler)
 target_compile_definitions(fm2 PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 target_compile_options(fm2 PRIVATE -gline-tables-only)

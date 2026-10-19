@@ -19,17 +19,21 @@ namespace
 {
 enum : int
 {
-    kProfile = 100, kResolution, kAspect, kDisplay, kVsync, kMaxFps, kPlay, kQuit
+    kProfile = 100, kResolution, kAspect, kDisplay, kVsync, kMaxFps, kUpscaler, kQuality, kPlay, kQuit
 };
 
 const std::pair<uint32_t, uint32_t> kAspects[] = { { 0, 0 }, { 16, 9 }, { 21, 9 }, { 32, 9 } };
 const wchar_t* kAspectNames[] = { L"Auto (match resolution)", L"16:9", L"21:9", L"32:9" };
 const uint32_t kFps[] = { 30, 60, 120, 144, 165, 240, 360 };
+// Upscalers offered so far (DLSS and FSR 3 follow), and the quality presets.
+const std::pair<Settings::Upscaler, const wchar_t*> kUpscalers[] = { { Settings::Upscaler::Off, L"Off (native)" }, { Settings::Upscaler::Fsr1, L"AMD FSR 1" } };
+const wchar_t* kQualities[] = { L"Native (sharpen only)", L"Quality (67%)", L"Balanced (59%)", L"Performance (50%)", L"Ultra performance (33%)" };
 
 struct State
 {
     HWND window = nullptr;
-    HWND profile = nullptr, resolution = nullptr, aspect = nullptr, display = nullptr, vsync = nullptr, maxFps = nullptr;
+    HWND profile = nullptr, resolution = nullptr, aspect = nullptr, display = nullptr, vsync = nullptr, maxFps = nullptr, upscaler = nullptr,
+         quality = nullptr;
     std::vector<std::pair<uint32_t, uint32_t>> resolutions;
     bool play = false, done = false;
 } g_state;
@@ -85,6 +89,12 @@ void Apply()
     const LRESULT f = SendMessageW(g_state.maxFps, CB_GETCURSEL, 0, 0);
     if (f >= 0 && size_t(f) < std::size(kFps))
         s.maxFps = kFps[size_t(f)];
+    const LRESULT u = SendMessageW(g_state.upscaler, CB_GETCURSEL, 0, 0);
+    if (u >= 0 && size_t(u) < std::size(kUpscalers))
+        s.upscaler = kUpscalers[size_t(u)].first;
+    const LRESULT q = SendMessageW(g_state.quality, CB_GETCURSEL, 0, 0);
+    if (q >= 0 && q <= 4)
+        s.quality = uint32_t(q);
 }
 
 LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -134,7 +144,7 @@ bool RunLauncher()
     wc.hbrBackground = HBRUSH(COLOR_BTNFACE + 1);
     wc.lpszClassName = L"fm2launcher";
     RegisterClassW(&wc);
-    RECT r{ 0, 0, S(380), S(300) };
+    RECT r{ 0, 0, S(380), S(380) };
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     AdjustWindowRect(&r, style, FALSE);
     const int ww = r.right - r.left, wh = r.bottom - r.top;
@@ -193,6 +203,25 @@ bool RunLauncher()
     SendMessageW(g_state.maxFps, CB_SETCURSEL, fpsIndex, 0);
     g_state.vsync = Control(w, L"BUTTON", L"VSync", BS_AUTOCHECKBOX, cx + 120, y, 100, 26, kVsync, font);
     SendMessageW(g_state.vsync, BM_SETCHECK, s.vsync ? BST_CHECKED : BST_UNCHECKED, 0);
+    y += 40;
+
+    Label(w, L"Upscaling", lx, y, font);
+    g_state.upscaler = Control(w, L"COMBOBOX", L"", CBS_DROPDOWNLIST, cx, y, cw, 200, kUpscaler, font);
+    for (size_t i = 0; i < std::size(kUpscalers); i++)
+    {
+        SendMessageW(g_state.upscaler, CB_ADDSTRING, 0, LPARAM(kUpscalers[i].second));
+        if (kUpscalers[i].first == s.upscaler)
+            SendMessageW(g_state.upscaler, CB_SETCURSEL, i, 0);
+    }
+    if (SendMessageW(g_state.upscaler, CB_GETCURSEL, 0, 0) < 0)
+        SendMessageW(g_state.upscaler, CB_SETCURSEL, 0, 0);
+    y += 40;
+
+    Label(w, L"Upscale quality", lx, y, font);
+    g_state.quality = Control(w, L"COMBOBOX", L"", CBS_DROPDOWNLIST, cx, y, cw, 200, kQuality, font);
+    for (const wchar_t* name : kQualities)
+        SendMessageW(g_state.quality, CB_ADDSTRING, 0, LPARAM(name));
+    SendMessageW(g_state.quality, CB_SETCURSEL, std::min<uint32_t>(s.quality, 4), 0);
     y += 52;
 
     Control(w, L"BUTTON", L"Play", BS_DEFPUSHBUTTON, cx, y, 105, 32, kPlay, font);

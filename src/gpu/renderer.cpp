@@ -35,6 +35,9 @@
 
 #include "gpu/hlsl.h"
 #include "gpu/recorded_list.h"
+#include "fsr1_cs.h"
+#include <DirectXPackedVector.h>
+#include "settings.h"
 #include "gpu/regs.h"
 #include "gpu/texture.h"
 #include "gpu/ucode.h"
@@ -74,8 +77,22 @@ uint32_t OutputHeight()
     static const uint32_t h = [] { uint32_t w, h; RenderSize(w, h); return h; }();
     return h;
 }
-float ScaleY() { return float(OutputHeight()) / float(kHeight); }
-float ScaleWide() { return float(OutputWidth()) / float(kWidth); }
+// Upscaling: the 3D scene of a frame renders at this fraction of the output (1 otherwise);
+// after the scene is upscaled (UpscaleScene), the rest of the frame renders at full size.
+float g_sceneScale = 1.0f;
+struct Upscale
+{
+    bool tried = false, ready = false;
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> easu, rcas;
+    ComPtr<ID3D12Resource> temp; // EASU output (RGBA16F)
+    uint32_t tempWidth = 0, tempHeight = 0;
+    bool switchedThisFrame = false;
+    uint64_t retryFrame = 0; // after a frame with no scene to upscale (menus): native until then
+} g_upscale;
+
+float ScaleY() { return float(OutputHeight()) / float(kHeight) * g_sceneScale; }
+float ScaleWide() { return float(OutputWidth()) / float(kWidth) * g_sceneScale; }
 bool WidePass() { return (gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF) == kWidth; }
 float ScaleX() { return WidePass() ? ScaleWide() : ScaleY(); }
 LONG HostX(LONG v) { return LONG(std::lround(double(v) * ScaleX())); }
@@ -1052,6 +1069,12 @@ void BeginFrameIfNeeded()
     }
     f.allocator->Reset();
     g_r.list->Reset(f.allocator.Get(), nullptr);
+    // This frame's scene scale (see UpscaleScene).
+    {
+        const float scale = GetSettings().upscaler == Settings::Upscaler::Fsr1 ? GetSettings().SceneScale() : 1.0f;
+        g_upscale.switchedThisFrame = false;
+        g_sceneScale = scale < 1.0f && g_r.frame >= g_upscale.retryFrame ? scale : 1.0f;
+    }
     PassMark("frame start %u%u", 0, 0);
     if (perf && g_timestamps)
         g_r.list->EndQuery(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 2);
@@ -2740,9 +2763,9 @@ void TransitionColor(D3D12_RESOURCE_STATES to)
 // Draws the resolve rectangle of the colour (or depth) buffer into the
 // destination's host texture at the same pixels, converting the format and
 // scaling colour by the resolve's exponent bias.
-void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXGI_FORMAT format, const D3D12_RECT& rect, float scale, bool swapRB = false)
+// Makes `dest` the variant of that size and format (an earlier one from its spares, or new).
+void EnsureResolved(ResolvedTexture& dest, uint32_t width, uint32_t height, uint32_t hostWidth, uint32_t hostHeight, DXGI_FORMAT format)
 {
-    ResolvedTexture& dest = g_r.resolved[base];
     auto swapVariant = [](ResolvedTexture& a, ResolvedTexture& b) {
         std::swap(a.resource, b.resource);
         std::swap(a.width, b.width);
@@ -2753,7 +2776,6 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
         std::swap(a.format, b.format);
         std::swap(a.swapped, b.swapped);
     };
-    const uint32_t hostWidth = uint32_t(HostX(LONG(width))), hostHeight = uint32_t(HostY(LONG(height)));
     if (!dest.resource || dest.width != width || dest.height != height || dest.hostWidth != hostWidth || dest.hostHeight != hostHeight ||
         dest.format != format)
     {
@@ -2790,6 +2812,9 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
             td.SampleDesc.Count = 1;
             td.Format = format;
             td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            // Colour images can also be an upscaler's output (written by compute).
+            if (format == DXGI_FORMAT_R8G8B8A8_UNORM || format == DXGI_FORMAT_R16G16B16A16_FLOAT)
+                td.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
             Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
                       IID_PPV_ARGS(&dest.resource)),
@@ -2803,6 +2828,13 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
             dest.swapped = false;
         }
     }
+}
+
+void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXGI_FORMAT format, const D3D12_RECT& rect, float scale, bool swapRB = false)
+{
+    ResolvedTexture& dest = g_r.resolved[base];
+    const uint32_t hostWidth = uint32_t(HostX(LONG(width))), hostHeight = uint32_t(HostY(LONG(height)));
+    EnsureResolved(dest, width, height, hostWidth, hostHeight, format);
     dest.frame = g_r.frame;
     const D3D12_RECT sr{ rect.left, rect.top, std::min<LONG>(rect.right, width), std::min<LONG>(rect.bottom, height) };
     FrameResources& f = Frame();
@@ -2865,6 +2897,182 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
 
 // EDRAM resolve: copy a rectangle of the render target to the destination
 // (as a host texture), then optionally clear colour and depth.
+// ---- Upscaling ---------------------------------------------------------------------------
+// The scene (everything up to the full-screen resolve of the main view) renders at
+// g_sceneScale; that resolved image is upscaled to the output size (FSR 1: EASU, then RCAS
+// sharpening) and post-processing and the HUD render at full size from it.
+
+bool InitUpscale()
+{
+    if (g_upscale.tried)
+        return g_upscale.ready;
+    g_upscale.tried = true;
+    D3D12_DESCRIPTOR_RANGE srv{}, uav{};
+    srv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srv.NumDescriptors = 1;
+    uav.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    uav.NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER params[3]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants.Num32BitValues = 24;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable.NumDescriptorRanges = 1;
+    params[1].DescriptorTable.pDescriptorRanges = &srv;
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[2].DescriptorTable.NumDescriptorRanges = 1;
+    params[2].DescriptorTable.pDescriptorRanges = &uav;
+    D3D12_STATIC_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rs{};
+    rs.NumParameters = 3;
+    rs.pParameters = params;
+    rs.NumStaticSamplers = 1;
+    rs.pStaticSamplers = &sampler;
+    ComPtr<ID3DBlob> blob, error;
+    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)) ||
+        FAILED(g_r.device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&g_upscale.root))))
+    {
+        Log("upscale: root signature failed: %s", error ? static_cast<const char*>(error->GetBufferPointer()) : "?");
+        return false;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g_upscale.root.Get();
+    pd.CS = { kEasuMain, sizeof(kEasuMain) };
+    if (FAILED(g_r.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_upscale.easu))))
+        return false;
+    pd.CS = { kRcasMain, sizeof(kRcasMain) };
+    if (FAILED(g_r.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_upscale.rcas))))
+        return false;
+    g_upscale.ready = true;
+    Log("upscale: FSR 1 ready (scene at %.0f%% of %ux%u)", GetSettings().SceneScale() * 100.0f, OutputWidth(), OutputHeight());
+    return true;
+}
+
+// Upscales the resolved image at `base` (rendered at the scene scale) to the output size in
+// place: the resolve keeps the small image among its spares and shows the upscaled one.
+void UpscaleResolved(uint32_t base)
+{
+    auto it = g_r.resolved.find(base);
+    if (it == g_r.resolved.end() || !it->second.resource || !InitUpscale())
+        return;
+    ResolvedTexture& dest = it->second;
+    if (dest.format != DXGI_FORMAT_R8G8B8A8_UNORM && dest.format != DXGI_FORMAT_R16G16B16A16_FLOAT)
+        return;
+    const ComPtr<ID3D12Resource> source = dest.resource;
+    const uint32_t inWidth = dest.hostWidth, inHeight = dest.hostHeight;
+    const float savedScale = g_sceneScale;
+    g_sceneScale = 1.0f;
+    const uint32_t outWidth = uint32_t(HostX(LONG(dest.width))), outHeight = uint32_t(HostY(LONG(dest.height)));
+    g_sceneScale = savedScale;
+    if (outWidth <= inWidth || outHeight <= inHeight)
+        return;
+    const uint64_t frame = dest.frame;
+    const DXGI_FORMAT format = dest.format;
+    const bool swapped = dest.swapped;
+    EnsureResolved(dest, dest.width, dest.height, outWidth, outHeight, format);
+    dest.frame = frame;
+    dest.swapped = swapped;
+    if (!g_upscale.temp || g_upscale.tempWidth != outWidth || g_upscale.tempHeight != outHeight)
+    {
+        if (g_upscale.temp)
+            Frame().garbage.push_back(std::move(g_upscale.temp));
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = outWidth;
+        td.Height = outHeight;
+        td.DepthOrArraySize = 1;
+        td.MipLevels = 1;
+        td.SampleDesc.Count = 1;
+        td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        Check(g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                  IID_PPV_ARGS(&g_upscale.temp)),
+            "CreateCommittedResource(upscale)");
+        g_upscale.tempWidth = outWidth;
+        g_upscale.tempHeight = outHeight;
+    }
+    FrameResources& f = Frame();
+    if (f.descriptorsUsed + 4 > kDescriptorsPerFrame)
+        return;
+    const UINT slots = f.descriptorBase + f.descriptorsUsed;
+    f.descriptorsUsed += 4;
+    auto srvOf = [&](ID3D12Resource* r, DXGI_FORMAT fmt, UINT slot) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+        v.Format = fmt;
+        v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        v.Texture2D.MipLevels = 1;
+        g_r.device->CreateShaderResourceView(r, &v, Cpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
+    };
+    auto uavOf = [&](ID3D12Resource* r, DXGI_FORMAT fmt, UINT slot) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC v{};
+        v.Format = fmt;
+        v.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        g_r.device->CreateUnorderedAccessView(r, nullptr, &v, Cpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
+    };
+    srvOf(source.Get(), format, slots);
+    uavOf(g_upscale.temp.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, slots + 1);
+    srvOf(g_upscale.temp.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, slots + 2);
+    uavOf(dest.resource.Get(), format, slots + 3);
+
+    // FSR 1 constants (FsrEasuCon / FsrRcasCon): the whole source texture is the input.
+    auto bits = [](float v) { return std::bit_cast<uint32_t>(v); };
+    uint32_t c[24] = {};
+    const float iw = float(inWidth), ih = float(inHeight), ow = float(outWidth), oh = float(outHeight);
+    c[0] = bits(iw / ow); c[1] = bits(ih / oh); c[2] = bits(0.5f * iw / ow - 0.5f); c[3] = bits(0.5f * ih / oh - 0.5f);
+    c[4] = bits(1.0f / iw); c[5] = bits(1.0f / ih); c[6] = bits(1.0f / iw); c[7] = bits(-1.0f / ih);
+    c[8] = bits(-1.0f / iw); c[9] = bits(2.0f / ih); c[10] = bits(1.0f / iw); c[11] = bits(2.0f / ih);
+    c[12] = bits(0.0f); c[13] = bits(4.0f / ih);
+    // RCAS: sharpness in stops (0 sharpest); the setting's 1 is sharpest.
+    const float sharp = std::exp2(-2.0f * (1.0f - GetSettings().sharpness));
+    c[16] = bits(sharp);
+    const uint16_t h = DirectX::PackedVector::XMConvertFloatToHalf(sharp);
+    c[17] = uint32_t(h) | uint32_t(h) << 16;
+    c[20] = outWidth;
+    c[21] = outHeight;
+
+    auto barrier = [](ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = r;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = from;
+        b.Transition.StateAfter = to;
+        g_r.list->ResourceBarrier(1, &b);
+    };
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const UINT gx = (outWidth + 15) / 16, gy = (outHeight + 15) / 16;
+    g_r.list->SetComputeRootSignature(g_upscale.root.Get());
+    g_r.list->SetComputeRoot32BitConstants(0, 24, c, 0);
+    g_r.list->SetPipelineState(g_upscale.easu.Get());
+    g_r.list->SetComputeRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
+    g_r.list->SetComputeRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
+    g_r.list->Dispatch(gx, gy, 1);
+    barrier(g_upscale.temp.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
+    barrier(dest.resource.Get(), read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g_r.list->SetPipelineState(g_upscale.rcas.Get());
+    g_r.list->SetComputeRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), slots + 2, g_r.srvStride));
+    g_r.list->SetComputeRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), slots + 3, g_r.srvStride));
+    g_r.list->Dispatch(gx, gy, 1);
+    barrier(dest.resource.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
+    barrier(g_upscale.temp.Get(), read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g_drawState.Invalidate(); // the compute pipeline replaced the draw's
+}
+
+// The scene is complete (its full-screen image resolved): upscale it, and render the rest of
+// the frame (post-processing, HUD) at full size.
+void UpscaleScene(uint32_t base)
+{
+    UpscaleResolved(base);
+    g_sceneScale = 1.0f;
+    g_upscale.switchedThisFrame = true;
+}
+
 void Resolve()
 {
     g_resolveEpoch++; // texture bindings may now map to a new resolve
@@ -2931,6 +3139,9 @@ void Resolve()
         // fetch swizzle swaps them back when the title samples it.
         const bool swapRB = !depth && ((info >> 24) & 1);
         BlitResolve(depth, base, width, height, format, rect, depth ? 1.0f : std::ldexp(1.0f, bias));
+        // The main view's full image (its last tile reaches the bottom): the scene is done.
+        if (g_sceneScale < 1.0f && !depth && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth) && rect.bottom >= LONG(kHeight))
+            UpscaleScene(base);
         g_r.resolved[base].swapped = swapRB;
     }
     // Clears after a tile's resolve prepare the EDRAM for the next tile, which
@@ -4134,7 +4345,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             scissor.bottom = std::min(scissor.bottom, g_tile.rect.bottom);
         }
     }
-    const D3D12_VIEWPORT vp{ 0, shiftY * ScaleY(), float(kWidth) * ScaleX(), float(OutputHeight()), 0, 1 };
+    const D3D12_VIEWPORT vp{ 0, shiftY * ScaleY(), float(kWidth) * ScaleX(), float(kHeight) * ScaleY(), 0, 1 };
     if (scissor.right <= scissor.left || scissor.bottom <= scissor.top)
     {
         TraceSkip("empty scissor", initiator);
@@ -4147,7 +4358,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // screen layers (post-processing done in halves would leave a seam).
     if (WidePass() && ScaleWide() != ScaleY() && !g_drawSamplesResolve && (scissor.left > 0 || scissor.right < LONG(kWidth)))
     {
-        const double centre = OutputWidth() / 2.0, s = ScaleY();
+        const double centre = kWidth * ScaleWide() / 2.0, s = ScaleY();
         hostScissor.left = LONG(std::lround(centre + (scissor.left - double(kWidth) / 2) * s));
         hostScissor.right = LONG(std::lround(centre + (scissor.right - double(kWidth) / 2) * s));
     }
@@ -4575,6 +4786,14 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     PrecompileAll();
     WarmupStep();
     BeginFrameIfNeeded();
+    // A frame that rendered small but never resolved a scene (a menu): upscale what it shows
+    // and stay at full size for a while (menus are drawn sharp at full size).
+    if (g_sceneScale < 1.0f && !g_upscale.switchedThisFrame)
+    {
+        UpscaleResolved(frontBuffer);
+        g_sceneScale = 1.0f;
+        g_upscale.retryFrame = g_r.frame + 120;
+    }
     // Show the front buffer the title resolved to; fall back to the render
     // target if it was never resolved.
     ID3D12Resource* image = g_r.color.Get();

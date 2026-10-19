@@ -41,6 +41,14 @@ public:
         Put(kCopyTexture, &a, sizeof(a));
     }
     void SetGraphicsRootSignature(ID3D12RootSignature* r) { Put(kRootSignature, &r, sizeof(r)); }
+    void SetComputeRootSignature(ID3D12RootSignature* r) { Put(kComputeRootSignature, &r, sizeof(r)); }
+    void SetComputeRootDescriptorTable(UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) { struct A { UINT i; D3D12_GPU_DESCRIPTOR_HANDLE h; } a{ i, h }; Put(kComputeTable, &a, sizeof(a)); }
+    void SetComputeRoot32BitConstants(UINT i, UINT n, const void* data, UINT offset)
+    {
+        struct A { UINT i, n, offset; } a{ i, n, offset };
+        Put(kComputeRoot32, &a, sizeof(a), data, n * 4);
+    }
+    void Dispatch(UINT x, UINT y, UINT z) { UINT a[3] = { x, y, z }; Put(kDispatch, a, sizeof(a)); }
     void SetGraphicsRootDescriptorTable(UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) { struct A { UINT i; D3D12_GPU_DESCRIPTOR_HANDLE h; } a{ i, h }; Put(kTable, &a, sizeof(a)); }
     void SetGraphicsRootConstantBufferView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS v) { struct A { UINT i; D3D12_GPU_VIRTUAL_ADDRESS v; } a{ i, v }; Put(kCbv, &a, sizeof(a)); }
     void SetGraphicsRoot32BitConstants(UINT i, UINT n, const void* data, UINT offset)
@@ -105,7 +113,8 @@ private:
     enum Op : uint32_t
     {
         kBarrier, kCopyTexture, kRootSignature, kTable, kCbv, kRoot32, kTargets, kPipeline, kViewports, kScissors, kStencilRef, kBlendFactor,
-        kTopology, kHeaps, kDraw, kEndQuery, kResolveQuery, kClearRtv, kClearDsv, kCreateRtv, kCreateDsv, kDrawIndexed, kIndexBuffer, kCopyBuffer
+        kTopology, kHeaps, kDraw, kEndQuery, kResolveQuery, kClearRtv, kClearDsv, kCreateRtv, kCreateDsv, kDrawIndexed, kIndexBuffer, kCopyBuffer,
+        kComputeRootSignature, kComputeTable, kComputeRoot32, kDispatch
     };
     static constexpr size_t kChunk = 64 << 10;
 
@@ -280,6 +289,26 @@ private:
                 struct A { ID3D12Resource* dst; UINT64 dstOffset; ID3D12Resource* src; UINT64 srcOffset, bytes; };
                 const A& c = At<A>(a);
                 l->CopyBufferRegion(c.dst, c.dstOffset, c.src, c.srcOffset, c.bytes);
+                break;
+            }
+            case kComputeRootSignature: l->SetComputeRootSignature(At<ID3D12RootSignature*>(a)); break;
+            case kComputeTable:
+            {
+                struct A { UINT i; D3D12_GPU_DESCRIPTOR_HANDLE h; };
+                l->SetComputeRootDescriptorTable(At<A>(a).i, At<A>(a).h);
+                break;
+            }
+            case kComputeRoot32:
+            {
+                struct A { UINT i, n, offset; };
+                const A& c = At<A>(a);
+                l->SetComputeRoot32BitConstants(c.i, c.n, a + sizeof(A), c.offset);
+                break;
+            }
+            case kDispatch:
+            {
+                const UINT* d = reinterpret_cast<const UINT*>(a);
+                l->Dispatch(d[0], d[1], d[2]);
                 break;
             }
             case kCreateRtv:

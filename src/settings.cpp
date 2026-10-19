@@ -17,6 +17,28 @@ bool g_loaded = false;
 
 std::filesystem::path Path() { return UserDir() / "settings.ini"; }
 
+Settings::Upscaler ParseUpscaler(const std::string& v)
+{
+    if (v == "fsr1")
+        return Settings::Upscaler::Fsr1;
+    if (v == "fsr3")
+        return Settings::Upscaler::Fsr3;
+    if (v == "dlss")
+        return Settings::Upscaler::Dlss;
+    return Settings::Upscaler::Off;
+}
+
+const char* UpscalerName(Settings::Upscaler u)
+{
+    switch (u)
+    {
+    case Settings::Upscaler::Fsr1: return "fsr1";
+    case Settings::Upscaler::Fsr3: return "fsr3";
+    case Settings::Upscaler::Dlss: return "dlss";
+    default: return "off";
+    }
+}
+
 void Load()
 {
     std::ifstream in(Path());
@@ -42,6 +64,12 @@ void Load()
             g_settings.vsync = value == "1";
         else if (key == "max_fps")
             g_settings.maxFps = uint32_t(atoi(value.c_str()));
+        else if (key == "upscaler")
+            g_settings.upscaler = ParseUpscaler(value);
+        else if (key == "upscale_quality")
+            g_settings.quality = uint32_t(atoi(value.c_str()));
+        else if (key == "sharpness")
+            g_settings.sharpness = float(atof(value.c_str()));
     }
     // Overrides for testing.
     if (const char* v = getenv("FM2_PROFILE"))
@@ -58,6 +86,14 @@ void Load()
         g_settings.maxFps = uint32_t(atoi(v));
     if (const char* v = getenv("FM2_VSYNC"))
         g_settings.vsync = atoi(v) != 0;
+    if (const char* v = getenv("FM2_UPSCALER"))
+        g_settings.upscaler = ParseUpscaler(v);
+    if (const char* v = getenv("FM2_UPSCALE_QUALITY"))
+        g_settings.quality = uint32_t(atoi(v));
+    if (const char* v = getenv("FM2_SHARPNESS"))
+        g_settings.sharpness = float(atof(v));
+    g_settings.quality = std::min<uint32_t>(g_settings.quality, 4);
+    g_settings.sharpness = std::clamp(g_settings.sharpness, 0.0f, 1.0f);
     if (const char* v = getenv("FM2_FULLSCREEN"))
         g_settings.fullscreen = atoi(v) != 0;
     g_settings.width = std::clamp<uint32_t>(g_settings.width, 640, 15360);
@@ -86,6 +122,15 @@ void Settings::RenderSize(uint32_t& w, uint32_t& h) const
         h = uint32_t(uint64_t(width) * ah / aw) & ~1u;
 }
 
+float Settings::SceneScale() const
+{
+    if (upscaler == Upscaler::Off)
+        return 1.0f;
+    // The usual presets (native, 1.5x, 1.7x, 2x, 3x per axis).
+    static const float scales[] = { 1.0f, 1.0f / 1.5f, 1.0f / 1.7f, 0.5f, 1.0f / 3.0f };
+    return scales[std::min<uint32_t>(quality, 4)];
+}
+
 Settings& GetSettings()
 {
     if (!g_loaded)
@@ -107,4 +152,7 @@ void SaveSettings()
     out << "fullscreen=" << (s.fullscreen ? 1 : 0) << "\n";
     out << "vsync=" << (s.vsync ? 1 : 0) << "\n";
     out << "max_fps=" << s.maxFps << "\n";
+    out << "upscaler=" << UpscalerName(s.upscaler) << "\n";
+    out << "upscale_quality=" << s.quality << "\n";
+    out << "sharpness=" << s.sharpness << "\n";
 }
