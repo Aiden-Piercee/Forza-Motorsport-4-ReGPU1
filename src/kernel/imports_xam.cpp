@@ -696,9 +696,13 @@ GUEST_EXPORT(XamContentCreateEx)
     // XCONTENT_DATA: deviceId, contentType, displayName[128] (wide), fileName[42].
     const std::string fileName(GuestPtr<char>(data + 8 + 256), strnlen(GuestPtr<char>(data + 8 + 256), 42));
     const uint32_t contentType = LoadBE32(data + 4);
-    const std::filesystem::path dir = ContentTypeDir(contentType) / fileName;
+    std::filesystem::path dir = ContentTypeDir(contentType) / fileName;
     std::error_code ec;
-    const bool existed = std::filesystem::exists(dir, ec);
+    // A downloadable package installed in the shared folder: mounted read-only from there.
+    const bool shared = contentType == 2 && std::filesystem::is_directory(DlcDir() / fileName, ec);
+    if (shared)
+        dir = DlcDir() / fileName;
+    const bool existed = shared || std::filesystem::exists(dir, ec);
     const uint32_t flags = ctx.r6.u32;
     const uint32_t mode = flags & 0xF; // 1 create new, 2 create always, 3 open, 4 open always
     if (!existed && mode == 3)
@@ -706,7 +710,8 @@ GUEST_EXPORT(XamContentCreateEx)
         FinishUi(ctx, StackArg(ctx, 8), X_ERROR_FILE_NOT_FOUND);
         return;
     }
-    std::filesystem::create_directories(dir, ec);
+    if (!shared)
+        std::filesystem::create_directories(dir, ec);
     if (!existed)
     {
         std::u16string title;
@@ -719,11 +724,18 @@ GUEST_EXPORT(XamContentCreateEx)
         }
         std::ofstream(TitlePath(contentType, fileName), std::ios::binary).write(reinterpret_cast<const char*>(title.data()), title.size() * 2);
     }
-    const std::string device = "\\Device\\Content\\" + dir.parent_path().filename().string() + "\\" + fileName;
+    const std::string device = shared ? "\\Device\\Dlc\\" + fileName
+                                      : "\\Device\\Content\\" + dir.parent_path().filename().string() + "\\" + fileName;
     VfsAddLink(root + ":", device);
     Log("content: %s: -> %s", root.c_str(), dir.string().c_str());
     StoreIfNonNull(ctx.r7.u32, existed ? 2 : 1); // XCONTENT_OPENED_EXISTING : XCONTENT_CREATED_NEW
-    StoreIfNonNull(ctx.r8.u32, 0);
+    // The license mask of a downloadable package (<package>.license, from its header; see
+    // tools/stfs.py install): titles skip content that is not licensed.
+    uint32_t licenseMask = 0;
+    if (shared)
+        if (std::ifstream in(DlcDir() / (fileName + ".license")); in)
+            in >> std::hex >> licenseMask;
+    StoreIfNonNull(ctx.r8.u32, licenseMask);
     FinishUi(ctx, StackArg(ctx, 8));
 }
 
@@ -791,7 +803,7 @@ GUEST_EXPORT(XamContentCreateEnumerator)
         for (const auto& package : std::filesystem::directory_iterator(typeDir.path(), ec))
         {
             const std::string fileName = package.path().filename().string();
-            if (!package.is_directory() || fileName.size() > 41)
+            if (!package.is_directory() || fileName.size() > 42)
                 continue;
             ContentItem item{ type, {}, fileName };
             std::ifstream in(TitlePath(type, fileName), std::ios::binary);
@@ -802,6 +814,21 @@ GUEST_EXPORT(XamContentCreateEnumerator)
             e->items.push_back(std::move(item));
         }
     }
+    // Downloadable content is shared by all profiles: <user dir>\dlc\<package>.
+    if (!wanted || wanted == 2)
+        for (const auto& package : std::filesystem::directory_iterator(DlcDir(), ec))
+        {
+            const std::string fileName = package.path().filename().string();
+            if (!package.is_directory() || fileName.size() > 42)
+                continue;
+            ContentItem item{ 2, {}, fileName };
+            std::ifstream in(DlcDir() / (fileName + ".title"), std::ios::binary);
+            std::string bytes((std::istreambuf_iterator<char>(in)), {});
+            item.displayName.assign(reinterpret_cast<const char16_t*>(bytes.data()), bytes.size() / 2);
+            if (item.displayName.empty())
+                item.displayName.assign(fileName.begin(), fileName.end());
+            e->items.push_back(std::move(item));
+        }
     Log("content: enumerating %zu packages of type %08X", e->items.size(), wanted);
     StoreIfNonNull(ctx.r8.u32, std::max(ctx.r7.u32, 1u) * kContentDataSize);
     StoreIfNonNull(ctx.r9.u32, CreateHandle(e));

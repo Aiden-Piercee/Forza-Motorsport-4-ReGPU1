@@ -1,12 +1,16 @@
 #include "loader.h"
 
 #include <fstream>
+#include <windows.h>
 #include <vector>
 
 #include <ppc_config.h>
 #include <ppc_context.h>
 
 #include <image.h>
+#ifdef FM2_TITLE_UPDATE
+#include <xex_patcher.h>
+#endif
 
 #include "log.h"
 #include "memory.h"
@@ -195,9 +199,39 @@ uint32_t XexHeaderField(uint32_t headerBase, uint32_t key)
     return 0;
 }
 
+const std::filesystem::path& TitleUpdateDir()
+{
+    static const std::filesystem::path dir = [] {
+        char buffer[MAX_PATH];
+        if (GetEnvironmentVariableA("FM2_TITLE_UPDATE_DIR", buffer, MAX_PATH))
+            return std::filesystem::path(buffer);
+        if (GetEnvironmentVariableA("USERPROFILE", buffer, MAX_PATH))
+            return std::filesystem::path(buffer) / "Documents" / "fm2" / "update";
+        return std::filesystem::path("update");
+    }();
+    return dir;
+}
+
 void LoadTitle(const std::filesystem::path& xexPath)
 {
-    const std::vector<uint8_t> file = ReadFile(xexPath);
+    std::vector<uint8_t> file = ReadFile(xexPath);
+#ifdef FM2_TITLE_UPDATE
+    {
+        // This build's recompiled code is the title-updated executable: the update's patch
+        // turns the disc's default.xex into it (the same patch XenonRecomp applied).
+        const std::filesystem::path xexp = TitleUpdateDir() / "default.xexp";
+        if (!std::filesystem::exists(xexp))
+            Fatal("this build needs the title update: %s is missing (tools/stfs.py update <package> <folder>)", xexp.string().c_str());
+        const std::vector<uint8_t> patch = ReadFile(xexp);
+        std::vector<uint8_t> patched;
+        const auto result = XexPatcher::apply(file.data(), file.size(), patch.data(), patch.size(), patched, false);
+        if (result != XexPatcher::Result::Success)
+            Fatal("could not apply %s to %s (result %d): is it the right title update for this disc?", xexp.string().c_str(),
+                xexPath.string().c_str(), int(result));
+        file = std::move(patched);
+        Log("loader: applied the title update %s (%zu bytes)", xexp.string().c_str(), patch.size());
+    }
+#endif
     Image image = Image::ParseImage(file.data(), file.size());
     if (!image.data)
         Fatal("%s: could not decrypt/decompress the XEX", xexPath.string().c_str());

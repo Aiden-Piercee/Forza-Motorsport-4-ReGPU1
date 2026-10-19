@@ -19,8 +19,13 @@ struct LoadedTitle
 
 extern LoadedTitle g_title;
 
-// Loads default.xex into guest memory and wires up imports.
+// Loads default.xex into guest memory and wires up imports. A build for the title update
+// (FM2_TITLE_UPDATE) applies the update's default.xexp to it first.
 void LoadTitle(const std::filesystem::path& xexPath);
+
+// Where the title update lives (the console's update: device): default.xexp, Media.zip.
+// FM2_TITLE_UPDATE_DIR overrides <user>\fm2\update.
+const std::filesystem::path& TitleUpdateDir();
 
 // Optional header value (low byte 0x00/0x01) or guest pointer to its data.
 uint32_t XexHeaderField(uint32_t headerBase, uint32_t key);

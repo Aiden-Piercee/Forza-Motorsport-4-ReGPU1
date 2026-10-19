@@ -98,6 +98,7 @@ void RuntimeInit(const std::filesystem::path& gameDir)
         Log("runtime: moved saves to the Player profile (%s)", ec ? ec.message().c_str() : "ok");
     }
     std::filesystem::create_directories(g_contentDir, ec);
+    std::filesystem::create_directories(DlcDir(), ec);
     Log("runtime: profile %s, saves in %s", GetSettings().profile.c_str(), g_contentDir.string().c_str());
     PresenterInit();
     GpuInit();
@@ -107,6 +108,11 @@ void RuntimeInit(const std::filesystem::path& gameDir)
 const std::filesystem::path& GameDir() { return g_gameDir; }
 const std::filesystem::path& UserDir() { return g_userDir; }
 const std::filesystem::path& ContentDir() { return g_contentDir; }
+const std::filesystem::path& DlcDir()
+{
+    static const std::filesystem::path dir = g_userDir / "dlc";
+    return dir;
+}
 uint32_t TscFrequency() { return g_tscFrequency; }
 
 void CompleteOverlapped(uint32_t overlapped, uint32_t result, uint32_t extendedError, uint32_t length)

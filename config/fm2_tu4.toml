@@ -1,0 +1,70 @@
+# XenonRecomp config for Forza Motorsport 2 (4D5307EA), European default.xex
+# sha256 9726066f0c546c4e51340ed02a32ae44a89d4175de82a2d55aaaf5451d9b120a.
+# Paths are relative to this file.
+[main]
+patched_file_path = "../out/tu4/default_tu4.xex"
+patch_file_path = "../out/tu4/default.xexp"
+file_path = "../game/default.xex"
+out_directory_path = "../out/ppc_tu4"
+switch_table_file_path = "fm2_switch_tables_tu4.toml"
+
+# Registers kept in host locals instead of the guest context (faster). Hooks, Lua's
+# setjmp/longjmp and the diagnostics read the GPRs and LR from the context, so those stay.
+skip_lr = false
+skip_msr = false
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+cr_as_local = true
+non_argument_as_local = false
+non_volatile_as_local = false
+
+# Register save/restore helpers (tools/findhelpers.py; one match each).
+restgprlr_14_address = 0x8242CCE0
+savegprlr_14_address = 0x8242cc90
+restfpr_14_address = 0x8242DFFC
+savefpr_14_address = 0x8242dfb0
+restvmx_14_address = 0x8242E3E8
+savevmx_14_address = 0x8242e150
+restvmx_64_address = 0x8242E47C
+savevmx_64_address = 0x8242E1E4
+
+# CRT setjmp/longjmp (Lua error handling): mapped to host setjmp/longjmp
+# with the guest context saved and restored around them.
+setjmp_address = 0x82432080
+longjmp_address = 0x82431d30
+
+# Leaf functions without .pdata entries whose jump tables XenonAnalyse's size
+# guess cut off. Each runs to the next .pdata function (minus padding/EH data).
+functions = [
+    # memset: its 1-3 byte tail (0x824145C0..) was split off into separate functions,
+    # so lengths of 2 or 3 mod 4 lost their last bytes (Bink block types -> Arcade crash).
+    { address = 0x8242e050, size = 0xA0 },
+    { address = 0x821EDE28, size = 0xE8 },
+    { address = 0x821EED48, size = 0xC0 },
+    { address = 0x822AB7A8, size = 0x7C },
+    { address = 0x82376288, size = 0x378 },
+    { address = 0x82383388, size = 0x354 },
+    { address = 0x82519328, size = 0x5C },
+    { address = 0x82578640, size = 0x9C },
+    { address = 0x8267A6C0, size = 0x250 },
+    { address = 0x8268B790, size = 0xF8 },
+    { address = 0x82692DA0, size = 0xD8 },
+    { address = 0x826C6D70, size = 0x348 },
+    { address = 0x826E0768, size = 0x114 },
+    { address = 0x826EC1D0, size = 0xDC },
+    { address = 0x82708DF0, size = 0x16C },
+    { address = 0x8271B520, size = 0x1F8 },
+    { address = 0x82764a88, size = 0x108 },
+    { address = 0x82793b80, size = 0x5C4 },
+
+]
+
+invalid_instructions = [
+    { data = 0x00000000, size = 4 }, # Padding
+    # Exception data (handler + scope table) placed before functions with
+    # ExceptionFlag set in .pdata.
+    { data = 0x827745E0, size = 8 }, # C++ frame handler (346 functions)
+    { data = 0x8296B6A8, size = 8 }, # C-specific handler (54 functions)
+    { data = 0x8277AEC0, size = 8 },
+]

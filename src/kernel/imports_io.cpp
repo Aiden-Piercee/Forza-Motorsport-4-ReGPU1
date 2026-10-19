@@ -9,6 +9,7 @@
 
 #include "kernel/imports.h"
 #include "kernel/runtime.h"
+#include "loader.h"
 #include "kernel/vfs.h"
 
 namespace fs = std::filesystem;
@@ -191,7 +192,11 @@ bool VfsResolve(std::string guest, fs::path& host, bool* readOnly)
             match("\\device\\harddisk0\\partition0", UserDir() / "hdd", false) ||
             match("\\device\\harddisk0\\cache0", UserDir() / "cache", false) ||
             match("\\device\\harddisk0\\cache1", UserDir() / "cache", false) || match("cache:", UserDir() / "cache", false) ||
-            match("\\device\\content", ContentDir(), false)))
+            match("\\device\\content", ContentDir(), false) || match("\\device\\dlc", DlcDir(), true)
+#ifdef FM2_TITLE_UPDATE
+            || match("update:", TitleUpdateDir(), true)
+#endif
+            ))
         return false;
 
     while (!rest.empty() && rest.front() == '\\')
@@ -523,6 +528,9 @@ GUEST_EXPORT(NtQueryFullAttributesFile)
     HostInfo h;
     if (!VfsResolve(guest, host, nullptr) || !QueryHostInfo(host, h))
     {
+        static const bool trace = getenv("FM2_TRACE_FILES") != nullptr;
+        if (trace)
+            Log("vfs: attributes not found %s", guest.c_str());
         Return(ctx, X_STATUS_OBJECT_NAME_NOT_FOUND);
         return;
     }
@@ -532,10 +540,13 @@ GUEST_EXPORT(NtQueryFullAttributesFile)
 
 GUEST_EXPORT(NtQueryDirectoryFile)
 {
-    // (handle, event, apcRoutine, apcContext, iosb*, info*, length, class, mask ANSI_STRING*, restartScan)
+    // The 360's version has nine arguments: (handle, event, apcRoutine, apcContext, iosb*, info*,
+    // length, mask ANSI_STRING*, restartScan). The mask is in r10, the restart flag the first
+    // stack argument. (The desktop NT call has two more, which the layout used to assume: it
+    // read the mask and the restart flag from stack garbage.)
     auto file = GetFile(ctx.r3.u32);
     const uint32_t iosb = ctx.r7.u32, info = ctx.r8.u32, length = ctx.r9.u32;
-    const uint32_t mask = StackArg(ctx, 9), restart = StackArg(ctx, 10);
+    const uint32_t mask = ctx.r10.u32, restart = StackArg(ctx, 8);
     if (!file || !file->directory)
     {
         Return(ctx, X_STATUS_INVALID_HANDLE);
@@ -543,7 +554,11 @@ GUEST_EXPORT(NtQueryDirectoryFile)
     }
     if (!file->listed || restart)
     {
-        const std::string pattern = mask ? GuestAnsiString(mask) : "*";
+        // No mask, or an empty one: every entry (NT's meaning; the title's DLC scan passes "").
+        std::string pattern = mask ? GuestAnsiString(mask) : std::string();
+        pattern = pattern.c_str(); // (the title's scan passes a string holding only a NUL)
+        if (pattern.empty())
+            pattern = "*";
         file->entries.clear();
         std::error_code ec;
         for (auto& e : fs::directory_iterator(file->path, ec))
@@ -553,6 +568,9 @@ GUEST_EXPORT(NtQueryDirectoryFile)
         }
         file->nextEntry = 0;
         file->listed = true;
+        static const bool traceFiles = getenv("FM2_TRACE_FILES") != nullptr;
+        if (traceFiles)
+            Log("vfs: list %s mask '%s' -> %zu entries", file->guestPath.c_str(), pattern.c_str(), file->entries.size());
     }
     if (file->nextEntry >= file->entries.size())
     {
@@ -574,6 +592,11 @@ GUEST_EXPORT(NtQueryDirectoryFile)
     file->nextEntry++;
     HostInfo h;
     QueryHostInfo(e.path(), h);
+    {
+        static const bool traceFiles = getenv("FM2_TRACE_FILES") != nullptr;
+        if (traceFiles && file->guestPath.find("dlczips") != std::string::npos)
+            Log("vfs:   entry %zu '%s' attributes %08X size %llu", file->nextEntry, name.c_str(), h.attributes, (unsigned long long)h.size);
+    }
     StoreBE32(info + 0x00, 0);
     StoreBE32(info + 0x04, uint32_t(file->nextEntry));
     StoreBE64(info + 0x08, h.creation);

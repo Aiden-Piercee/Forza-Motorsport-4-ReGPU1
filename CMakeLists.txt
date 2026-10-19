@@ -10,9 +10,18 @@ endif()
 
 add_subdirectory(thirdparty/XenonRecomp EXCLUDE_FROM_ALL)
 
+# Build for the title-updated executable instead (tools/xexmap.py, tools/xexremap.py): the
+# recompiled code is out/ppc_tu4, the guest addresses in the hooks are translated into the
+# build folder, and the loader applies the update's default.xexp to your default.xex.
+option(FM2_TITLE_UPDATE "Build for the title-updated executable" OFF)
+
 # Recompiled game code (out/ppc, produced by XenonRecomp from your own
 # default.xex; never committed).
-set(FM2_PPC_DIR "${CMAKE_SOURCE_DIR}/out/ppc")
+if(FM2_TITLE_UPDATE)
+    set(FM2_PPC_DIR "${CMAKE_SOURCE_DIR}/out/ppc_tu4")
+else()
+    set(FM2_PPC_DIR "${CMAKE_SOURCE_DIR}/out/ppc")
+endif()
 file(GLOB FM2_PPC_SOURCES CONFIGURE_DEPENDS "${FM2_PPC_DIR}/*.cpp")
 if(NOT FM2_PPC_SOURCES)
     message(FATAL_ERROR "out/ppc is empty: run XenonRecomp first (see README)")
@@ -25,6 +34,36 @@ target_compile_options(fm2_ppc PUBLIC -msse4.1 -fno-strict-aliasing)
 target_compile_options(fm2_ppc PRIVATE -gline-tables-only "/FI${CMAKE_SOURCE_DIR}/src/ppc_hooks.h")
 
 file(GLOB_RECURSE FM2_SOURCES CONFIGURE_DEPENDS src/*.cpp)
+if(FM2_TITLE_UPDATE)
+    set(FM2_TU_DIR "${CMAKE_SOURCE_DIR}/out/tu4")
+    set(FM2_REMAP_DIR "${CMAKE_BINARY_DIR}/remapped")
+    set(FM2_REMAP_ARGS "${FM2_TU_DIR}/map.json" "${CMAKE_SOURCE_DIR}/out/base.bin" "${FM2_TU_DIR}/image.bin")
+    execute_process(COMMAND py -3 -I "${CMAKE_SOURCE_DIR}/tools/xexremap.py" scan ${FM2_REMAP_ARGS} "${CMAKE_SOURCE_DIR}/src"
+                    OUTPUT_VARIABLE FM2_REMAP_LIST RESULT_VARIABLE FM2_REMAP_RESULT OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT FM2_REMAP_RESULT EQUAL 0)
+        message(FATAL_ERROR "FM2_TITLE_UPDATE needs out/tu4/map.json (tools/xexmap.py build ...)")
+    endif()
+    string(REPLACE "\n" ";" FM2_REMAP_LIST "${FM2_REMAP_LIST}")
+    # Sources with guest addresses are compiled from translated copies.
+    foreach(rel ${FM2_REMAP_LIST})
+        string(STRIP "${rel}" rel)
+        if(rel MATCHES "\\.cpp$")
+            list(REMOVE_ITEM FM2_SOURCES "${CMAKE_SOURCE_DIR}/src/${rel}")
+            add_custom_command(OUTPUT "${FM2_REMAP_DIR}/${rel}"
+                COMMAND py -3 -I "${CMAKE_SOURCE_DIR}/tools/xexremap.py" source ${FM2_REMAP_ARGS} "${CMAKE_SOURCE_DIR}/src/${rel}" "${FM2_REMAP_DIR}/${rel}"
+                DEPENDS "${CMAKE_SOURCE_DIR}/src/${rel}" "${FM2_TU_DIR}/map.json" "${CMAKE_SOURCE_DIR}/tools/xexremap.py"
+                COMMENT "Translating guest addresses in ${rel}")
+            list(APPEND FM2_SOURCES "${FM2_REMAP_DIR}/${rel}")
+        endif()
+    endforeach()
+    # Weak fallbacks for the patched executable's imports instead of src/kernel/stubs.cpp.
+    list(REMOVE_ITEM FM2_SOURCES "${CMAKE_SOURCE_DIR}/src/kernel/stubs.cpp")
+    add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/generated/stubs_tu.cpp"
+        COMMAND py -3 -I "${CMAKE_SOURCE_DIR}/tools/genstubs.py" "${FM2_PPC_DIR}/ppc_recomp_shared.h" "${CMAKE_BINARY_DIR}/generated/stubs_tu.cpp"
+        DEPENDS "${FM2_PPC_DIR}/ppc_recomp_shared.h" "${CMAKE_SOURCE_DIR}/tools/genstubs.py"
+        COMMENT "Generating import stubs for the patched executable")
+    list(APPEND FM2_SOURCES "${CMAKE_BINARY_DIR}/generated/stubs_tu.cpp")
+endif()
 
 # Upscalers: AMD FidelityFX SDK (MIT) and NVIDIA DLSS SDK, fetched into thirdparty/ (see README).
 set(FM2_FFX "${CMAKE_SOURCE_DIR}/thirdparty/fidelityfx/Kits/FidelityFX")
@@ -44,6 +83,9 @@ if(NOT EXISTS "${FM2_DLSS}/include/nvsdk_ngx.h")
     message(FATAL_ERROR "thirdparty/dlss is missing: clone NVIDIA/DLSS v310.9.16 there (see README)")
 endif()
 add_executable(fm2 ${FM2_SOURCES})
+if(FM2_TITLE_UPDATE)
+    target_compile_definitions(fm2 PRIVATE FM2_TITLE_UPDATE=1)
+endif()
 target_include_directories(fm2 PRIVATE src "${FM2_GENERATED}" "${FM2_DLSS}/include")
 target_link_libraries(fm2 PRIVATE "${FM2_DLSS}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib" "${FM2_FFX}/signedbin/amd_fidelityfx_loader_dx12.lib")
 target_include_directories(fm2 PRIVATE "${FM2_FFX}/api/include" "${FM2_FFX}/upscalers/include")
@@ -55,7 +97,7 @@ target_link_libraries(fm2 PRIVATE fm2_ppc XenonUtils synchronization winmm oneco
 target_compile_definitions(fm2 PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 target_compile_options(fm2 PRIVATE -gline-tables-only)
 target_link_options(fm2 PRIVATE /STACK:0x1000000 /DEBUG)
-target_link_libraries(fm2 PRIVATE dbghelp xaudio2)
+target_link_libraries(fm2 PRIVATE dbghelp xaudio2 bcrypt)
 
 # XMA decoding through FFmpeg's xma2 decoder (LGPL, linked dynamically): a shared build
 # with include/, lib/ and bin/ in thirdparty/ffmpeg (see README).

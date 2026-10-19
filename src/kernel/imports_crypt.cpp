@@ -1,6 +1,12 @@
 // XeCryptSha*: SHA-1 on a guest XECRYPT_SHA_STATE
 // { u32 count, u32 state[5], u8 buffer[64] }.
+// XeKeys*: the console-bound key functions (below).
 #include "kernel/imports.h"
+
+#include <windows.h>
+#include <bcrypt.h>
+
+#include <vector>
 
 namespace
 {
@@ -110,4 +116,129 @@ GUEST_EXPORT(XeCryptSha)
     uint8_t digest[20];
     s.Final(digest);
     memcpy(GuestPtr(ctx.r9.u32), digest, std::min<uint32_t>(ctx.r10.u32, 20));
+}
+
+// ---- XeKeys*: keys bound to the console ------------------------------------------------
+// The title update signs and encrypts the profile with keys the console "obscures" with a
+// secret in its fuses. This port has no such secret, so it uses a fixed one: what
+// XeKeysObscureKey obscures, XeKeysAesCbcUsingKey and XeKeysHmacShaUsingKey accept.
+namespace
+{
+const uint8_t kConsoleSecret[16] = { 'F', 'M', '2', '-', 'p', 'o', 'r', 't', '-', 'c', 'o', 'n', 's', 'o', 'l', 'e' };
+
+bool AesRun(const uint8_t key[16], bool cbc, const uint8_t* iv16, const uint8_t* in, uint8_t* out, uint32_t size, bool encrypt)
+{
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_KEY_HANDLE handle = nullptr;
+    bool ok = false;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0) == 0)
+    {
+        const wchar_t* mode = cbc ? BCRYPT_CHAIN_MODE_CBC : BCRYPT_CHAIN_MODE_ECB;
+        if (BCryptSetProperty(alg, BCRYPT_CHAINING_MODE, PUCHAR(mode), ULONG((wcslen(mode) + 1) * sizeof(wchar_t)), 0) == 0 &&
+            BCryptGenerateSymmetricKey(alg, &handle, nullptr, 0, PUCHAR(key), 16, 0) == 0)
+        {
+            uint8_t iv[16] = {};
+            if (iv16)
+                memcpy(iv, iv16, 16);
+            std::vector<uint8_t> input(in, in + size), output(size);
+            ULONG got = 0;
+            const NTSTATUS status = encrypt ? BCryptEncrypt(handle, input.data(), size, nullptr, cbc ? iv : nullptr, cbc ? 16 : 0, output.data(), size, &got, 0)
+                                            : BCryptDecrypt(handle, input.data(), size, nullptr, cbc ? iv : nullptr, cbc ? 16 : 0, output.data(), size, &got, 0);
+            if (status == 0)
+            {
+                memcpy(out, output.data(), size);
+                ok = true;
+            }
+        }
+    }
+    if (handle)
+        BCryptDestroyKey(handle);
+    if (alg)
+        BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
+
+// The key for obscuredKey (16 bytes in guest memory), or false.
+bool Unobscure(uint32_t guestKey, uint8_t key[16])
+{
+    return guestKey && AesRun(kConsoleSecret, false, nullptr, GuestPtr<uint8_t>(guestKey), key, 16, false);
+}
+
+void HmacSha1(const uint8_t key[16], const std::vector<std::pair<const uint8_t*, uint32_t>>& parts, uint8_t out[20])
+{
+    uint8_t ipad[64], opad[64];
+    for (int i = 0; i < 64; i++)
+    {
+        const uint8_t k = i < 16 ? key[i] : 0;
+        ipad[i] = k ^ 0x36;
+        opad[i] = k ^ 0x5C;
+    }
+    uint8_t inner[20];
+    {
+        Sha s;
+        s.Update(ipad, 64);
+        for (const auto& p : parts)
+            if (p.first && p.second)
+                s.Update(p.first, p.second);
+        s.Final(inner);
+    }
+    Sha s;
+    s.Update(opad, 64);
+    s.Update(inner, 20);
+    s.Final(out);
+}
+}
+
+GUEST_EXPORT(XeKeysObscureKey)
+{
+    // (input[16], output[16]) -> status
+    uint8_t out[16];
+    if (!ctx.r3.u32 || !ctx.r4.u32 || !AesRun(kConsoleSecret, false, nullptr, GuestPtr<uint8_t>(ctx.r3.u32), out, 16, true))
+    {
+        Return(ctx, 0xC0000001);
+        return;
+    }
+    memcpy(GuestPtr(ctx.r4.u32), out, 16);
+    Return(ctx, 0);
+}
+
+GUEST_EXPORT(XeKeysAesCbcUsingKey)
+{
+    // (obscuredKey[16], input, size, output, iv[16], encrypt) -> status
+    uint8_t key[16];
+    const uint32_t size = ctx.r5.u32 & ~15u; // whole blocks
+    if (!Unobscure(ctx.r3.u32, key) || !ctx.r4.u32 || !ctx.r6.u32 || !ctx.r7.u32)
+    {
+        Return(ctx, 0xC0000001);
+        return;
+    }
+    std::vector<uint8_t> out(size);
+    if (size && !AesRun(key, true, GuestPtr<uint8_t>(ctx.r7.u32), GuestPtr<uint8_t>(ctx.r4.u32), out.data(), size, ctx.r8.u32 != 0))
+    {
+        Return(ctx, 0xC0000001);
+        return;
+    }
+    if (size)
+        memcpy(GuestPtr(ctx.r6.u32), out.data(), size);
+    Return(ctx, 0);
+}
+
+GUEST_EXPORT(XeKeysHmacShaUsingKey)
+{
+    // (obscuredKey[16], in1, len1, in2, len2, in3, len3, out, outSize) -> status
+    uint8_t key[16];
+    if (!Unobscure(ctx.r3.u32, key) || !ctx.r10.u32)
+    {
+        Return(ctx, 0xC0000001);
+        return;
+    }
+    const uint32_t inputs[3][2] = { { ctx.r4.u32, ctx.r5.u32 }, { ctx.r6.u32, ctx.r7.u32 }, { ctx.r8.u32, ctx.r9.u32 } };
+    std::vector<std::pair<const uint8_t*, uint32_t>> parts;
+    for (const auto& in : inputs)
+        if (in[0] && in[1])
+            parts.emplace_back(GuestPtr<uint8_t>(in[0]), in[1]);
+    uint8_t digest[20];
+    HmacSha1(key, parts, digest);
+    memcpy(GuestPtr(ctx.r10.u32), digest, std::min<uint32_t>(StackArg(ctx, 8), 20));
+    Return(ctx, 0);
 }
