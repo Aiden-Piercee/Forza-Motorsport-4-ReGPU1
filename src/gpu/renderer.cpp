@@ -4328,6 +4328,11 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
         drawBefore = drawNow;
         static const double slowMs = getenv("FM2_SLOW_MS") ? atof(getenv("FM2_SLOW_MS")) : 25.0; // slow-frame log threshold
         if (perf && dt > slowMs)
+        {
+            void SpikeDump(double ms);
+            SpikeDump(dt + 2.0);
+        }
+        if (perf && dt > slowMs)
             Log("perf: slow frame %llu: %.1f ms | draw %.1f ms (worst draw %.1f; shaders %.1f indices %.1f pipeline %.1f constants %.1f "
                 "textures %.1f submit %.1f), waited %.1f ms on %u builds, %u pipelines started, %u resources created",
                 (unsigned long long)frameNumber, dt, frameDrawMs, g_frameEvents.worstDrawMs, g_frameEvents.section[0], g_frameEvents.section[1],

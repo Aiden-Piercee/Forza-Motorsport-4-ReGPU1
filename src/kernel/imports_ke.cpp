@@ -178,12 +178,64 @@ GUEST_EXPORT(KeSetBasePriorityThread)
 GUEST_EXPORT(KeDelayExecutionThread)
 {
     // (mode, alertable, interval*)
+    static const bool spikes = getenv("FM2_SPIKES") != nullptr;
+    const auto start = spikes ? Clock::now() : Clock::time_point{};
     SleepUntil(TimeoutFromGuest(ctx.r5.u32));
+    if (spikes)
+    {
+        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+        if (ms > 2.0)
+        {
+            // A few return addresses from the guest stack (back chain at 0(r1), LR saved at -8 of each frame's caller).
+            char chain[96] = {};
+            uint32_t sp = ctx.r1.u32;
+            int n = 0;
+            for (int i = 0; i < 6 && sp; i++)
+            {
+                const uint32_t next = LoadBE32(sp);
+                if (!next || next <= sp)
+                    break;
+                n += snprintf(chain + n, sizeof(chain) - n, " %08X", LoadBE32(next - 8));
+                sp = next;
+            }
+            Log("spike: sleep t%u asked %lld (100 ns) slept %.1f ms:%s", CurrentGuestThreadId(), (long long)int64_t(LoadBE64(ctx.r5.u32)), ms, chain);
+        }
+    }
     Return(ctx, X_STATUS_SUCCESS);
 }
 
 GUEST_EXPORT(NtYieldExecution)
 {
+    static const bool spikes = getenv("FM2_SPIKES") != nullptr;
+    if (spikes)
+    {
+        // A run of yields longer than 3 ms (a thread polling for something): log where.
+        thread_local Clock::time_point runStart{}, last{};
+        thread_local bool logged = false;
+        const auto now = Clock::now();
+        if (now - last > std::chrono::microseconds(500))
+        {
+            runStart = now;
+            logged = false;
+        }
+        last = now;
+        if (!logged && now - runStart > std::chrono::milliseconds(3))
+        {
+            logged = true;
+            char chain[128] = {};
+            uint32_t sp = ctx.r1.u32;
+            int n = 0;
+            for (int i = 0; i < 8 && sp; i++)
+            {
+                const uint32_t next = LoadBE32(sp);
+                if (!next || next <= sp)
+                    break;
+                n += snprintf(chain + n, sizeof(chain) - n, " %08X", LoadBE32(next - 8));
+                sp = next;
+            }
+            Log("spike: t%u yielding for 3+ ms: lr %08llX%s", CurrentGuestThreadId(), (unsigned long long)ctx.lr, chain);
+        }
+    }
     SwitchToThread();
     Return(ctx, X_STATUS_SUCCESS);
 }

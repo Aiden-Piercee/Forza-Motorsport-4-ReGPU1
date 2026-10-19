@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <string>
+#include <deque>
+#include <map>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -366,6 +368,161 @@ std::string GuestThreadCpuUsage(double wallSeconds)
         }
     }
     return out;
+}
+
+// Spike recorder (FM2_SPIKES=1): every millisecond, what each busy guest thread is doing
+// (host function and guest return address), kept for a short while; SpikeDump logs the
+// last stretch when the renderer sees a slow frame.
+namespace
+{
+struct SpikeSample
+{
+    std::chrono::steady_clock::time_point time;
+    uint32_t thread;
+    uint64_t rip, lr;
+};
+std::mutex g_spikeMutex;
+std::deque<SpikeSample> g_spikeSamples;
+}
+
+void StartSpikeRecorder()
+{
+    if (!getenv("FM2_SPIKES"))
+        return;
+    // FM2_SPIKES=<id>: only that thread, sampled every ~0.25 ms (top functions per spike).
+    // FM2_SPIKES=3,7,9: only those threads, sampled every ~0.25 ms.
+    static const std::vector<uint32_t> onlyList = [] {
+        std::vector<uint32_t> v;
+        for (const char* p = getenv("FM2_SPIKES"); *p;)
+        {
+            char* end;
+            const unsigned long id = strtoul(p, &end, 10);
+            if (end == p)
+                break;
+            if (id > 1)
+                v.push_back(uint32_t(id));
+            p = *end == ',' ? end + 1 : end;
+        }
+        return v;
+    }();
+    static const bool only = !onlyList.empty();
+    std::thread([] {
+        SetThreadDescription(GetCurrentThread(), L"spike recorder");
+        for (;;)
+        {
+            if (only)
+            {
+                const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(250);
+                while (std::chrono::steady_clock::now() < until)
+                    SwitchToThread();
+            }
+            else
+                Sleep(1);
+            std::vector<std::pair<uint32_t, HANDLE>> threads;
+            std::vector<PPCContext*> contexts;
+            {
+                std::lock_guard lock(g_threadsMutex);
+                for (auto& [kthread, weak] : g_threadsByKthread)
+                    if (auto object = weak.lock(); object && !object->exited && object->thread->hostHandle && (!only || std::find(onlyList.begin(), onlyList.end(), object->thread->id) != onlyList.end()))
+                    {
+                        threads.push_back({ object->thread->id, object->thread->hostHandle });
+                        contexts.push_back(object->thread->ctx);
+                    }
+            }
+            const auto now = std::chrono::steady_clock::now();
+            std::vector<SpikeSample> batch;
+            for (size_t i = 0; i < threads.size(); i++)
+            {
+                if (SuspendThread(threads[i].second) == DWORD(-1))
+                    continue;
+                CONTEXT c{};
+                c.ContextFlags = CONTEXT_CONTROL;
+                const bool ok = GetThreadContext(threads[i].second, &c);
+                const uint64_t lr = contexts[i] ? contexts[i]->lr : 0;
+                ResumeThread(threads[i].second);
+                if (ok)
+                    batch.push_back({ now, threads[i].first, c.Rip, lr });
+            }
+            std::lock_guard lock(g_spikeMutex);
+            for (auto& b : batch)
+                g_spikeSamples.push_back(b);
+            while (!g_spikeSamples.empty() && now - g_spikeSamples.front().time > std::chrono::milliseconds(300))
+                g_spikeSamples.pop_front();
+        }
+    }).detach();
+}
+
+// Logs, per thread, what it did in the last `ms` milliseconds (runs of the same place).
+void SpikeDump(double ms)
+{
+    if (!getenv("FM2_SPIKES"))
+        return;
+    std::vector<SpikeSample> samples;
+    {
+        std::lock_guard lock(g_spikeMutex);
+        const auto from = std::chrono::steady_clock::now() - std::chrono::microseconds(int64_t(ms * 1000));
+        for (auto& s : g_spikeSamples)
+            if (s.time >= from)
+                samples.push_back(s);
+    }
+    std::map<uint32_t, std::vector<const SpikeSample*>> byThread;
+    for (auto& s : samples)
+        byThread[s.thread].push_back(&s);
+    auto name = [](uint64_t rip) {
+        alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256];
+        auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 255;
+        DWORD64 displacement = 0;
+        return std::string(SymFromAddr(GetCurrentProcess(), rip, &displacement, symbol) ? symbol->Name : "?");
+    };
+    static const bool only = atoi(getenv("FM2_SPIKES")) > 1 && !strchr(getenv("FM2_SPIKES"), ',');
+    if (only)
+    {
+        // Top places in the window.
+        std::map<std::string, int> counts;
+        for (auto& s : samples)
+        {
+            char lr[16];
+            snprintf(lr, sizeof(lr), "@%08llX", (unsigned long long)s.lr);
+            counts[name(s.rip) + lr]++;
+        }
+        std::vector<std::pair<int, std::string>> top;
+        for (auto& [k, v] : counts)
+            top.push_back({ v, k });
+        std::sort(top.rbegin(), top.rend());
+        std::string line;
+        for (size_t i = 0; i < top.size() && i < 12; i++)
+            line += " | " + top[i].second + " x" + std::to_string(top[i].first);
+        Log("spike: %zu samples:%s", samples.size(), line.c_str());
+        return;
+    }
+    for (auto& [thread, list] : byThread)
+    {
+        std::string line;
+        std::string last;
+        int run = 0;
+        auto flush = [&] {
+            if (run)
+                line += " | " + last + (run > 1 ? " x" + std::to_string(run) : "");
+        };
+        for (auto* s : list)
+        {
+            char lr[16];
+            snprintf(lr, sizeof(lr), "@%08llX", (unsigned long long)s->lr);
+            const std::string here = name(s->rip) + lr;
+            if (here == last)
+                run++;
+            else
+            {
+                flush();
+                last = here;
+                run = 1;
+            }
+        }
+        flush();
+        Log("spike: t%u%s", thread, line.c_str());
+    }
 }
 
 // Sampling profiler (FM2_PROFILE=<guest thread id>): every millisecond, read the

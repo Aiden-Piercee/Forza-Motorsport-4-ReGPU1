@@ -41,6 +41,8 @@ int main(int argc, char** argv)
 
     void StartThreadProfiler();
     StartThreadProfiler();
+    void StartSpikeRecorder();
+    StartSpikeRecorder();
     void StartWatch();
     StartWatch();
     auto main = CreateGuestThread(g_title.entryPoint, 0, 0, g_title.stackSize, false, "main");

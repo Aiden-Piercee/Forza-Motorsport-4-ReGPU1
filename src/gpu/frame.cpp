@@ -46,9 +46,40 @@ struct ShaderUpload
     uint32_t used = 0;           // ucode::UsedDwords
     uint64_t hash = 0;           // Fnv1a of the used dwords ^ type
 };
-std::unordered_map<uint64_t, ShaderUpload> g_uploads;
-// The same uploads by guest address: a repeat from the same place costs one compare.
-std::unordered_map<uint64_t, const ShaderUpload*> g_uploadsAt;
+// Two generations: when the current one fills, the older one is dropped and the current
+// one becomes old (lookups promote what is still used). Clearing everything at once made
+// every upload miss for a while and stalled the command processor for ~20 ms.
+std::unordered_map<uint64_t, ShaderUpload> g_uploads, g_uploadsOld;
+// The same uploads by guest address (to their key): a repeat from the same place costs one
+// compare. A fixed direct-mapped table: the title patches shaders at ever new addresses, and
+// a growing map's rehashes stalled the command processor.
+struct UploadAt
+{
+    uint64_t at = ~0ull, key = 0;
+};
+UploadAt g_uploadsAt[16384];
+UploadAt& UploadSlot(uint64_t at) { return g_uploadsAt[((at * 0x9E3779B97F4A7C15ull) >> 50) & 16383]; }
+constexpr size_t kUploadGeneration = 8192;
+
+ShaderUpload* FindUpload(uint64_t key)
+{
+    if (auto it = g_uploads.find(key); it != g_uploads.end())
+        return &it->second;
+    auto old = g_uploadsOld.find(key);
+    if (old == g_uploadsOld.end())
+        return nullptr;
+    auto node = g_uploadsOld.extract(old);
+    return &g_uploads.insert(std::move(node)).position->second;
+}
+
+void RotateUploads()
+{
+    if (g_uploads.size() < kUploadGeneration)
+        return;
+    g_uploadsOld.clear();
+    std::swap(g_uploads, g_uploadsOld);
+    g_uploads.reserve(kUploadGeneration * 2);
+}
 
 uint64_t FastKey(const uint32_t* p, uint32_t dwords, uint32_t type)
 {
@@ -153,31 +184,29 @@ void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dw
     if (!dwords || dwords > 0x10000)
         return;
     const uint64_t at = uint64_t(guestAddress) << 32 ^ uint64_t(dwords) << 2 ^ uint32_t(type);
-    if (auto it = g_uploadsAt.find(at); it != g_uploadsAt.end() && memcmp(it->second->words.data(), microcodeBE, dwords * 4) == 0)
-    {
-        RendererSetShader(uint32_t(type), microcodeBE, it->second->used, it->second->hash);
-        return;
-    }
+    if (g_uploads.bucket_count() < kUploadGeneration * 2)
+        g_uploads.reserve(kUploadGeneration * 2);
+    UploadAt& slot = UploadSlot(at);
+    if (slot.at == at)
+        if (const ShaderUpload* u = FindUpload(slot.key); u && u->words.size() == dwords && memcmp(u->words.data(), microcodeBE, dwords * 4) == 0)
+        {
+            RendererSetShader(uint32_t(type), microcodeBE, u->used, u->hash);
+            return;
+        }
     const uint64_t key = FastKey(microcodeBE, dwords, uint32_t(type));
-    auto it = g_uploads.find(key);
-    if (it != g_uploads.end() && it->second.words.size() == dwords && memcmp(it->second.words.data(), microcodeBE, dwords * 4) == 0)
+    if (const ShaderUpload* u = FindUpload(key); u && u->words.size() == dwords && memcmp(u->words.data(), microcodeBE, dwords * 4) == 0)
     {
-        RendererSetShader(uint32_t(type), microcodeBE, it->second.used, it->second.hash);
-        g_uploadsAt[at] = &it->second;
+        RendererSetShader(uint32_t(type), microcodeBE, u->used, u->hash);
+        slot = { at, key };
         return; // seen before: already logged and dumped
     }
     const uint32_t raw = dwords;
     dwords = ucode::UsedDwords(microcodeBE, dwords);
     const uint64_t hash = Fnv1a(microcodeBE, dwords) ^ uint64_t(type);
     RendererSetShader(uint32_t(type), microcodeBE, dwords, hash);
-    if (g_uploads.size() > 8192)
-    {
-        g_uploads.clear();
-        g_uploadsAt.clear();
-    }
-    auto& entry = g_uploads[key];
-    entry = ShaderUpload{ std::vector<uint32_t>(microcodeBE, microcodeBE + raw), dwords, hash };
-    g_uploadsAt[at] = &entry;
+    RotateUploads();
+    g_uploads[key] = ShaderUpload{ std::vector<uint32_t>(microcodeBE, microcodeBE + raw), dwords, hash };
+    slot = { at, key };
     if (!g_shaders.insert(hash).second)
         return;
     if (g_shaders.size() % 50 == 1)
