@@ -213,10 +213,12 @@ void DecodeTexel(uint32_t format, const uint8_t* t, uint8_t* out)
         break;
     }
     case k_8_8_8_8:
-        // Memory order after the swap is A R G B in a little-endian word.
-        out[0] = t[2];
+        // The channels in memory order after the swap (R G B A). The title's fetch constants for
+        // these textures carry the BGRA swizzle (applied below), so what it samples is B G R A of
+        // the word: a livery painted red stays red (it came out blue with the order reversed).
+        out[0] = t[0];
         out[1] = t[1];
-        out[2] = t[0];
+        out[2] = t[2];
         out[3] = t[3];
         break;
     default:

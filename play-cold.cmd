@@ -13,4 +13,4 @@ for %%f in (shadercache pipelines.bin pipelines.manifest static_shaders.bin) do 
 )
 echo Caches moved to %B%
 set FM2_PERF=1
-build\rel\fm2.exe > out\play.log 2>&1
+build\tu\fm2.exe > out\play.log 2>&1
