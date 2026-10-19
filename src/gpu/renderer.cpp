@@ -454,6 +454,23 @@ void ReclaimTextureBlocks()
     }
 }
 
+// Bumped by every resolve: the per-slot texture bindings below are only reused while no
+// resolve has changed what an address maps to.
+uint64_t g_resolveEpoch = 0;
+
+// The constants a texture fetch slot produced for the previous draw: draws usually bind
+// the same fetch constants as their neighbours, and a repeat within the frame (same fetch,
+// no resolve since) gives the same binding.
+struct SlotBinding
+{
+    uint32_t fetch[6] = {};
+    uint64_t frame = ~0ull, epoch = ~0ull;
+    uint32_t tinfo[4] = {};
+    float tbias[4] = {};
+    bool samplesResolve = false;
+};
+SlotBinding g_slotBindings[32];
+
 // Per-draw timing (several clock reads per draw) only for FM2_PERF.
 const bool g_perfTiming = getenv("FM2_PERF") != nullptr;
 
@@ -2617,6 +2634,7 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
 // (as a host texture), then optionally clear colour and depth.
 void Resolve()
 {
+    g_resolveEpoch++; // texture bindings may now map to a new resolve
     if (!g_r.ok)
         Init();
     BeginFrameIfNeeded();
@@ -3762,6 +3780,17 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     {
         const uint32_t slot = uint32_t(__builtin_ctz(m));
         const TextureFetch fetch = ReadTextureFetch(slot);
+        SlotBinding& memo = g_slotBindings[slot];
+        static const bool noSlotMemo = getenv("FM2_NO_SLOT_MEMO") != nullptr || getenv("FM2_DUMP_PS_TEXTURES") != nullptr;
+        if (!noSlotMemo && memo.frame == g_r.frame && memo.epoch == g_resolveEpoch && memcmp(memo.fetch, fetch.dwords, sizeof(memo.fetch)) == 0)
+        {
+            memcpy(pc->tinfo[slot], memo.tinfo, sizeof(memo.tinfo));
+            memcpy(pc->tbias[slot], memo.tbias, sizeof(memo.tbias));
+            g_drawSamplesResolve |= memo.samplesResolve;
+            continue;
+        }
+        const bool samplesBefore = g_drawSamplesResolve;
+        g_drawSamplesResolve = false;
         const bool cube = fetch.Dimension() == 3;
         static const uint64_t dumpPs = getenv("FM2_DUMP_PS_TEXTURES") ? strtoull(getenv("FM2_DUMP_PS_TEXTURES"), nullptr, 16) : 0;
         if (dumpPs && g_r.psHash == dumpPs && !cube)
@@ -3814,6 +3843,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
         pc->tinfo[slot][1] = fetch.Width();
         pc->tinfo[slot][2] = fetch.Height();
+        memcpy(memo.fetch, fetch.dwords, sizeof(memo.fetch));
+        memo.frame = g_r.frame;
+        memo.epoch = g_resolveEpoch;
+        memcpy(memo.tinfo, pc->tinfo[slot], sizeof(memo.tinfo));
+        memcpy(memo.tbias, pc->tbias[slot], sizeof(memo.tbias));
+        memo.samplesResolve = g_drawSamplesResolve;
+        g_drawSamplesResolve |= samplesBefore;
     }
     // HUD and menus sample ordinary textures; full-screen layers sample resolved targets
     // and must keep spanning the width (squeezing them warped the image outside 16:9).
