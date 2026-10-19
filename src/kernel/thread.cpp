@@ -533,7 +533,7 @@ void StartThreadProfiler()
     static const char* env = getenv("FM2_PROFILE");
     if (!env)
         return;
-    const uint32_t target = uint32_t(atoi(env));
+    const uint32_t target = uint32_t(atoi(env)); // 0 with "w": the first draw piece worker
     std::thread([target] {
         std::unordered_map<std::string, uint64_t> counts;
         uint64_t samples = 0;
@@ -542,6 +542,10 @@ void StartThreadProfiler()
         {
             Sleep(1);
             HANDLE handle = nullptr;
+            extern HANDLE g_profiledWorker;
+            if (env[0] == 'w')
+                handle = g_profiledWorker;
+            else
             {
                 std::lock_guard lock(g_threadsMutex);
                 for (auto& [kthread, weak] : g_threadsByKthread)

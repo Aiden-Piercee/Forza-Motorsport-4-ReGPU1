@@ -19,12 +19,20 @@
 class RecordedList
 {
 public:
-    void Init(ID3D12GraphicsCommandList* real)
+    // direct: call the list right away (draw workers, which run in parallel themselves).
+    void Init(ID3D12GraphicsCommandList* real, bool direct = false)
     {
         m_real = real;
-        m_direct = getenv("FM2_NO_RECORD_THREAD") != nullptr;
+        m_direct = direct || getenv("FM2_NO_RECORD_THREAD") != nullptr;
         if (!m_direct)
             std::thread([this] { Worker(); }).detach();
+    }
+
+    // Records into another list from now on (after replaying everything so far).
+    void Rebind(ID3D12GraphicsCommandList* real)
+    {
+        Drain();
+        m_real = real;
     }
 
     // The real list, with everything recorded so far replayed into it.

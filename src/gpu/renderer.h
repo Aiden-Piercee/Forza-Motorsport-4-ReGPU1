@@ -20,3 +20,22 @@ bool RendererCompileIdle();
 void RendererSaveCaches();
 // True while FM2_TRACE_DRAWS's frame is being recorded.
 bool RendererTracing();
+
+// Parallel draw translation (gpu.cpp cuts the draw stream between resolves into pieces).
+#include <functional>
+struct RendererTile
+{
+    int32_t originY = 0;
+    int32_t rect[4] = { 0, 0, 1 << 14, 1 << 14 };
+};
+// Whether draws may be translated on workers now (game settled, no upscaler, ...).
+bool RendererParallelReady();
+uint32_t RendererDrawWorkers();
+// The current draw is a resolve (EDRAM copy): a point the stream is not cut across.
+bool RendererIsResolveDraw();
+// Follows the tile state draws set (see DrawImpl), for the state at each piece's start.
+void RendererTrackTile(RendererTile& tile);
+void RendererSetTile(const RendererTile& tile);
+// Runs translate(i), i in [0, n), on the draw workers (and this thread), each into its own
+// command list, and executes them in order after everything recorded so far.
+void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translate);

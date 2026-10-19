@@ -109,7 +109,7 @@ constexpr uint64_t kWords = 16ull << 20; // 64 MB
 std::vector<uint32_t> g_ring(kWords);
 alignas(64) std::atomic<uint64_t> g_head{ 0 }; // written by the command processor
 alignas(64) std::atomic<uint64_t> g_tail{ 0 }; // written by the worker
-std::vector<uint8_t> g_file(0x5000 * 4);       // the worker's register file
+std::vector<uint8_t> g_file(0x8000 * 4);       // the worker's register file (registers up to 0x7FFF)
 const bool g_enabled = getenv("FM2_DRAW_THREAD") != nullptr; // off by default (no gain until draws translate in parallel)
 std::atomic<bool> g_started{ false };
 
@@ -173,8 +173,175 @@ void LogRegs(uint32_t index, const uint32_t* valuesBE, uint32_t count)
 
 void WriteBackNow(uint32_t address, uint32_t value);
 
+// ---- Parallel draw segments ------------------------------------------------------------
+// Between resolves (and fences, swaps, waits, interrupts) the draws of a frame are
+// independent: the command processor logs them with the register writes and shader loads
+// between them, plus a snapshot of the registers, shaders and tile state every 128 draws.
+// At the segment's end, it is cut at snapshots into pieces of about equal draw counts that
+// are translated on the draw workers into their own command lists, executed in order
+// (RendererRunPieces). FM2_DRAW_WORKERS=0 turns it off.
+namespace seg
+{
+enum : uint32_t { kRegs = 1, kShader, kDraw };
+constexpr uint32_t kSnapEvery = 128;
+struct Snapshot
+{
+    size_t logPos = 0;
+    uint32_t drawsBefore = 0;
+    std::vector<uint8_t> regs;
+    std::vector<uint32_t> vs, ps;
+    uint32_t vsAddress = 0, psAddress = 0;
+    RendererTile tile;
+};
+bool g_open = false;
+std::vector<uint32_t> g_log;
+std::vector<Snapshot> g_snaps;
+size_t g_snapCount = 0; // used entries of g_snaps (kept allocated)
+uint32_t g_draws = 0;
+// The command processor's view: the shaders last loaded and the tile state.
+std::vector<uint32_t> g_vs, g_ps;
+uint32_t g_vsAddress = 0, g_psAddress = 0;
+RendererTile g_tile;
+
+void TakeSnapshot()
+{
+    if (g_snapCount == g_snaps.size())
+        g_snaps.emplace_back();
+    Snapshot& s = g_snaps[g_snapCount++];
+    s.logPos = g_log.size();
+    s.drawsBefore = g_draws;
+    s.regs.resize(0x8000 * 4); // (type-0 packets address registers up to 0x7FFF)
+    memcpy(s.regs.data(), GuestPtr<uint8_t>(kRegisterBase), s.regs.size());
+    s.vs = g_vs;
+    s.ps = g_ps;
+    s.vsAddress = g_vsAddress;
+    s.psAddress = g_psAddress;
+    s.tile = g_tile;
+}
+
+void Append(uint32_t type, const uint32_t* a, uint32_t n, const uint32_t* b = nullptr, uint32_t nb = 0)
+{
+    g_log.push_back(type << 24 | (n + nb));
+    g_log.insert(g_log.end(), a, a + n);
+    if (nb)
+        g_log.insert(g_log.end(), b, b + nb);
+}
+
+// Replays snapshot `first`'s records up to `endPos` on this thread (a worker or the CP).
+void Replay(size_t first, size_t endPos)
+{
+    const Snapshot& snap = g_snaps[first];
+    thread_local std::vector<uint8_t> file;
+    file = snap.regs;
+    uint8_t* const saved = gpureg::t_file;
+    gpureg::t_file = file.data();
+    RendererSetTile(snap.tile);
+    if (!snap.vs.empty())
+        FrameOnShaderLoad(ShaderType::Vertex, snap.vs.data(), uint32_t(snap.vs.size()), snap.vsAddress);
+    if (!snap.ps.empty())
+        FrameOnShaderLoad(ShaderType::Pixel, snap.ps.data(), uint32_t(snap.ps.size()), snap.psAddress);
+    for (size_t at = snap.logPos; at < endPos;)
+    {
+        const uint32_t header = g_log[at];
+        const uint32_t type = header >> 24, n = header & 0xFFFFFF;
+        const uint32_t* a = &g_log[at + 1];
+        switch (type)
+        {
+        case kRegs:
+            memcpy(file.data() + size_t(a[0]) * 4, a + 1, size_t(n - 1) * 4);
+            break;
+        case kShader:
+            FrameOnShaderLoad(ShaderType(a[0]), a + 3, a[2], a[1]);
+            break;
+        case kDraw:
+            FrameOnDraw(a[0], a[1], a[2]);
+            break;
+        }
+        at += size_t(n) + 1;
+    }
+    gpureg::t_file = saved;
+}
+
+// Translates the open segment (on the workers if it is large enough).
+void Flush()
+{
+    if (!g_open)
+        return;
+    g_open = false;
+    const size_t end = g_log.size();
+    const uint32_t workers = RendererDrawWorkers() + 1;
+    const uint32_t pieces = std::min<uint32_t>(uint32_t(g_snapCount), std::min(workers, g_draws / 96));
+    {
+        static uint64_t segments = 0, parallel = 0, draws = 0, parallelDraws = 0;
+        static auto last = std::chrono::steady_clock::now();
+        segments++;
+        draws += g_draws;
+        if (pieces > 1)
+        {
+            parallel++;
+            parallelDraws += g_draws;
+        }
+        static const bool perf = getenv("FM2_PERF") != nullptr;
+        if (perf && std::chrono::steady_clock::now() - last > std::chrono::seconds(2))
+        {
+            last = std::chrono::steady_clock::now();
+            Log("perf: segments %llu (%llu parallel), draws %llu (%llu parallel) in 2 s", (unsigned long long)segments,
+                (unsigned long long)parallel, (unsigned long long)draws, (unsigned long long)parallelDraws);
+            segments = parallel = draws = parallelDraws = 0;
+        }
+    }
+    if (pieces <= 1)
+        Replay(0, end);
+    else
+    {
+        // Snapshot boundaries closest to equal shares of the draws.
+        std::vector<size_t> starts;
+        for (uint32_t k = 0; k < pieces; k++)
+        {
+            const uint32_t want = uint32_t(uint64_t(g_draws) * k / pieces);
+            size_t best = 0;
+            for (size_t i = 0; i < g_snapCount; i++)
+                if (g_snaps[i].drawsBefore <= want)
+                    best = i;
+            if (starts.empty() || best != starts.back())
+                starts.push_back(best);
+        }
+        RendererRunPieces(uint32_t(starts.size()), [&](uint32_t i) {
+            Replay(starts[i], i + 1 < starts.size() ? g_snaps[starts[i + 1]].logPos : end);
+        });
+        // This thread's own draws continue with the shaders the stream has now.
+        if (!g_vs.empty())
+            FrameOnShaderLoad(ShaderType::Vertex, g_vs.data(), uint32_t(g_vs.size()), g_vsAddress);
+        if (!g_ps.empty())
+            FrameOnShaderLoad(ShaderType::Pixel, g_ps.data(), uint32_t(g_ps.size()), g_psAddress);
+    }
+    g_log.clear();
+    g_snapCount = 0;
+    g_draws = 0;
+}
+
+bool Enabled()
+{
+    static const bool on = RendererDrawWorkers() > 0 && !getenv("FM2_DRAW_THREAD");
+    return on;
+}
+}
+
 void SubmitShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwords, uint32_t guestAddress)
 {
+    if (seg::Enabled())
+    {
+        dwords = std::min<uint32_t>(dwords, 0x10000);
+        auto& code = type == ShaderType::Vertex ? seg::g_vs : seg::g_ps;
+        code.assign(microcodeBE, microcodeBE + dwords);
+        (type == ShaderType::Vertex ? seg::g_vsAddress : seg::g_psAddress) = guestAddress;
+        if (seg::g_open)
+        {
+            const uint32_t head[3] = { uint32_t(type), guestAddress, dwords };
+            seg::Append(seg::kShader, head, 3, microcodeBE, dwords);
+            return;
+        }
+    }
     if (!work::Active())
     {
         FrameOnShaderLoad(type, microcodeBE, dwords, guestAddress);
@@ -191,6 +358,25 @@ void SubmitShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwo
 
 void SubmitDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
+    if (seg::Enabled())
+    {
+        if (RendererIsResolveDraw() || !RendererParallelReady())
+        {
+            seg::Flush();
+            FrameOnDraw(initiator, dmaBase, dmaSize);
+            return;
+        }
+        if (!seg::g_open || seg::g_draws % seg::kSnapEvery == 0)
+        {
+            seg::g_open = true;
+            seg::TakeSnapshot();
+        }
+        const uint32_t a[3] = { initiator, dmaBase, dmaSize };
+        seg::Append(seg::kDraw, a, 3);
+        seg::g_draws++;
+        RendererTrackTile(seg::g_tile);
+        return;
+    }
     if (!work::Active())
     {
         FrameOnDraw(initiator, dmaBase, dmaSize);
@@ -313,6 +499,7 @@ void WriteBackNow(uint32_t address, uint32_t value)
 // Memory writes from the command stream (fences): after the draws before them.
 void WriteBack(uint32_t address, uint32_t value)
 {
+    seg::Flush(); // a fence: after the draws before it
     if (work::Active())
     {
         uint32_t* p = work::Begin(work::kWriteBack, 2);
@@ -376,6 +563,11 @@ constexpr uint32_t SCRATCH_ADDR = 0x01DD;
 void WriteRegister(uint32_t index, uint32_t value)
 {
     SetReg(index, value);
+    if (seg::g_open)
+    {
+        const uint32_t be[2] = { index, __builtin_bswap32(value) };
+        seg::Append(seg::kRegs, be, 2);
+    }
     if (work::Active())
     {
         const uint32_t be = __builtin_bswap32(value);
@@ -387,6 +579,7 @@ void WriteRegister(uint32_t index, uint32_t value)
         if ((Reg(SCRATCH_UMSK) >> n) & 1)
         {
             const uint32_t address = PhysToGuest(Reg(SCRATCH_ADDR) + n * 4);
+            seg::Flush();
             if (work::Active())
             {
                 uint32_t* p = work::Begin(work::kStore, 2);
@@ -407,6 +600,8 @@ void WriteRegisters(uint32_t index, uint32_t source, uint32_t count)
     if (index + count <= SCRATCH_REG0 || index >= SCRATCH_REG0 + 8)
     {
         memcpy(GuestPtr<uint8_t>(kRegisterBase + index * 4), GuestPtr<uint8_t>(source), size_t(count) * 4);
+        if (seg::g_open)
+            seg::Append(seg::kRegs, &index, 1, GuestPtr<uint32_t>(source), count);
         if (work::Active())
             work::LogRegs(index, GuestPtr<uint32_t>(source), count);
         return;
@@ -455,6 +650,8 @@ uint32_t ExecutePacket(uint32_t ptr)
             {
                 const auto swap = g_gpu.pendingSwaps[i];
                 g_gpu.pendingSwaps.erase(g_gpu.pendingSwaps.begin(), g_gpu.pendingSwaps.begin() + i + 1);
+                seg::Flush();
+                seg::g_tile = RendererTile{};
                 if (work::Active())
                 {
                     uint32_t* p = work::Begin(work::kSwap, 3);
@@ -549,6 +746,8 @@ uint32_t ExecutePacket(uint32_t ptr)
     }
     case 0x45: // COND_WRITE: wait info, poll addr, ref, mask, write addr, write data
     {
+        if (arg(0) & 0x10) // polls memory a fence of the open segment may change
+            seg::Flush();
         const uint32_t info = arg(0);
         if (info & 0x10) // a memory poll may read a fence the worker writes
             work::Drain();
@@ -565,6 +764,9 @@ uint32_t ExecutePacket(uint32_t ptr)
     case 0x3C: // WAIT_REG_MEM: info, poll addr, ref, mask, interval
     {
         const uint32_t info = arg(0);
+        // A memory poll that does not hold yet may wait for a fence of the open segment.
+        if ((info & 0x10) && !WaitCompare(info & 7, ReadBack(arg(1)) & arg(3), arg(2)))
+            seg::Flush();
         // A memory poll may wait for a fence the worker writes: let it catch up, unless the
         // condition already holds (most waits are for values the title set).
         if ((info & 0x10) && !WaitCompare(info & 7, ReadBack(arg(1)) & arg(3), arg(2)))
@@ -628,6 +830,7 @@ uint32_t ExecutePacket(uint32_t ptr)
         break;
     }
     case 0x54: // INTERRUPT: cpu mask
+        seg::Flush();
         work::Drain(); // after the draws before it, like the hardware
         for (uint32_t cpu = 0; cpu < 6; cpu++)
         {
@@ -847,7 +1050,7 @@ void LookaheadBuffer(uint32_t address, uint32_t dwords, int depth, LookState& st
 void GpuLookahead()
 {
     static const bool off = getenv("FM2_NO_LOOKAHEAD") != nullptr;
-    if (off || work::Active()) // (the renderer runs on the draw worker; the stream is the CP's)
+    if (off || work::Active() || !t_cpContext) // (only on the command processor thread: its stream and registers)
         return;
     constexpr uint32_t kFirst = 0x2000, kCount = 0x3000;
     std::vector<uint32_t> saved(kCount);
@@ -924,6 +1127,7 @@ void CommandProcessorLoop(PPCContext& ctx)
         const uint32_t wptr = Reg(CP_RB_WPTR) % size;
         if (g_gpu.rptr == wptr)
         {
+            seg::Flush(); // nothing more queued: translate what there is
             Sleep(0);
             continue;
         }

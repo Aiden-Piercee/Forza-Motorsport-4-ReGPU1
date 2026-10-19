@@ -241,7 +241,7 @@ struct FrameResources
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12Resource> ring;
     uint8_t* ringCpu = nullptr;
-    UINT64 ringUsed = 0;
+    std::atomic<UINT64> ringUsed{ 0 }; // draw workers allocate concurrently
     // Guest ranges already uploaded this frame: (address << 32 | bytes) -> (offset, sample hash).
     std::unordered_map<uint64_t, std::pair<UINT64, uint64_t>> uploads;
     UINT descriptorBase = 0;
@@ -249,6 +249,9 @@ struct FrameResources
     UINT64 fence = 0;
     std::vector<ComPtr<ID3D12Resource>> garbage; // released once this frame's work completes
     bool timed = false; // FM2_PERF: GPU timestamps were written for this frame
+    // Extra command lists of this frame (parallel draw pieces, main list continuations).
+    std::vector<std::pair<ComPtr<ID3D12CommandAllocator>, ComPtr<ID3D12GraphicsCommandList>>> pool;
+    size_t poolUsed = 0;
 };
 
 struct PipelineKey
@@ -341,11 +344,19 @@ struct Renderer
     std::unordered_map<uint32_t, ResolvedTexture> resolved; // by physical address
 
     uint64_t frame = 0;
-    uint32_t drawsThisFrame = 0, skippedThisFrame = 0;
+    std::atomic<uint32_t> drawsThisFrame{ 0 }, skippedThisFrame{ 0 };
     bool ok = false;
 };
 
 Renderer g_r;
+
+// Shared caches used by draws on several threads (see DrawContext).
+std::recursive_mutex g_shaderMutex;  // shaders, pipelines, the compiler's maps
+std::recursive_mutex g_textureMutex; // textures, cubes, mip chains, bindless, texture memory, index arena
+std::mutex g_surfaceMutex;           // EDRAM surfaces
+// Parallel segments: texture uploads and copies a worker makes go to this list, executed
+// before the segment's draws (another worker's earlier draws may use the same texture).
+RecordedList* g_prepList = nullptr;
 
 // What a thread recording draws keeps for itself: its command list, the bound surfaces and
 // shaders. The command processor thread uses the main context (the frame's list); draw
@@ -366,6 +377,26 @@ struct DrawContext
 DrawContext g_mainContext;
 thread_local DrawContext* t_context = nullptr;
 inline DrawContext& C() { return t_context ? *t_context : g_mainContext; }
+
+// Holds the texture lock and, on a draw worker, records into the segment's prep list.
+struct TextureScope
+{
+    std::lock_guard<std::recursive_mutex> lock{ g_textureMutex };
+    RecordedList* saved = nullptr;
+    TextureScope()
+    {
+        if (C().worker && g_prepList)
+        {
+            saved = C().list;
+            C().list = g_prepList;
+        }
+    }
+    ~TextureScope()
+    {
+        if (saved)
+            C().list = saved;
+    }
+};
 
 void LogDebugMessages()
 {
@@ -879,6 +910,7 @@ void BeginTemporalFrame();
 
 Renderer::Surface& GetSurface(bool depth, uint32_t base)
 {
+    std::lock_guard surfaceLock(g_surfaceMutex);
     auto& map = depth ? g_r.depthSurfaces : g_r.colorSurfaces;
     if (auto it = map.find(base); it != map.end())
         return it->second;
@@ -955,7 +987,7 @@ void SelectSurfaces(bool force)
     const uint32_t colorBase = gpureg::Get(RB_COLOR_INFO) & 0xFFF, depthBase = gpureg::Get(RB_DEPTH_INFO) & 0xFFF;
     if (!force && colorBase == C().colorBase && depthBase == C().depthBase)
         return;
-    if (C().colorBase != ~0u)
+    if (C().colorBase != ~0u && !C().worker) // (workers leave surfaces as render targets)
         g_r.colorSurfaces[C().colorBase].state = C().colorState;
     Renderer::Surface& c = GetSurface(false, colorBase);
     Renderer::Surface& z = GetSurface(true, depthBase);
@@ -976,7 +1008,27 @@ void SelectSurfaces(bool force)
 // while the texture is in use. Entries unused for a few frames (replaced or
 // dropped textures) go back to the free list; their resources are released
 // once the GPU is done with the frame that last used them.
+UINT BindlessIndexLocked(ID3D12Resource* resource, DXGI_FORMAT format, bool cube);
+// Each thread remembers this frame's descriptors (eviction only takes ones unused for frames).
 UINT BindlessIndex(ID3D12Resource* resource, DXGI_FORMAT format, bool cube)
+{
+    const uint64_t key = uint64_t(reinterpret_cast<uintptr_t>(resource)) << 8 ^ uint64_t(format) << 1 ^ uint64_t(cube);
+    thread_local std::unordered_map<uint64_t, UINT> known;
+    thread_local uint64_t knownFrame = ~0ull;
+    if (knownFrame != g_r.frame)
+    {
+        known.clear();
+        knownFrame = g_r.frame;
+    }
+    if (auto it = known.find(key); it != known.end())
+        return it->second;
+    std::lock_guard textureLock(g_textureMutex);
+    const UINT index = BindlessIndexLocked(resource, format, cube);
+    known.emplace(key, index);
+    return index;
+}
+
+UINT BindlessIndexLocked(ID3D12Resource* resource, DXGI_FORMAT format, bool cube)
 {
     const uint64_t key = uint64_t(reinterpret_cast<uintptr_t>(resource)) << 8 ^ uint64_t(format) << 1 ^ uint64_t(cube);
     auto it = g_r.bindless.find(key);
@@ -1128,6 +1180,8 @@ void BeginFrameIfNeeded()
         f.timed = false;
     }
     f.allocator->Reset();
+    f.poolUsed = 0;
+    g_r.recorder.Rebind(g_r.realList.Get()); // (a pool list may have continued last frame)
     C().list->Reset(f.allocator.Get(), nullptr);
     // This frame's scene phase and scale (see UpscaleScene).
     {
@@ -1180,18 +1234,23 @@ void BeginFrameIfNeeded()
 UINT64 RingAlloc(UINT64 bytes, UINT64 alignment = 256)
 {
     FrameResources& f = Frame();
-    const UINT64 offset = (f.ringUsed + alignment - 1) & ~(alignment - 1);
+    UINT64 used = f.ringUsed.load(std::memory_order_relaxed), offset;
+    for (;;)
+    {
+        offset = (used + alignment - 1) & ~(alignment - 1);
+        if (offset + bytes > kRingSize || f.ringUsed.compare_exchange_weak(used, offset + bytes, std::memory_order_relaxed))
+            break;
+    }
     if (offset + bytes > kRingSize)
     {
         static UINT64 lastFull = 0;
         if (RendererTracing() && lastFull != g_r.frame)
         {
             lastFull = g_r.frame;
-            Log("ring full: %llu bytes requested, %llu used, %llu uploads cached", (unsigned long long)bytes, (unsigned long long)f.ringUsed, (unsigned long long)f.uploads.size());
+            Log("ring full: %llu bytes requested, %llu used, %llu uploads cached", (unsigned long long)bytes, (unsigned long long)f.ringUsed.load(), (unsigned long long)f.uploads.size());
         }
         return ~0ull;
     }
-    f.ringUsed = offset + bytes;
     return offset;
 }
 
@@ -1214,15 +1273,23 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
             sample = (sample ^ v) * 0x100000001B3ull;
         }
     const uint64_t key = uint64_t(guest) << 32 | bytes;
-    if (auto it = f.uploads.find(key); it != f.uploads.end() && it->second.second == sample)
+    // Each recording thread keeps its own cache (cleared when the frame changes).
+    thread_local std::unordered_map<uint64_t, std::pair<UINT64, uint64_t>> uploads;
+    thread_local uint64_t uploadsFrame = ~0ull;
+    if (uploadsFrame != g_r.frame)
+    {
+        uploads.clear();
+        uploadsFrame = g_r.frame;
+    }
+    if (auto it = uploads.find(key); it != uploads.end() && it->second.second == sample)
         return it->second.first;
     if (RendererTracing() && bytes > (16u << 10))
-        Log("upload: %08X %u bytes (ring %llu)", guest, bytes, (unsigned long long)f.ringUsed);
+        Log("upload: %08X %u bytes (ring %llu)", guest, bytes, (unsigned long long)f.ringUsed.load());
     const UINT64 offset = RingAlloc(std::max<uint32_t>(bytes, 16) + 16, 16);
     if (offset == ~0ull)
         return offset;
     memcpy(f.ringCpu + offset, src, bytes);
-    f.uploads[key] = { offset, sample };
+    uploads[key] = { offset, sample };
     return offset;
 }
 
@@ -1276,7 +1343,31 @@ void FlushIndexCopies()
 
 // The view of the guest index buffer at physical address `base` (count indices), swapped
 // into the arena; false when it cannot be cached (the draw fetches indices itself).
+bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view);
+// Each thread remembers this frame's index buffers (checked once per frame).
 bool GetIndexBuffer(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view)
+{
+    thread_local std::unordered_map<uint64_t, D3D12_INDEX_BUFFER_VIEW> known;
+    thread_local uint64_t knownFrame = ~0ull;
+    if (knownFrame != g_r.frame)
+    {
+        known.clear();
+        knownFrame = g_r.frame;
+    }
+    const uint64_t key = uint64_t(base) << 32 ^ uint64_t(count) << 3 ^ uint64_t(is32) << 2 ^ endian;
+    if (auto it = known.find(key); it != known.end())
+    {
+        view = it->second;
+        return true;
+    }
+    std::lock_guard textureLock(g_textureMutex);
+    if (!GetIndexBufferLocked(base, count, is32, endian, view))
+        return false;
+    known.emplace(key, view);
+    return true;
+}
+
+bool GetIndexBufferLocked(uint32_t base, uint32_t count, bool is32, uint32_t endian, D3D12_INDEX_BUFFER_VIEW& view)
 {
     IndexArena& arena = g_indexArena;
     const uint32_t bytes = count * (is32 ? 4 : 2);
@@ -1679,7 +1770,20 @@ uint64_t CanonicalKey(const ucode::Shader& parsed)
 }
 
 // background: queued behind everything a draw needs (the static shader set).
+const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel, bool background);
+// Shaders are never removed: each thread remembers the ones it looked up (no lock per draw).
 const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel, bool background = false)
+{
+    thread_local std::unordered_map<uint64_t, const CompiledShader*> known;
+    if (auto it = known.find(hash); it != known.end())
+        return *it->second;
+    std::lock_guard shaderLock(g_shaderMutex);
+    const CompiledShader& cs = GetShaderLocked(hash, codeBE, pixel, background);
+    known.emplace(hash, &cs);
+    return cs;
+}
+
+const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel, bool background)
 {
     auto it = g_r.shaders.find(hash);
     if (it != g_r.shaders.end())
@@ -2352,10 +2456,20 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     PipelineKey key = MakePipelineKey(C().vsHash, C().psHash, depthOnly, cullable);
     if (motion)
         key.flags |= 4;
-    auto it = g_r.pipelines.find(key);
-    if (it != g_r.pipelines.end() && it->second->state.load(std::memory_order_acquire) == 1)
-        return it->second->pso.Get();
-    const auto entry = EnsurePipeline(vs, ps, key);
+    thread_local std::unordered_map<PipelineKey, ID3D12PipelineState*, PipelineKeyHash> ready; // (pipelines are never removed)
+    if (auto r = ready.find(key); r != ready.end())
+        return r->second;
+    std::shared_ptr<PipelineEntry> entry;
+    {
+        std::lock_guard shaderLock(g_shaderMutex);
+        auto it = g_r.pipelines.find(key);
+        if (it != g_r.pipelines.end() && it->second->state.load(std::memory_order_acquire) == 1)
+        {
+            ready.emplace(key, it->second->pso.Get());
+            return it->second->pso.Get();
+        }
+        entry = EnsurePipeline(vs, ps, key);
+    }
     if (SkippableDraw(depthOnly, key.blend) && entry->state.load(std::memory_order_acquire) == 0)
     {
         g_skippedPipeline++;
@@ -2371,6 +2485,7 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
 // frame; static faces are decoded once and re-decoded when their data changes.
 ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
 {
+    TextureScope textureScope;
     const uint32_t w = fetch.Width(), h = fetch.Height();
     if (w != h || w > 2048)
         return nullptr;
@@ -2524,6 +2639,7 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
 // 4 KB. Assembled into one mipmapped host texture every frame it is used.
 ID3D12Resource* ResolvedMipChain(const TextureFetch& fetch, const ResolvedTexture& level0)
 {
+    TextureScope textureScope;
     const uint32_t w = std::min(fetch.Width(), level0.width), h = std::min(fetch.Height(), level0.height);
     const UINT bpp = level0.format == DXGI_FORMAT_R8G8B8A8_UNORM ? 4 : 8;
     std::vector<const ResolvedTexture*> levels{ &level0 };
@@ -2611,8 +2727,44 @@ const ResolvedTexture* ResolvedFor(const TextureFetch& fetch)
 }
 
 // Decodes (if changed) and uploads a texture; returns its resource.
+ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format, bool& native);
+// Textures are checked and uploaded once per frame; each thread remembers what it got this
+// frame, so repeated bindings take no lock.
 ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format, bool& native)
 {
+    struct Known
+    {
+        ID3D12Resource* resource;
+        DXGI_FORMAT format;
+        bool native;
+    };
+    thread_local std::unordered_map<uint64_t, Known> known;
+    thread_local uint64_t knownFrame = ~0ull;
+    if (knownFrame != g_r.frame)
+    {
+        known.clear();
+        knownFrame = g_r.frame;
+    }
+    // (Resolved textures can change within a frame: not cached.)
+    const bool cacheable = !ResolvedFor(fetch) && !RendererTracing();
+    const uint64_t key = TextureKey(fetch.Address(), fetch.Format(), fetch.Width(), fetch.Height()) ^ uint64_t(fetch.dwords[0]) << 7 ^
+        uint64_t(fetch.dwords[3] & 0xFFF) << 41 ^ uint64_t(fetch.dwords[1] & 0xC0) << 50;
+    if (cacheable)
+        if (auto it = known.find(key); it != known.end())
+        {
+            format = it->second.format;
+            native = it->second.native;
+            return it->second.resource;
+        }
+    ID3D12Resource* r = GetTextureLocked(fetch, format, native);
+    if (cacheable && r)
+        known[key] = { r, format, native };
+    return r;
+}
+
+ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format, bool& native)
+{
+    TextureScope textureScope;
     native = false;
     format = DXGI_FORMAT_R8G8B8A8_UNORM;
     if (const ResolvedTexture* resolvedTexture = ResolvedFor(fetch))
@@ -4350,6 +4502,253 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize);
 }
 
 
+// ---- Parallel draw pieces --------------------------------------------------------------
+namespace
+{
+std::mutex g_poolMutex;
+
+ID3D12GraphicsCommandList* AcquireList()
+{
+    FrameResources& f = Frame();
+    std::lock_guard lock(g_poolMutex);
+    if (f.poolUsed == f.pool.size())
+    {
+        auto& e = f.pool.emplace_back();
+        Check(g_r.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&e.first)), "CreateCommandAllocator(piece)");
+        Check(g_r.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, e.first.Get(), nullptr, IID_PPV_ARGS(&e.second)),
+            "CreateCommandList(piece)");
+    }
+    else
+    {
+        auto& e = f.pool[f.poolUsed];
+        e.first->Reset();
+        e.second->Reset(e.first.Get(), nullptr);
+    }
+    return f.pool[f.poolUsed++].second.Get();
+}
+
+// The state every draw list starts with.
+void ListPrologue(RecordedList& list)
+{
+    ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get() };
+    list.SetDescriptorHeaps(1, heaps);
+    list.SetGraphicsRootSignature(g_r.rootSignature.Get());
+    list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+}
+
+// Executes the main list so far and continues the frame in a fresh one.
+void SplitMainList()
+{
+    ID3D12GraphicsCommandList* done = g_r.recorder.Real();
+    done->Close();
+    ID3D12CommandList* lists[] = { done };
+    g_r.queue->ExecuteCommandLists(1, lists);
+    g_r.recorder.Rebind(AcquireList());
+    ListPrologue(g_r.recorder);
+    g_drawState.Invalidate();
+    SelectSurfaces(true);
+}
+
+struct Workers
+{
+    bool started = false;
+    std::mutex mutex;
+    std::condition_variable start, done;
+    uint64_t generation = 0;
+    const std::function<void(uint32_t)>* job = nullptr;
+    uint32_t count = 0;
+    std::atomic<uint32_t> next{ 0 }, finished{ 0 };
+    std::vector<ID3D12GraphicsCommandList*> lists;
+} g_workers;
+
+// One piece on this thread, with a worker context of its own.
+std::atomic<uint64_t> g_pieceNs{ 0 }, g_segmentNs{ 0 }, g_pieceCount{ 0 }, g_segmentCount{ 0 };
+void TranslatePiece(DrawContext& ctx, uint32_t i)
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    ID3D12GraphicsCommandList* real = AcquireList();
+    RecordedList recorder;
+    recorder.Init(real, true);
+    ctx = DrawContext{};
+    ctx.list = &recorder;
+    ctx.worker = true;
+    DrawContext* saved = t_context;
+    t_context = &ctx;
+    ListPrologue(recorder);
+    g_drawState.Invalidate();
+    (*g_workers.job)(i);
+    t_context = saved;
+    real->Close();
+    g_workers.lists[i] = real;
+    g_pieceNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    g_pieceCount++;
+}
+
+}
+HANDLE g_profiledWorker = nullptr; // FM2_PROFILE=w
+namespace
+{
+void WorkerMain()
+{
+    SetThreadDescription(GetCurrentThread(), L"gpu draw piece worker");
+    if (!g_profiledWorker)
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_profiledWorker, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    DrawContext ctx;
+    uint64_t seen = 0;
+    for (;;)
+    {
+        {
+            std::unique_lock lock(g_workers.mutex);
+            g_workers.start.wait(lock, [&] { return g_workers.generation != seen; });
+            seen = g_workers.generation;
+        }
+        for (uint32_t i; (i = g_workers.next.fetch_add(1)) < g_workers.count;)
+        {
+            TranslatePiece(ctx, i);
+            if (g_workers.finished.fetch_add(1) + 1 == g_workers.count)
+            {
+                std::lock_guard lock(g_workers.mutex);
+                g_workers.done.notify_all();
+            }
+        }
+    }
+}
+}
+
+std::string CurrentHostStack(int maxFrames);
+// Exceptions escaping a thread end the process silently: say where.
+void InstallTerminateLog()
+{
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::set_terminate([] {
+            std::string what = "?";
+            if (auto e = std::current_exception())
+                try { std::rethrow_exception(e); } catch (const std::exception& x) { what = x.what(); } catch (...) {}
+            Log("CRASH: std::terminate (%s): %s", what.c_str(), CurrentHostStack(24).c_str());
+            fflush(nullptr);
+            std::abort();
+        });
+    });
+}
+
+uint32_t RendererDrawWorkers()
+{
+    InstallTerminateLog();
+    static const uint32_t n = [] {
+        const char* v = getenv("FM2_DRAW_WORKERS");
+        const uint32_t hw = std::max(2u, std::thread::hardware_concurrency());
+        (void)hw;
+        // Off by default: measured slower than the serial path so far (per-draw cost roughly
+        // doubles across threads and the command processor waits for each segment).
+        return v ? std::min<uint32_t>(uint32_t(atoi(v)), hw) : 0u;
+    }();
+    return n;
+}
+
+bool RendererParallelReady()
+{
+    return RendererDrawWorkers() > 0 && g_r.ok && GameSettled() && GetSettings().upscaler == Settings::Upscaler::Off && !RendererTracing();
+}
+
+bool RendererIsResolveDraw()
+{
+    return (gpureg::Get(RB_MODECONTROL) & 7) == 6;
+}
+
+void RendererTrackTile(RendererTile& tile)
+{
+    const uint32_t mode = gpureg::Get(RB_MODECONTROL) & 7;
+    if (mode != 4 && mode != 5)
+        return;
+    const D3D12_RECT scissor = WindowScissor();
+    const uint32_t offsetReg = gpureg::Get(PA_SC_WINDOW_OFFSET);
+    const int32_t wy = ((gpureg::Get(PA_SU_SC_MODE_CNTL) >> 16) & 1) ? int32_t((offsetReg >> 16) << 17) >> 17 : 0;
+    const bool full = scissor.left <= 0 && scissor.top <= 0 && scissor.right >= LONG(kWidth) && scissor.bottom >= LONG(kHeight);
+    if (!full)
+    {
+        tile.originY = -wy;
+        tile.rect[0] = scissor.left;
+        tile.rect[1] = scissor.top;
+        tile.rect[2] = scissor.right;
+        tile.rect[3] = scissor.bottom;
+    }
+}
+
+void RendererSetTile(const RendererTile& tile)
+{
+    g_tile.originY = tile.originY;
+    g_tile.rect = { tile.rect[0], tile.rect[1], tile.rect[2], tile.rect[3] };
+}
+
+void RendererRunPieces(uint32_t n, const std::function<void(uint32_t)>& translate)
+{
+    if (!n)
+        return;
+    const auto segmentStart = std::chrono::steady_clock::now();
+    struct Done
+    {
+        std::chrono::steady_clock::time_point start;
+        ~Done()
+        {
+            g_segmentNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            g_segmentCount++;
+            static auto last = std::chrono::steady_clock::now();
+            if (getenv("FM2_PERF") && std::chrono::steady_clock::now() - last > std::chrono::seconds(2))
+            {
+                last = std::chrono::steady_clock::now();
+                Log("perf: parallel segments %llu: %.1f ms wall, %.1f ms in %llu pieces (%.2fx)", (unsigned long long)g_segmentCount.load(),
+                    g_segmentNs / 1e6, g_pieceNs / 1e6, (unsigned long long)g_pieceCount.load(), double(g_pieceNs) / std::max<uint64_t>(1, g_segmentNs));
+                g_segmentNs = g_pieceNs = g_pieceCount = g_segmentCount = 0;
+            }
+        }
+    } done{ segmentStart };
+    BeginFrameIfNeeded();
+    SplitMainList();
+    // Texture uploads of the pieces, executed before them.
+    ID3D12GraphicsCommandList* prepReal = AcquireList();
+    RecordedList prep;
+    prep.Init(prepReal, true);
+    g_prepList = &prep;
+    {
+        std::lock_guard lock(g_workers.mutex);
+        if (!g_workers.started)
+        {
+            g_workers.started = true;
+            // 16 MB stacks like the command processor's: shader translation and the HLSL
+            // compiler can run on these threads, and they need far more than 1 MB.
+            for (uint32_t i = 0; i < RendererDrawWorkers(); i++)
+                if (HANDLE h = CreateThread(nullptr, 16u << 20, [](void*) -> DWORD { WorkerMain(); return 0; }, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr))
+                    CloseHandle(h);
+        }
+        g_workers.job = &translate;
+        g_workers.count = n;
+        g_workers.next = 0;
+        g_workers.finished = 0;
+        g_workers.lists.assign(n, nullptr);
+        g_workers.generation++;
+    }
+    g_workers.start.notify_all();
+    // This thread takes pieces too.
+    static DrawContext ownContext;
+    for (uint32_t i; (i = g_workers.next.fetch_add(1)) < n;)
+    {
+        TranslatePiece(ownContext, i);
+        g_workers.finished.fetch_add(1);
+    }
+    {
+        std::unique_lock lock(g_workers.mutex);
+        g_workers.done.wait(lock, [] { return g_workers.finished.load() >= g_workers.count; });
+    }
+    g_prepList = nullptr;
+    prepReal->Close();
+    std::vector<ID3D12CommandList*> lists;
+    lists.push_back(prepReal);
+    for (ID3D12GraphicsCommandList* l : g_workers.lists)
+        lists.push_back(l);
+    g_r.queue->ExecuteCommandLists(UINT(lists.size()), lists.data());
+}
+
 void RendererOnDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
     if (!g_perfTiming)
@@ -4948,7 +5347,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         Log("    indices (initiator %08X dma %08X offset %u): %u %u %u %u %u %u ... %u", initiator, dmaBase, gpureg::Get(VGT_INDX_OFFSET),
             list.size() > 0 ? list[0] : 0, list.size() > 1 ? list[1] : 0, list.size() > 2 ? list[2] : 0, list.size() > 3 ? list[3] : 0,
             list.size() > 4 ? list[4] : 0, list.size() > 5 ? list[5] : 0, list.empty() ? 0 : list.back());
-        Log("draw #%u vs %016llx ps %016llx prim %u n %zu blend %08X mask %X scissor %ld,%ld-%ld,%ld vte %03X wide %d layer %d pitch %u%s", g_r.drawsThisFrame,
+        Log("draw #%u vs %016llx ps %016llx prim %u n %zu blend %08X mask %X scissor %ld,%ld-%ld,%ld vte %03X wide %d layer %d pitch %u%s", g_r.drawsThisFrame.load(),
             (unsigned long long)C().vsHash, (unsigned long long)C().psHash, initiator & 0x3F, list.size(), gpureg::Get(RB_BLENDCONTROL0),
             gpureg::Get(RB_COLOR_MASK) & 15, scissor.left, scissor.top, scissor.right, scissor.bottom, gpureg::Get(PA_CL_VTE_CNTL) & 0x3FF,
             int(WidePass()), int(g_drawSamplesResolve), gpureg::Get(RB_SURFACE_INFO) & 0x3FFF, tex.c_str());
@@ -5547,12 +5946,12 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         }
         else
             WritePng(g_r.frame == dumpFrame ? "frame.png" : "frame2.png", dw, dh, full);
-        Log("renderer: wrote frame.png (frame %llu: %u draws, %u skipped)", (unsigned long long)frameNumber, g_r.drawsThisFrame,
-            g_r.skippedThisFrame);
+        Log("renderer: wrote frame.png (frame %llu: %u draws, %u skipped)", (unsigned long long)frameNumber, g_r.drawsThisFrame.load(),
+            g_r.skippedThisFrame.load());
     }
     if (frameNumber % 600 == 0)
         Log("renderer: frame %llu: %u draws, %u skipped, %zu shaders, %zu pipelines, %zu textures", (unsigned long long)frameNumber,
-            g_r.drawsThisFrame, g_r.skippedThisFrame, g_r.shaders.size(), g_r.pipelines.size(), g_r.textures.size());
+            g_r.drawsThisFrame.load(), g_r.skippedThisFrame.load(), g_r.shaders.size(), g_r.pipelines.size(), g_r.textures.size());
     g_r.drawsThisFrame = g_r.skippedThisFrame = 0;
     g_r.frameIndex = (g_r.frameIndex + 1) % kFrames;
 }
