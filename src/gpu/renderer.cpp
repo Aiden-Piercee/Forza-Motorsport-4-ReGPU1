@@ -289,8 +289,7 @@ struct Renderer
     ID3D12Device* device = nullptr;
     ID3D12CommandQueue* queue = nullptr;
     ComPtr<ID3D12GraphicsCommandList> realList;
-    RecordedList recorder;
-    RecordedList* list = &recorder; // see recorded_list.h
+    RecordedList recorder; // the main thread's command list (see recorded_list.h)
     ComPtr<ID3D12Heap> physicalHeap;     // the guest's physical memory section, mapped for the GPU
     ComPtr<ID3D12Resource> physical;     // 512 MB raw buffer over it (null if unsupported)
     ComPtr<ID3D12Fence> fence;
@@ -320,11 +319,7 @@ struct Renderer
         D3D12_CPU_DESCRIPTOR_HANDLE view{};
     };
     std::unordered_map<uint32_t, Surface> colorSurfaces, depthSurfaces;
-    uint32_t colorBase = ~0u, depthBase = ~0u;
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv{}, dsv{};
-    // The bound surfaces.
-    ComPtr<ID3D12Resource> color, depth, readback;
-    D3D12_RESOURCE_STATES colorState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    ComPtr<ID3D12Resource> readback;
 
     std::unordered_map<uint64_t, std::unique_ptr<CompiledShader>> shaders;
     std::unordered_map<PipelineKey, std::shared_ptr<PipelineEntry>, PipelineKeyHash> pipelines;
@@ -345,16 +340,32 @@ struct Renderer
     UINT bindlessNext = 2;
     std::unordered_map<uint32_t, ResolvedTexture> resolved; // by physical address
 
-    // Active shaders: the last microcode loaded per stage.
-    std::vector<uint32_t> vsCode, psCode;
-    uint64_t vsHash = 0, psHash = 0;
-
     uint64_t frame = 0;
     uint32_t drawsThisFrame = 0, skippedThisFrame = 0;
     bool ok = false;
 };
 
 Renderer g_r;
+
+// What a thread recording draws keeps for itself: its command list, the bound surfaces and
+// shaders. The command processor thread uses the main context (the frame's list); draw
+// workers each have their own (see the parallel draw segments in gpu.cpp).
+struct DrawContext
+{
+    RecordedList* list = nullptr;
+    uint32_t colorBase = ~0u, depthBase = ~0u;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv{}, dsv{};
+    // The bound surfaces.
+    ComPtr<ID3D12Resource> color, depth;
+    D3D12_RESOURCE_STATES colorState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    // Active shaders: the last microcode loaded per stage.
+    std::vector<uint32_t> vsCode, psCode;
+    uint64_t vsHash = 0, psHash = 0;
+    bool worker = false; // a draw worker: frame-level work (begin, resolves, swaps) is not its job
+};
+DrawContext g_mainContext;
+thread_local DrawContext* t_context = nullptr;
+inline DrawContext& C() { return t_context ? *t_context : g_mainContext; }
 
 void LogDebugMessages()
 {
@@ -381,7 +392,7 @@ uint32_t g_skippedPipeline = 0;
 const char* g_waitWhat = "?";
 // The current draw samples the full-screen image the title resolved this frame (the
 // post-processing composite): its flat geometry is a screen layer, not HUD (see vwide.w).
-bool g_drawSamplesResolve = false;
+thread_local bool g_drawSamplesResolve = false;
 // FM2_PERF: GPU time per frame from timestamps at the start and end of each frame's list.
 ComPtr<ID3D12QueryHeap> g_timestamps;
 
@@ -532,7 +543,7 @@ struct SlotBinding
     float tbias[4] = {};
     bool samplesResolve = false;
 };
-SlotBinding g_slotBindings[32];
+thread_local SlotBinding g_slotBindings[32];
 
 // Per-draw timing (several clock reads per draw) only for FM2_PERF.
 const bool g_perfTiming = getenv("FM2_PERF") != nullptr;
@@ -553,7 +564,8 @@ struct DrawState
     bool motionRoot = false;    // the motion root signature is set
     D3D12_INDEX_BUFFER_VIEW indexBuffer{};
     void Invalidate() { *this = DrawState{}; }
-} g_drawState;
+};
+thread_local DrawState g_drawState;
 
 // Texture cache key: address (4 KB aligned), format (6 bits), width and height (13 bits each).
 uint64_t TextureKey(uint32_t address, uint32_t format, uint32_t w, uint32_t h)
@@ -847,6 +859,7 @@ void Init()
         "CreateCommandList");
     g_r.realList->Close();
     g_r.recorder.Init(g_r.realList.Get());
+    g_mainContext.list = &g_r.recorder;
     Check(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_r.fence)), "CreateFence");
     g_r.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     PresenterUseRenderer();
@@ -898,7 +911,7 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
         D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc{};
         dsvDesc.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
         dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-        g_r.list->CreateDepthStencilView(g_r.device, s.resource.Get(), dsvDesc, s.view); // in order with the recorded commands
+        C().list->CreateDepthStencilView(g_r.device, s.resource.Get(), dsvDesc, s.view); // in order with the recorded commands
     }
     else
     {
@@ -910,7 +923,7 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
             "CreateCommittedResource(colour surface)"); CountCreate("colour surface");
         s.view = g_r.rtvHeap->GetCPUDescriptorHandleForHeapStart();
         s.view.ptr += SIZE_T(index) * g_r.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        g_r.list->CreateRenderTargetView(g_r.device, s.resource.Get(), s.view); // in order with the recorded commands
+        C().list->CreateRenderTargetView(g_r.device, s.resource.Get(), s.view); // in order with the recorded commands
     }
     Log("renderer: EDRAM %s surface at base %03X", depth ? "depth" : "colour", base);
     return s;
@@ -933,29 +946,29 @@ void PassMark(const char* fmt, uint32_t a, uint32_t b)
     g_passDraws = 0;
     PassMarkInfo m{};
     snprintf(m.label, sizeof(m.label), fmt, a, b);
-    g_r.list->EndQuery(g_passQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * kPassMarks + UINT(marks.size()));
+    C().list->EndQuery(g_passQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * kPassMarks + UINT(marks.size()));
     marks.push_back(m);
 }
 
 void SelectSurfaces(bool force)
 {
     const uint32_t colorBase = gpureg::Get(RB_COLOR_INFO) & 0xFFF, depthBase = gpureg::Get(RB_DEPTH_INFO) & 0xFFF;
-    if (!force && colorBase == g_r.colorBase && depthBase == g_r.depthBase)
+    if (!force && colorBase == C().colorBase && depthBase == C().depthBase)
         return;
-    if (g_r.colorBase != ~0u)
-        g_r.colorSurfaces[g_r.colorBase].state = g_r.colorState;
+    if (C().colorBase != ~0u)
+        g_r.colorSurfaces[C().colorBase].state = C().colorState;
     Renderer::Surface& c = GetSurface(false, colorBase);
     Renderer::Surface& z = GetSurface(true, depthBase);
-    g_r.color = c.resource;
-    g_r.colorState = c.state;
-    g_r.rtv = c.view;
-    g_r.depth = z.resource;
-    g_r.dsv = z.view;
-    g_r.colorBase = colorBase;
-    g_r.depthBase = depthBase;
+    C().color = c.resource;
+    C().colorState = c.state;
+    C().rtv = c.view;
+    C().depth = z.resource;
+    C().dsv = z.view;
+    C().colorBase = colorBase;
+    C().depthBase = depthBase;
     PassMark("pass colour %03X depth %03X", colorBase, depthBase);
     TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
-    g_r.list->OMSetRenderTargets(1, &g_r.rtv, FALSE, &g_r.dsv);
+    C().list->OMSetRenderTargets(1, &C().rtv, FALSE, &C().dsv);
     g_drawState.motionTargets = false;
 }
 
@@ -1115,7 +1128,7 @@ void BeginFrameIfNeeded()
         f.timed = false;
     }
     f.allocator->Reset();
-    g_r.list->Reset(f.allocator.Get(), nullptr);
+    C().list->Reset(f.allocator.Get(), nullptr);
     // This frame's scene phase and scale (see UpscaleScene).
     {
         const Settings& st = GetSettings();
@@ -1131,7 +1144,7 @@ void BeginFrameIfNeeded()
     }
     PassMark("frame start %u%u", 0, 0);
     if (perf && g_timestamps)
-        g_r.list->EndQuery(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 2);
+        C().list->EndQuery(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 2);
     f.ringUsed = 0;
     f.uploads.clear();
     // Per-frame table: t0 this frame's ring, t1 guest physical memory.
@@ -1155,11 +1168,11 @@ void BeginFrameIfNeeded()
     EvictBindless();
     ReclaimTextureBlocks();
     ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get() };
-    g_r.list->SetDescriptorHeaps(1, heaps);
-    g_r.list->SetGraphicsRootSignature(g_r.rootSignature.Get());
+    C().list->SetDescriptorHeaps(1, heaps);
+    C().list->SetGraphicsRootSignature(g_r.rootSignature.Get());
     g_drawState.Invalidate();
     SelectSurfaces(true);
-    g_r.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    C().list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_r.listOpen = true;
 }
 
@@ -1253,11 +1266,11 @@ void FlushIndexCopies()
     b.Transition.pResource = arena.buffer.Get();
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_INDEX_BUFFER;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    g_r.list->ResourceBarrier(1, &b);
+    C().list->ResourceBarrier(1, &b);
     for (const auto& c : arena.pending)
-        g_r.list->CopyBufferRegion(arena.buffer.Get(), c.to, c.ring, c.from, c.bytes);
+        C().list->CopyBufferRegion(arena.buffer.Get(), c.to, c.ring, c.from, c.bytes);
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
-    g_r.list->ResourceBarrier(1, &b);
+    C().list->ResourceBarrier(1, &b);
     arena.pending.clear();
 }
 
@@ -2336,7 +2349,7 @@ bool SkippableDraw(bool depthOnly, uint32_t blend)
 
 ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion = false)
 {
-    PipelineKey key = MakePipelineKey(g_r.vsHash, g_r.psHash, depthOnly, cullable);
+    PipelineKey key = MakePipelineKey(C().vsHash, C().psHash, depthOnly, cullable);
     if (motion)
         key.flags |= 4;
     auto it = g_r.pipelines.find(key);
@@ -2437,9 +2450,9 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
             fb[n].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
             n++;
         }
-        g_r.list->ResourceBarrier(1, &b);
+        C().list->ResourceBarrier(1, &b);
         if (n)
-            g_r.list->ResourceBarrier(n, fb);
+            C().list->ResourceBarrier(n, fb);
         for (uint32_t i = 0; i < 6; i++)
         {
             if (!faces[i] || faces[i]->format != want)
@@ -2451,12 +2464,12 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
             src.pResource = faces[i]->resource.Get();
             src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             const D3D12_BOX box{ 0, 0, 0, std::min(cw, faces[i]->hostWidth), std::min(ch, faces[i]->hostHeight), 1 };
-            g_r.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+            C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
         }
         for (UINT k = 0; k < n; k++)
             std::swap(fb[k].Transition.StateBefore, fb[k].Transition.StateAfter);
         if (n)
-            g_r.list->ResourceBarrier(n, fb);
+            C().list->ResourceBarrier(n, fb);
     }
     else
     {
@@ -2470,7 +2483,7 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
         const UINT64 offset = RingAlloc(faceBytes * 6, 512);
         if (offset == ~0ull)
             return nullptr;
-        g_r.list->ResourceBarrier(1, &b);
+        C().list->ResourceBarrier(1, &b);
         for (uint32_t i = 0; i < 6; i++)
         {
             TextureFetch face = fetch;
@@ -2496,12 +2509,12 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
             src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
             src.PlacedFootprint.Offset = offset + faceBytes * i;
             src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1, rowPitch };
-            g_r.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         }
         cached.contentHash = hash;
     }
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
-    g_r.list->ResourceBarrier(1, &b);
+    C().list->ResourceBarrier(1, &b);
     return cached.resource.Get();
 }
 
@@ -2567,7 +2580,7 @@ ID3D12Resource* ResolvedMipChain(const TextureFetch& fetch, const ResolvedTextur
     }
     // Several levels can share one host texture only if the title resolved
     // them to the same address, which it does not; still, transition each once.
-    g_r.list->ResourceBarrier(UINT(b.size()), b.data());
+    C().list->ResourceBarrier(UINT(b.size()), b.data());
     for (UINT i = 0; i < count; i++)
     {
         D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
@@ -2577,11 +2590,11 @@ ID3D12Resource* ResolvedMipChain(const TextureFetch& fetch, const ResolvedTextur
         src.pResource = levels[i]->resource.Get();
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         const D3D12_BOX box{ 0, 0, 0, std::max(w >> i, 1u), std::max(h >> i, 1u), 1 };
-        g_r.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+        C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
     }
     for (auto& x : b)
         std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
-    g_r.list->ResourceBarrier(UINT(b.size()), b.data());
+    C().list->ResourceBarrier(UINT(b.size()), b.data());
     return chain.resource.Get();
 }
 
@@ -2693,7 +2706,7 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format, bool&
             b.Transition.pResource = cached.resource.Get();
             b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-            g_r.list->ResourceBarrier(1, &b);
+            C().list->ResourceBarrier(1, &b);
         }
         const UINT rowPitch = ((w / 4) * blockBytes + 255) & ~255u;
         const UINT64 offset = RingAlloc(UINT64(rowPitch) * (h / 4), 512);
@@ -2708,11 +2721,11 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format, bool&
         src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         src.PlacedFootprint.Offset = offset;
         src.PlacedFootprint.Footprint = { bcFormat, w, h, 1, rowPitch };
-        g_r.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         b.Transition.pResource = cached.resource.Get();
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        g_r.list->ResourceBarrier(1, &b);
+        C().list->ResourceBarrier(1, &b);
         cached.contentHash = hash;
         cached.native = true;
         format = bcFormat;
@@ -2766,7 +2779,7 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format, bool&
         b.Transition.Subresource = 0;
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-        g_r.list->ResourceBarrier(1, &b);
+        C().list->ResourceBarrier(1, &b);
     }
     const UINT rowPitch = (w * 4 + 255) & ~255u;
     const UINT64 offset = RingAlloc(UINT64(rowPitch) * h, 512);
@@ -2782,14 +2795,14 @@ ID3D12Resource* GetTexture(const TextureFetch& fetch, DXGI_FORMAT& format, bool&
     src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     src.PlacedFootprint.Offset = offset;
     src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1, rowPitch };
-    g_r.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = cached.resource.Get();
     b.Transition.Subresource = 0;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    g_r.list->ResourceBarrier(1, &b);
+    C().list->ResourceBarrier(1, &b);
     cached.contentHash = hash;
     return cached.resource.Get();
 }
@@ -2819,8 +2832,8 @@ bool BuildIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize, std:
     const bool is32 = (initiator >> 11) & 1;
     const uint32_t offset = gpureg::Get(VGT_INDX_OFFSET);
     // Reused between draws (no allocation per draw).
-    static std::vector<uint32_t> g;
-    static std::vector<uint8_t> cut;
+    thread_local std::vector<uint32_t> g;
+    thread_local std::vector<uint8_t> cut;
     g.resize(count);
     cut.clear();
     // Primitive restart: a raw index equal to the reset value ends the strip/fan.
@@ -2925,7 +2938,8 @@ struct TileState
 {
     int originY = 0;
     D3D12_RECT rect{ 0, 0, 1 << 14, 1 << 14 };
-} g_tile;
+};
+thread_local TileState g_tile;
 
 // Tiling: each tile pass is shifted into EDRAM by the window offset and
 // clipped to the tile. We render in screen space, so draws (and resolves)
@@ -2950,16 +2964,16 @@ D3D12_RECT WindowScissor()
 
 void TransitionColor(D3D12_RESOURCE_STATES to)
 {
-    if (g_r.colorState == to)
+    if (C().colorState == to)
         return;
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = g_r.color.Get();
+    b.Transition.pResource = C().color.Get();
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b.Transition.StateBefore = g_r.colorState;
+    b.Transition.StateBefore = C().colorState;
     b.Transition.StateAfter = to;
-    g_r.list->ResourceBarrier(1, &b);
-    g_r.colorState = to;
+    C().list->ResourceBarrier(1, &b);
+    C().colorState = to;
 }
 
 // Draws the resolve rectangle of the colour (or depth) buffer into the
@@ -3049,9 +3063,9 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
-    g_r.device->CreateShaderResourceView(depth ? g_r.depth.Get() : g_r.color.Get(), &srv, Cpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
+    g_r.device->CreateShaderResourceView(depth ? C().depth.Get() : C().color.Get(), &srv, Cpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
     const auto rtv = g_r.blitRtvHeap->GetCPUDescriptorHandleForHeapStart();
-    g_r.list->CreateRenderTargetView(g_r.device, dest.resource.Get(), rtv); // in order with the recorded commands
+    C().list->CreateRenderTargetView(g_r.device, dest.resource.Get(), rtv); // in order with the recorded commands
 
     D3D12_RESOURCE_BARRIER b[2]{};
     UINT barriers = 1;
@@ -3061,7 +3075,7 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     if (depth)
     {
-        b[1].Transition.pResource = g_r.depth.Get();
+        b[1].Transition.pResource = C().depth.Get();
         b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
         b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -3069,31 +3083,31 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     }
     else
         TransitionColor(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    g_r.list->ResourceBarrier(barriers, b);
+    C().list->ResourceBarrier(barriers, b);
 
     ID3D12PipelineState* pso = depth ? g_r.depthBlit.Get()
         : format == DXGI_FORMAT_R8G8B8A8_UNORM ? g_r.colorBlit8.Get() : g_r.colorBlit16.Get();
-    g_r.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    g_r.list->SetGraphicsRootSignature(g_r.blitRootSignature.Get());
-    g_r.list->SetPipelineState(pso);
-    g_r.list->SetGraphicsRootDescriptorTable(0, Gpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
+    C().list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    C().list->SetGraphicsRootSignature(g_r.blitRootSignature.Get());
+    C().list->SetPipelineState(pso);
+    C().list->SetGraphicsRootDescriptorTable(0, Gpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
     const uint32_t blitConstants[2] = { std::bit_cast<uint32_t>(scale), uint32_t(swapRB) };
-    g_r.list->SetGraphicsRoot32BitConstants(1, 2, blitConstants, 0);
+    C().list->SetGraphicsRoot32BitConstants(1, 2, blitConstants, 0);
     // Width and height stay in game pixels (the size the title knows); the texture and the
     // rectangle are scaled.
     const D3D12_VIEWPORT vp{ 0, 0, float(hostWidth), float(hostHeight), 0, 1 };
     const D3D12_RECT hostRect = ToHost(sr);
-    g_r.list->RSSetViewports(1, &vp);
-    g_r.list->RSSetScissorRects(1, &hostRect);
-    g_r.list->DrawInstanced(3, 1, 0, 0);
+    C().list->RSSetViewports(1, &vp);
+    C().list->RSSetScissorRects(1, &hostRect);
+    C().list->DrawInstanced(3, 1, 0, 0);
 
     std::swap(b[0].Transition.StateBefore, b[0].Transition.StateAfter);
     std::swap(b[1].Transition.StateBefore, b[1].Transition.StateAfter);
-    g_r.list->ResourceBarrier(barriers, b);
+    C().list->ResourceBarrier(barriers, b);
     TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
     // Back to the main targets and root signature.
-    g_r.list->OMSetRenderTargets(1, &g_r.rtv, FALSE, &g_r.dsv);
-    g_r.list->SetGraphicsRootSignature(g_r.rootSignature.Get());
+    C().list->OMSetRenderTargets(1, &C().rtv, FALSE, &C().dsv);
+    C().list->SetGraphicsRootSignature(g_r.rootSignature.Get());
     g_drawState.Invalidate();
 }
 
@@ -3145,7 +3159,7 @@ void CopySceneDepth(const D3D12_RECT& gameRect)
 {
     const D3D12_RECT r = ToHost(gameRect);
     FrameResources& f = Frame();
-    if (!g_upscale.depth || !g_r.depth || r.right <= r.left || r.bottom <= r.top || f.descriptorsUsed + 2 > kDescriptorsPerFrame)
+    if (!g_upscale.depth || !C().depth || r.right <= r.left || r.bottom <= r.top || f.descriptorsUsed + 2 > kDescriptorsPerFrame)
         return;
     const UINT slots = f.descriptorBase + f.descriptorsUsed;
     f.descriptorsUsed += 2;
@@ -3154,31 +3168,31 @@ void CopySceneDepth(const D3D12_RECT& gameRect)
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
-    g_r.device->CreateShaderResourceView(g_r.depth.Get(), &srv, Cpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
+    g_r.device->CreateShaderResourceView(C().depth.Get(), &srv, Cpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
     uav.Format = DXGI_FORMAT_R32_FLOAT;
     uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     g_r.device->CreateUnorderedAccessView(g_upscale.depth.Get(), nullptr, &uav, Cpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = g_r.depth.Get();
+    b.Transition.pResource = C().depth.Get();
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    g_r.list->ResourceBarrier(1, &b);
+    C().list->ResourceBarrier(1, &b);
     uint32_t c[24] = {};
     c[0] = uint32_t(r.left);
     c[1] = uint32_t(r.top);
     c[20] = uint32_t(r.right - r.left);
     c[21] = uint32_t(r.bottom - r.top);
-    g_r.list->SetComputeRootSignature(g_upscale.root.Get());
-    g_r.list->SetComputeRoot32BitConstants(0, 24, c, 0);
-    g_r.list->SetPipelineState(g_upscale.depthCopy.Get());
-    g_r.list->SetComputeRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
-    g_r.list->SetComputeRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
-    g_r.list->Dispatch((c[20] + 7) / 8, (c[21] + 7) / 8, 1);
+    C().list->SetComputeRootSignature(g_upscale.root.Get());
+    C().list->SetComputeRoot32BitConstants(0, 24, c, 0);
+    C().list->SetPipelineState(g_upscale.depthCopy.Get());
+    C().list->SetComputeRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
+    C().list->SetComputeRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
+    C().list->Dispatch((c[20] + 7) / 8, (c[21] + 7) / 8, 1);
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
-    g_r.list->ResourceBarrier(1, &b);
+    C().list->ResourceBarrier(1, &b);
     g_drawState.Invalidate(); // the compute pipeline replaced the draw's
 }
 
@@ -3212,7 +3226,7 @@ void BeginTemporalFrame()
     if (g_upscale.constantsFrame % 600 == 0) // draws not seen for a while
         std::erase_if(g_upscale.constants, [](const auto& e) { return e.second.frame + 2 < g_upscale.constantsFrame; });
     const float zero[4] = {};
-    g_r.list->ClearRenderTargetView(g_upscale.motionRtv, zero, 0, nullptr);
+    C().list->ClearRenderTargetView(g_upscale.motionRtv, zero, 0, nullptr);
 }
 
 void UpscaleResolved(uint32_t base);
@@ -3294,21 +3308,21 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         b.Transition.StateBefore = from;
         b.Transition.StateAfter = to;
-        g_r.list->ResourceBarrier(1, &b);
+        C().list->ResourceBarrier(1, &b);
     };
     const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     barrier(g_upscale.depth.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     barrier(g_upscale.motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     barrier(in.output, read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     // NGX records into the real command list (after everything recorded so far).
-    const bool ok = dlss ? DlssEvaluate(g_r.list->Real(), setup, in)
-                         : Fsr3Evaluate(g_r.device, g_r.list->Real(), setup, in, GetSettings().sharpness);
+    const bool ok = dlss ? DlssEvaluate(C().list->Real(), setup, in)
+                         : Fsr3Evaluate(g_r.device, C().list->Real(), setup, in, GetSettings().sharpness);
     barrier(in.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
     if (dlaa && ok)
     {
         barrier(in.output, read, D3D12_RESOURCE_STATE_COPY_SOURCE);
         barrier(color.Get(), read, D3D12_RESOURCE_STATE_COPY_DEST);
-        g_r.list->Real()->CopyResource(color.Get(), in.output);
+        C().list->Real()->CopyResource(color.Get(), in.output);
         barrier(color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, read);
         barrier(in.output, D3D12_RESOURCE_STATE_COPY_SOURCE, read);
     }
@@ -3316,9 +3330,9 @@ bool EvaluateTemporal(uint32_t base, bool dlss)
     barrier(g_upscale.depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     // NGX may have changed the list's heaps, root signatures and pipeline: set ours again.
     ID3D12DescriptorHeap* heaps[] = { g_r.srvHeap.Get() };
-    g_r.list->SetDescriptorHeaps(1, heaps);
-    g_r.list->SetGraphicsRootSignature(g_r.rootSignature.Get());
-    g_r.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    C().list->SetDescriptorHeaps(1, heaps);
+    C().list->SetGraphicsRootSignature(g_r.rootSignature.Get());
+    C().list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_drawState.Invalidate();
     SelectSurfaces(true);
     if (!ok && !dlaa) // keep the image: show the small one upscaled by FSR 1 instead
@@ -3489,22 +3503,22 @@ void UpscaleResolved(uint32_t base)
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         b.Transition.StateBefore = from;
         b.Transition.StateAfter = to;
-        g_r.list->ResourceBarrier(1, &b);
+        C().list->ResourceBarrier(1, &b);
     };
     const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     const UINT gx = (outWidth + 15) / 16, gy = (outHeight + 15) / 16;
-    g_r.list->SetComputeRootSignature(g_upscale.root.Get());
-    g_r.list->SetComputeRoot32BitConstants(0, 24, c, 0);
-    g_r.list->SetPipelineState(g_upscale.easu.Get());
-    g_r.list->SetComputeRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
-    g_r.list->SetComputeRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
-    g_r.list->Dispatch(gx, gy, 1);
+    C().list->SetComputeRootSignature(g_upscale.root.Get());
+    C().list->SetComputeRoot32BitConstants(0, 24, c, 0);
+    C().list->SetPipelineState(g_upscale.easu.Get());
+    C().list->SetComputeRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
+    C().list->SetComputeRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
+    C().list->Dispatch(gx, gy, 1);
     barrier(g_upscale.temp.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
     barrier(dest.resource.Get(), read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    g_r.list->SetPipelineState(g_upscale.rcas.Get());
-    g_r.list->SetComputeRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), slots + 2, g_r.srvStride));
-    g_r.list->SetComputeRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), slots + 3, g_r.srvStride));
-    g_r.list->Dispatch(gx, gy, 1);
+    C().list->SetPipelineState(g_upscale.rcas.Get());
+    C().list->SetComputeRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), slots + 2, g_r.srvStride));
+    C().list->SetComputeRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), slots + 3, g_r.srvStride));
+    C().list->Dispatch(gx, gy, 1);
     barrier(dest.resource.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
     barrier(g_upscale.temp.Get(), read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     g_drawState.Invalidate(); // the compute pipeline replaced the draw's
@@ -3530,7 +3544,7 @@ void Resolve()
         Init();
     BeginFrameIfNeeded();
     SelectSurfaces(false);
-    PassMark("resolve to %08X (colour %03X)", gpureg::Get(RB_COPY_DEST_BASE), g_r.colorBase);
+    PassMark("resolve to %08X (colour %03X)", gpureg::Get(RB_COPY_DEST_BASE), C().colorBase);
     const uint32_t control = gpureg::Get(RB_COPY_CONTROL);
     const uint32_t command = (control >> 20) & 3;
 
@@ -3611,7 +3625,7 @@ void Resolve()
         const float color[4] = { ((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f, (c & 0xFF) / 255.0f, (c >> 24) / 255.0f };
         TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
         const D3D12_RECT hostClear = ToHost(clearRect);
-        g_r.list->ClearRenderTargetView(g_r.rtv, color, 1, &hostClear);
+        C().list->ClearRenderTargetView(C().rtv, color, 1, &hostClear);
     }
     if ((control >> 9) & 1) // depth/stencil clear: depth 24 bits | stencil 8
     {
@@ -3625,7 +3639,7 @@ void Resolve()
             depth = std::clamp(depth, 0.0f, 1.0f);
         }
         const D3D12_RECT hostClear = ToHost(clearRect);
-        g_r.list->ClearDepthStencilView(g_r.dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, depth, UINT8(v & 0xFF), 1, &hostClear);
+        C().list->ClearDepthStencilView(C().dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, depth, UINT8(v & 0xFF), 1, &hostClear);
     }
 }
 }
@@ -3844,12 +3858,12 @@ void WaitHoldingImpl(const std::function<bool()>& done)
 // Lookahead hooks, called from GpuLookahead on shadow register state.
 void PredictBeginImpl()
 {
-    g_predVs = g_r.vsHash;
-    g_predPs = g_r.psHash;
-    g_predVsCode = g_r.vsCode.data();
-    g_predPsCode = g_r.psCode.data();
-    g_predVsDwords = uint32_t(g_r.vsCode.size());
-    g_predPsDwords = uint32_t(g_r.psCode.size());
+    g_predVs = C().vsHash;
+    g_predPs = C().psHash;
+    g_predVsCode = C().vsCode.data();
+    g_predPsCode = C().psCode.data();
+    g_predVsDwords = uint32_t(C().vsCode.size());
+    g_predPsDwords = uint32_t(C().psCode.size());
 }
 
 // ---- Warm-up: rebuilds every shader/pipeline recorded in the manifest in the
@@ -4087,7 +4101,7 @@ ID3D12Resource* PrepareOverlayOn(ID3D12GraphicsCommandList* list, const std::fun
 // The frame path stages through the frame's upload ring.
 ID3D12Resource* PrepareOverlay()
 {
-    return PrepareOverlayOn(g_r.list->Real(), [](UINT64 bytes) {
+    return PrepareOverlayOn(C().list->Real(), [](UINT64 bytes) {
         OverlayUpload u;
         const UINT64 offset = RingAlloc(bytes, 512);
         if (offset == ~0ull)
@@ -4296,16 +4310,16 @@ void RendererSaveCaches()
 
 void RendererSetShader(uint32_t type, const uint32_t* microcodeBE, uint32_t usedDwords, uint64_t hash)
 {
-    std::vector<uint32_t>& code = type == 0 ? g_r.vsCode : g_r.psCode;
+    std::vector<uint32_t>& code = type == 0 ? C().vsCode : C().psCode;
     code.assign(microcodeBE, microcodeBE + usedDwords);
-    (type == 0 ? g_r.vsHash : g_r.psHash) = hash;
+    (type == 0 ? C().vsHash : C().psHash) = hash;
 }
 
 void RendererOnShaderLoad(uint32_t type, const uint32_t* microcodeBE, uint32_t dwords)
 {
-    std::vector<uint32_t>& code = type == 0 ? g_r.vsCode : g_r.psCode;
+    std::vector<uint32_t>& code = type == 0 ? C().vsCode : C().psCode;
     code.assign(microcodeBE, microcodeBE + ucode::UsedDwords(microcodeBE, dwords));
-    (type == 0 ? g_r.vsHash : g_r.psHash) = Fnv(code.data(), code.size() * 4) ^ type;
+    (type == 0 ? C().vsHash : C().psHash) = Fnv(code.data(), code.size() * 4) ^ type;
 }
 
 namespace
@@ -4315,7 +4329,7 @@ void TraceSkip(const char* why, uint32_t initiator)
     static const uint64_t traceFrame = getenv("FM2_TRACE_DRAWS") ? strtoull(getenv("FM2_TRACE_DRAWS"), nullptr, 10) : 0;
     if (traceFrame && g_r.frame + 1 == traceFrame)
         Log("skip draw (%s): prim %u count %u mode %u vs %016llx ps %016llx", why, initiator & 0x3F, initiator >> 16,
-            gpureg::Get(RB_MODECONTROL) & 7, (unsigned long long)g_r.vsHash, (unsigned long long)g_r.psHash);
+            gpureg::Get(RB_MODECONTROL) & 7, (unsigned long long)C().vsHash, (unsigned long long)C().psHash);
 }
 }
 
@@ -4385,7 +4399,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         return;
     }
     // Colour+depth (4) and depth-only (5) passes draw.
-    if ((edramMode != 4 && edramMode != 5) || g_r.vsCode.empty() || g_r.psCode.empty())
+    if ((edramMode != 4 && edramMode != 5) || C().vsCode.empty() || C().psCode.empty())
     {
         TraceSkip("edram mode", initiator);
         g_r.skippedThisFrame++;
@@ -4397,12 +4411,12 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // right away; now that set covers the game, and the 512 MB scan (~18 ms on this
         // thread) only showed as a frame spike, so once the game runs the low-priority
         // background scan is enough.
-        const bool unseen = g_r.shaders.find(g_r.vsHash) == g_r.shaders.end() || g_r.shaders.find(g_r.psHash) == g_r.shaders.end();
+        const bool unseen = g_r.shaders.find(C().vsHash) == g_r.shaders.end() || g_r.shaders.find(C().psHash) == g_r.shaders.end();
         static auto lastScan = std::chrono::steady_clock::time_point{};
         static const bool noScan = getenv("FM2_NO_SHADER_SCAN") != nullptr;
         if (unseen && !noScan)
         {
-            if (g_scanKnown.count(g_r.vsHash) || g_scanKnown.count(g_r.psHash))
+            if (g_scanKnown.count(C().vsHash) || g_scanKnown.count(C().psHash))
                 g_scanPrefound++;
             else
                 g_scanMissed++;
@@ -4418,8 +4432,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             }
         }
     }
-    const CompiledShader& vs = GetShader(g_r.vsHash, g_r.vsCode, false);
-    const CompiledShader& ps = GetShader(g_r.psHash, g_r.psCode, true);
+    const CompiledShader& vs = GetShader(C().vsHash, C().vsCode, false);
+    const CompiledShader& ps = GetShader(C().psHash, C().psCode, true);
     Section(1);
     static const bool asyncShaders = getenv("FM2_ASYNC_SHADERS") != nullptr;
     const bool shadersPending = vs.state.load(std::memory_order_acquire) == CompiledShader::Pending || ps.state.load(std::memory_order_acquire) == CompiledShader::Pending;
@@ -4458,7 +4472,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     const bool directIndex = g_r.physical && !noDirectIndex && (indexSource == 0 || indexSource == 2) &&
         (prim == 4 || prim == 13 || (prim == 6 && !restartOn));
     const uint32_t directVertices = prim == 4 ? indexCount / 3 * 3 : prim == 13 ? indexCount / 4 * 6 : (indexCount >= 3 ? (indexCount - 2) * 3 : 0);
-    static std::vector<uint32_t> list; // reused between draws
+    thread_local std::vector<uint32_t> list; // reused between draws
     list.clear();
     if (directIndex ? directVertices == 0 : (!BuildIndexList(initiator, dmaBase, dmaSize, list) || list.empty()))
     {
@@ -4486,7 +4500,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             }
             return v;
         }();
-        const bool skipThis = g_r.frame == dumpFrame && std::find(skipVs.begin(), skipVs.end(), g_r.vsHash) != skipVs.end();
+        const bool skipThis = g_r.frame == dumpFrame && std::find(skipVs.begin(), skipVs.end(), C().vsHash) != skipVs.end();
         // FM2_SWEEP="start,step,count" (with FM2_DUMP_FRAME as the first frame): frame
         // dumpFrame+i drops draws [start+i*step, start+(i+1)*step) and is written to
         // out/sweep/<i>.png, so one run compares many skips on near-identical frames.
@@ -4591,7 +4605,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         {
             // This draw's constants for the next frame, and last frame's for its motion. The
             // draw is known by its shaders, vertex and index data and how often it came up.
-            uint64_t key = g_r.vsHash * 0x9E3779B97F4A7C15ull ^ g_r.psHash ^ (uint64_t(dmaBase) << 20) ^ initiator;
+            uint64_t key = C().vsHash * 0x9E3779B97F4A7C15ull ^ C().psHash ^ (uint64_t(dmaBase) << 20) ^ initiator;
             for (uint32_t k : vs.info.vertexFetchConstants)
             {
                 key = (key ^ gpureg::Get(gpureg::FetchConstants + k * 2)) * 0xFF51AFD7ED558CCDull;
@@ -4748,7 +4762,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         g_drawSamplesResolve = false;
         const bool cube = fetch.Dimension() == 3;
         static const uint64_t dumpPs = getenv("FM2_DUMP_PS_TEXTURES") ? strtoull(getenv("FM2_DUMP_PS_TEXTURES"), nullptr, 16) : 0;
-        if (dumpPs && g_r.psHash == dumpPs && !cube)
+        if (dumpPs && C().psHash == dumpPs && !cube)
         {
             static std::set<uint32_t> dumped;
             std::vector<uint8_t> rgba;
@@ -4857,17 +4871,17 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (memcmp(&ds.viewport, &vp, sizeof(vp)) != 0)
     {
         ds.viewport = vp;
-        g_r.list->RSSetViewports(1, &vp);
+        C().list->RSSetViewports(1, &vp);
     }
     if (memcmp(&ds.scissor, &hostScissor, sizeof(hostScissor)) != 0)
     {
         ds.scissor = hostScissor;
-        g_r.list->RSSetScissorRects(1, &hostScissor);
+        C().list->RSSetScissorRects(1, &hostScissor);
     }
     if (const uint32_t ref = gpureg::Get(RB_STENCILREFMASK) & 0xFF; ref != ds.stencilRef)
     {
         ds.stencilRef = ref;
-        g_r.list->OMSetStencilRef(ref);
+        C().list->OMSetStencilRef(ref);
     }
     {
         // RB_BLEND_RED..ALPHA: the constant colour for blend factors 12-15.
@@ -4875,47 +4889,47 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         if (memcmp(ds.blendFactor, factor, sizeof(factor)) != 0)
         {
             memcpy(ds.blendFactor, factor, sizeof(factor));
-            g_r.list->OMSetBlendFactor(factor);
+            C().list->OMSetBlendFactor(factor);
         }
     }
     if (motion != ds.motionRoot)
     {
         // Motion pipelines have their own root signature; switching clears the root arguments.
         ds.motionRoot = motion;
-        g_r.list->SetGraphicsRootSignature(motion ? g_r.motionRootSignature.Get() : g_r.rootSignature.Get());
+        C().list->SetGraphicsRootSignature(motion ? g_r.motionRootSignature.Get() : g_r.rootSignature.Get());
         ds.table2 = ds.table3 = D3D12_GPU_DESCRIPTOR_HANDLE{};
     }
     if (motion != ds.motionTargets)
     {
         ds.motionTargets = motion;
-        const D3D12_CPU_DESCRIPTOR_HANDLE targets[2] = { g_r.rtv, g_upscale.motionRtv };
-        g_r.list->OMSetRenderTargets(motion ? 2 : 1, targets, FALSE, &g_r.dsv);
+        const D3D12_CPU_DESCRIPTOR_HANDLE targets[2] = { C().rtv, g_upscale.motionRtv };
+        C().list->OMSetRenderTargets(motion ? 2 : 1, targets, FALSE, &C().dsv);
     }
     if (pso != ds.pso)
     {
         ds.pso = pso;
         const auto t0 = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        g_r.list->SetPipelineState(pso);
+        C().list->SetPipelineState(pso);
         if (g_perfTiming)
         {
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             if (ms > 1.0)
-                Log("perf: SetPipelineState took %.1f ms (vs %016llx ps %016llx)", ms, (unsigned long long)g_r.vsHash, (unsigned long long)g_r.psHash);
+                Log("perf: SetPipelineState took %.1f ms (vs %016llx ps %016llx)", ms, (unsigned long long)C().vsHash, (unsigned long long)C().psHash);
         }
     }
-    g_r.list->SetGraphicsRootConstantBufferView(0, f.ring->GetGPUVirtualAddress() + vsOffset);
-    g_r.list->SetGraphicsRootConstantBufferView(1, f.ring->GetGPUVirtualAddress() + psOffset);
+    C().list->SetGraphicsRootConstantBufferView(0, f.ring->GetGPUVirtualAddress() + vsOffset);
+    C().list->SetGraphicsRootConstantBufferView(1, f.ring->GetGPUVirtualAddress() + psOffset);
     if (motion)
-        g_r.list->SetGraphicsRootConstantBufferView(4, motionPrevious);
+        C().list->SetGraphicsRootConstantBufferView(4, motionPrevious);
     if (const D3D12_GPU_DESCRIPTOR_HANDLE t2 = Gpu(g_r.srvHeap.Get(), f.descriptorBase, g_r.srvStride); t2.ptr != ds.table2.ptr)
     {
         ds.table2 = t2;
-        g_r.list->SetGraphicsRootDescriptorTable(2, t2);
+        C().list->SetGraphicsRootDescriptorTable(2, t2);
     }
     if (const D3D12_GPU_DESCRIPTOR_HANDLE t3 = Gpu(g_r.srvHeap.Get(), kBindlessBase, g_r.srvStride); t3.ptr != ds.table3.ptr)
     {
         ds.table3 = t3;
-        g_r.list->SetGraphicsRootDescriptorTable(3, t3);
+        C().list->SetGraphicsRootDescriptorTable(3, t3);
     }
     static const uint64_t traceFrame = getenv("FM2_TRACE_DRAWS") ? strtoull(getenv("FM2_TRACE_DRAWS"), nullptr, 10) : 0;
     if (traceFrame && g_r.frame + 1 == traceFrame)
@@ -4935,7 +4949,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             list.size() > 0 ? list[0] : 0, list.size() > 1 ? list[1] : 0, list.size() > 2 ? list[2] : 0, list.size() > 3 ? list[3] : 0,
             list.size() > 4 ? list[4] : 0, list.size() > 5 ? list[5] : 0, list.empty() ? 0 : list.back());
         Log("draw #%u vs %016llx ps %016llx prim %u n %zu blend %08X mask %X scissor %ld,%ld-%ld,%ld vte %03X wide %d layer %d pitch %u%s", g_r.drawsThisFrame,
-            (unsigned long long)g_r.vsHash, (unsigned long long)g_r.psHash, initiator & 0x3F, list.size(), gpureg::Get(RB_BLENDCONTROL0),
+            (unsigned long long)C().vsHash, (unsigned long long)C().psHash, initiator & 0x3F, list.size(), gpureg::Get(RB_BLENDCONTROL0),
             gpureg::Get(RB_COLOR_MASK) & 15, scissor.left, scissor.top, scissor.right, scissor.bottom, gpureg::Get(PA_CL_VTE_CNTL) & 0x3FF,
             int(WidePass()), int(g_drawSamplesResolve), gpureg::Get(RB_SURFACE_INFO) & 0x3FFF, tex.c_str());
         uint32_t bools[8];
@@ -4996,24 +5010,24 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         if (topology != g_drawState.topology)
         {
             g_drawState.topology = topology;
-            g_r.list->IASetPrimitiveTopology(topology);
+            C().list->IASetPrimitiveTopology(topology);
         }
         if (indexedCount)
         {
             if (memcmp(&indexView, &g_drawState.indexBuffer, sizeof(indexView)) != 0)
             {
                 g_drawState.indexBuffer = indexView;
-                g_r.list->IASetIndexBuffer(&indexView);
+                C().list->IASetIndexBuffer(&indexView);
             }
-            g_r.list->DrawIndexedInstanced(indexedCount, 1, 0, 0, 0);
+            C().list->DrawIndexedInstanced(indexedCount, 1, 0, 0, 0);
         }
         else
-            g_r.list->DrawInstanced(directIndex ? directVertices : UINT(list.size()), 1, 0, 0);
+            C().list->DrawInstanced(directIndex ? directVertices : UINT(list.size()), 1, 0, 0);
         if (g_perfTiming)
         {
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             if (ms > 1.0)
-                Log("perf: DrawInstanced took %.1f ms (vs %016llx ps %016llx)", ms, (unsigned long long)g_r.vsHash, (unsigned long long)g_r.psHash);
+                Log("perf: DrawInstanced took %.1f ms (vs %016llx ps %016llx)", ms, (unsigned long long)C().vsHash, (unsigned long long)C().psHash);
         }
     }
     Section(6);
@@ -5304,7 +5318,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     }
     // Show the front buffer the title resolved to; fall back to the render
     // target if it was never resolved.
-    ID3D12Resource* image = g_r.color.Get();
+    ID3D12Resource* image = C().color.Get();
     D3D12_RESOURCE_STATES imageState = D3D12_RESOURCE_STATE_COPY_SOURCE;
     auto it = g_r.resolved.find(frontBuffer);
     const bool fromResolve = it != g_r.resolved.end() && it->second.width == kWidth && it->second.height == kHeight &&
@@ -5318,14 +5332,14 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         b.Transition.Subresource = 0;
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        g_r.list->ResourceBarrier(1, &b);
+        C().list->ResourceBarrier(1, &b);
     }
     // The render target is half float; without an 8-bit resolve there is
     // nothing presentable this frame.
     if (fromResolve)
         g_hold.image = it->second.resource;
     ID3D12Resource* overlay = fromResolve ? PrepareOverlay() : nullptr;
-    const bool presenting = fromResolve && PresenterRecordCopy(g_r.list->Real(), image, overlay, kOverlayW, kOverlayH);
+    const bool presenting = fromResolve && PresenterRecordCopy(C().list->Real(), image, overlay, kOverlayW, kOverlayH);
     {
         static const uint64_t traceFrame = getenv("FM2_TRACE_DRAWS") ? strtoull(getenv("FM2_TRACE_DRAWS"), nullptr, 10) : 0;
         if (traceFrame && g_r.frame + 1 == traceFrame)
@@ -5357,7 +5371,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         D3D12_TEXTURE_COPY_LOCATION src{};
         src.pResource = image;
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        g_r.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
     // FM2_DUMP_RESOLVES=1 (with FM2_DUMP_FRAME): also write every resolved texture to out/res.
     static std::vector<ResolveDump> resolveDumps;
@@ -5382,16 +5396,16 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
             bar.Transition.Subresource = 0;
             bar.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-            g_r.list->ResourceBarrier(1, &bar);
+            C().list->ResourceBarrier(1, &bar);
             D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
             dst.pResource = d.buffer.Get();
             dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
             dst.PlacedFootprint.Footprint = { r.format, d.width, d.height, 1, d.pitch };
             src.pResource = r.resource.Get();
             src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            g_r.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
             std::swap(bar.Transition.StateBefore, bar.Transition.StateAfter);
-            g_r.list->ResourceBarrier(1, &bar);
+            C().list->ResourceBarrier(1, &bar);
             resolveDumps.push_back(std::move(d));
         };
         for (auto& [base, r] : g_r.resolved)
@@ -5410,7 +5424,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         b.Transition.Subresource = 0;
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        g_r.list->ResourceBarrier(1, &b);
+        C().list->ResourceBarrier(1, &b);
     }
 
     FlushIndexCopies(); // this frame's index uploads into the arena, after its draws
@@ -5419,18 +5433,18 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         const UINT frameIndex = UINT(&Frame() - g_r.frames);
         PassMark("frame end %u%u", 0, 0);
         const UINT n = UINT(g_passMarks[frameIndex].size());
-        g_r.list->ResolveQueryData(g_passQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * kPassMarks, n, g_passReadback.Get(),
+        C().list->ResolveQueryData(g_passQueries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * kPassMarks, n, g_passReadback.Get(),
             UINT64(frameIndex) * kPassMarks * 8);
     }
     if (g_timestamps)
     {
         const UINT frameIndex = UINT(&Frame() - g_r.frames);
-        g_r.list->EndQuery(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 2 + 1);
-        g_r.list->ResolveQueryData(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 2, 2, g_timestampReadback.Get(), UINT64(frameIndex) * 16);
+        C().list->EndQuery(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 2 + 1);
+        C().list->ResolveQueryData(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 2, 2, g_timestampReadback.Get(), UINT64(frameIndex) * 16);
         Frame().timed = true;
     }
-    g_r.list->Close();
-    ID3D12CommandList* lists[] = { g_r.list->Real() };
+    C().list->Close();
+    ID3D12CommandList* lists[] = { C().list->Real() };
     g_r.queue->ExecuteCommandLists(1, lists);
     if (presenting)
         PresenterPresent();
