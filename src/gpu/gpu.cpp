@@ -93,6 +93,169 @@ void RaiseInterrupt(uint32_t source, uint32_t cpu)
     g_gpu.interruptCv.notify_one();
 }
 
+// ---- Draw worker ---------------------------------------------------------------------
+// The command processor (this file's CommandProcessorLoop) parses the command stream and
+// keeps the guest's view (registers, read pointer, waits) current; draws are translated on
+// a worker thread. Everything the renderer needs goes through an ordered log: register
+// writes (the worker keeps its own register file), shader loads (with their microcode),
+// draws, swaps, and the memory writes the title treats as fences, so those land only after
+// the draws before them. Waits, conditional writes and interrupts first let the worker
+// catch up. Opt-in with FM2_DRAW_THREAD=1: the worker alone still does nearly all the work
+// (translation, not parsing, is the cost), so it pays off once draws are spread over workers.
+namespace work
+{
+enum : uint32_t { kPad, kRegs, kShader, kDraw, kSwap, kWriteBack, kStore };
+constexpr uint64_t kWords = 16ull << 20; // 64 MB
+std::vector<uint32_t> g_ring(kWords);
+alignas(64) std::atomic<uint64_t> g_head{ 0 }; // written by the command processor
+alignas(64) std::atomic<uint64_t> g_tail{ 0 }; // written by the worker
+std::vector<uint8_t> g_file(0x5000 * 4);       // the worker's register file
+const bool g_enabled = getenv("FM2_DRAW_THREAD") != nullptr; // off by default (no gain until draws translate in parallel)
+std::atomic<bool> g_started{ false };
+
+// Space for a record of `words` payload words; returns where to write it.
+uint32_t* Begin(uint32_t type, uint32_t words)
+{
+    const uint64_t need = uint64_t(words) + 1;
+    uint64_t head = g_head.load(std::memory_order_relaxed);
+    if ((head % kWords) + need > kWords) // does not fit before the end: pad to it
+    {
+        const uint64_t pad = kWords - head % kWords;
+        while (head + pad - g_tail.load(std::memory_order_acquire) > kWords)
+            g_tail.wait(g_tail.load(std::memory_order_acquire), std::memory_order_acquire);
+        g_ring[head % kWords] = (kPad << 24) | uint32_t(pad - 1);
+        head += pad;
+        g_head.store(head, std::memory_order_release);
+        g_head.notify_one();
+    }
+    while (head + need - g_tail.load(std::memory_order_acquire) > kWords)
+    {
+        const uint64_t tail = g_tail.load(std::memory_order_acquire);
+        if (head + need - tail > kWords)
+            g_tail.wait(tail, std::memory_order_acquire);
+    }
+    uint32_t* p = &g_ring[head % kWords];
+    p[0] = (type << 24) | words;
+    return p + 1;
+}
+
+void End(uint32_t words)
+{
+    const uint64_t head = g_head.load(std::memory_order_relaxed) + words + 1;
+    g_head.store(head, std::memory_order_release);
+    g_head.notify_one();
+}
+
+// Waits until the worker has done everything logged so far.
+std::atomic<uint64_t> g_drains{ 0 }, g_drainWaits{ 0 };
+void Drain()
+{
+    if (!g_started.load(std::memory_order_acquire))
+        return;
+    g_drains++;
+    if (g_tail.load(std::memory_order_acquire) != g_head.load(std::memory_order_relaxed))
+        g_drainWaits++;
+    const uint64_t head = g_head.load(std::memory_order_relaxed);
+    for (uint64_t tail; (tail = g_tail.load(std::memory_order_acquire)) != head;)
+        g_tail.wait(tail, std::memory_order_acquire);
+}
+
+bool Active() { return g_enabled && g_started.load(std::memory_order_relaxed); }
+
+void LogRegs(uint32_t index, const uint32_t* valuesBE, uint32_t count)
+{
+    uint32_t* p = Begin(kRegs, count + 1);
+    p[0] = index;
+    memcpy(p + 1, valuesBE, size_t(count) * 4);
+    End(count + 1);
+}
+}
+
+void WriteBackNow(uint32_t address, uint32_t value);
+
+void SubmitShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwords, uint32_t guestAddress)
+{
+    if (!work::Active())
+    {
+        FrameOnShaderLoad(type, microcodeBE, dwords, guestAddress);
+        return;
+    }
+    dwords = std::min<uint32_t>(dwords, 0x10000);
+    uint32_t* p = work::Begin(work::kShader, dwords + 3);
+    p[0] = uint32_t(type);
+    p[1] = guestAddress;
+    p[2] = dwords;
+    memcpy(p + 3, microcodeBE, size_t(dwords) * 4);
+    work::End(dwords + 3);
+}
+
+void SubmitDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
+{
+    if (!work::Active())
+    {
+        FrameOnDraw(initiator, dmaBase, dmaSize);
+        return;
+    }
+    uint32_t* p = work::Begin(work::kDraw, 3);
+    p[0] = initiator;
+    p[1] = dmaBase;
+    p[2] = dmaSize;
+    work::End(3);
+}
+
+void WorkerLoop()
+{
+    SetThreadDescription(GetCurrentThread(), L"gpu draw worker");
+    gpureg::t_file = work::g_file.data();
+    for (;;)
+    {
+        uint64_t tail = work::g_tail.load(std::memory_order_relaxed);
+        uint64_t head;
+        while ((head = work::g_head.load(std::memory_order_acquire)) == tail)
+            work::g_head.wait(head, std::memory_order_acquire);
+        // Everything published so far, then let the command processor know.
+        while (tail != head)
+        {
+            const uint32_t* p = &work::g_ring[tail % work::kWords];
+            const uint32_t type = p[0] >> 24, words = p[0] & 0xFFFFFF;
+            const uint32_t* a = p + 1;
+            switch (type)
+            {
+            case work::kRegs:
+                memcpy(work::g_file.data() + a[0] * 4, a + 1, size_t(words - 1) * 4);
+                break;
+            case work::kShader:
+                FrameOnShaderLoad(ShaderType(a[0]), a + 3, a[2], a[1]);
+                break;
+            case work::kDraw:
+                FrameOnDraw(a[0], a[1], a[2]);
+                break;
+            case work::kSwap:
+                FrameOnSwap(uint64_t(a[0]) | uint64_t(a[1]) << 32, a[2]);
+                break;
+            case work::kWriteBack:
+                WriteBackNow(a[0], a[1]);
+                break;
+            case work::kStore:
+                StoreBE32(a[0], a[1]);
+                break;
+            default:
+                break;
+            }
+            tail += uint64_t(words) + 1;
+            // Publish now and then (the command processor waits on this when the log is full
+            // or it must catch up): every record would cost a wake-up each.
+            if (type == work::kWriteBack || type == work::kStore || type == work::kSwap || (tail & 0x3FFF) < words + 1)
+            {
+                work::g_tail.store(tail, std::memory_order_release);
+                work::g_tail.notify_all();
+            }
+        }
+        work::g_tail.store(tail, std::memory_order_release);
+        work::g_tail.notify_all();
+    }
+}
+
 thread_local PPCContext* t_cpContext = nullptr;
 
 void DispatchInterrupt(PPCContext& ctx, uint32_t source, uint32_t cpu)
@@ -142,9 +305,23 @@ uint32_t GpuSwap(uint32_t value, uint32_t endian)
     }
 }
 
-void WriteBack(uint32_t address, uint32_t value)
+void WriteBackNow(uint32_t address, uint32_t value)
 {
     *GuestPtr<uint32_t>(PhysToGuest(address & ~3u)) = GpuSwap(value, address);
+}
+
+// Memory writes from the command stream (fences): after the draws before them.
+void WriteBack(uint32_t address, uint32_t value)
+{
+    if (work::Active())
+    {
+        uint32_t* p = work::Begin(work::kWriteBack, 2);
+        p[0] = address;
+        p[1] = value;
+        work::End(2);
+        return;
+    }
+    WriteBackNow(address, value);
 }
 
 uint32_t ReadBack(uint32_t address)
@@ -193,16 +370,33 @@ uint32_t PacketLength(uint32_t header)
 constexpr uint32_t SCRATCH_UMSK = 0x01DC;
 constexpr uint32_t SCRATCH_ADDR = 0x01DD;
 
+
 // Register writes from the command stream. Scratch registers with their
 // mask bit set are mirrored to memory: D3D's fences rely on it.
 void WriteRegister(uint32_t index, uint32_t value)
 {
     SetReg(index, value);
+    if (work::Active())
+    {
+        const uint32_t be = __builtin_bswap32(value);
+        work::LogRegs(index, &be, 1);
+    }
     if (index >= SCRATCH_REG0 && index < SCRATCH_REG0 + 8)
     {
         const uint32_t n = index - SCRATCH_REG0;
         if ((Reg(SCRATCH_UMSK) >> n) & 1)
-            StoreBE32(PhysToGuest(Reg(SCRATCH_ADDR) + n * 4), value);
+        {
+            const uint32_t address = PhysToGuest(Reg(SCRATCH_ADDR) + n * 4);
+            if (work::Active())
+            {
+                uint32_t* p = work::Begin(work::kStore, 2);
+                p[0] = address;
+                p[1] = value;
+                work::End(2);
+            }
+            else
+                StoreBE32(address, value);
+        }
     }
 }
 
@@ -213,6 +407,8 @@ void WriteRegisters(uint32_t index, uint32_t source, uint32_t count)
     if (index + count <= SCRATCH_REG0 || index >= SCRATCH_REG0 + 8)
     {
         memcpy(GuestPtr<uint8_t>(kRegisterBase + index * 4), GuestPtr<uint8_t>(source), size_t(count) * 4);
+        if (work::Active())
+            work::LogRegs(index, GuestPtr<uint32_t>(source), count);
         return;
     }
     for (uint32_t i = 0; i < count; i++)
@@ -259,7 +455,16 @@ uint32_t ExecutePacket(uint32_t ptr)
             {
                 const auto swap = g_gpu.pendingSwaps[i];
                 g_gpu.pendingSwaps.erase(g_gpu.pendingSwaps.begin(), g_gpu.pendingSwaps.begin() + i + 1);
-                FrameOnSwap(swap.frame, swap.frontBuffer);
+                if (work::Active())
+                {
+                    uint32_t* p = work::Begin(work::kSwap, 3);
+                    p[0] = uint32_t(swap.frame);
+                    p[1] = uint32_t(swap.frame >> 32);
+                    p[2] = swap.frontBuffer;
+                    work::End(3);
+                }
+                else
+                    FrameOnSwap(swap.frame, swap.frontBuffer);
                 break;
             }
         }
@@ -345,6 +550,8 @@ uint32_t ExecutePacket(uint32_t ptr)
     case 0x45: // COND_WRITE: wait info, poll addr, ref, mask, write addr, write data
     {
         const uint32_t info = arg(0);
+        if (info & 0x10) // a memory poll may read a fence the worker writes
+            work::Drain();
         const uint32_t value = (info & 0x10) ? ReadBack(arg(1)) : Reg(arg(1));
         if (WaitCompare(info & 7, value & arg(3), arg(2)))
         {
@@ -358,6 +565,10 @@ uint32_t ExecutePacket(uint32_t ptr)
     case 0x3C: // WAIT_REG_MEM: info, poll addr, ref, mask, interval
     {
         const uint32_t info = arg(0);
+        // A memory poll may wait for a fence the worker writes: let it catch up, unless the
+        // condition already holds (most waits are for values the title set).
+        if ((info & 0x10) && !WaitCompare(info & 7, ReadBack(arg(1)) & arg(3), arg(2)))
+            work::Drain();
         g_gpu.waitingOn = arg(1);
         g_gpu.waitingRef = arg(2);
         g_gpu.waitingInfo = info;
@@ -417,6 +628,7 @@ uint32_t ExecutePacket(uint32_t ptr)
         break;
     }
     case 0x54: // INTERRUPT: cpu mask
+        work::Drain(); // after the draws before it, like the hardware
         for (uint32_t cpu = 0; cpu < 6; cpu++)
         {
             if ((arg(0) >> cpu) & 1)
@@ -476,22 +688,22 @@ uint32_t ExecutePacket(uint32_t ptr)
     {
         const uint32_t address = GpuPhysToGuest(arg(0) & ~3u);
         const uint32_t dwords = arg(1) & 0xFFFF;
-        FrameOnShaderLoad(ShaderType(arg(0) & 3), GuestPtr<uint32_t>(address), dwords, address);
+        SubmitShaderLoad(ShaderType(arg(0) & 3), GuestPtr<uint32_t>(address), dwords, address);
         break;
     }
     case 0x2B: // IM_LOAD_IMMEDIATE: type, start/size, microcode
     {
         const uint32_t dwords = std::min(arg(1) & 0xFFFF, count - 2);
-        FrameOnShaderLoad(ShaderType(arg(0) & 3), GuestPtr<uint32_t>(data + 8), dwords, data + 8);
+        SubmitShaderLoad(ShaderType(arg(0) & 3), GuestPtr<uint32_t>(data + 8), dwords, data + 8);
         break;
     }
     case 0x22: // DRAW_INDX: viz query, initiator, [index base, index size]
         g_gpu.draws++;
-        FrameOnDraw(arg(1), count > 2 ? arg(2) : 0, count > 3 ? arg(3) : 0);
+        SubmitDraw(arg(1), count > 2 ? arg(2) : 0, count > 3 ? arg(3) : 0);
         break;
     case 0x36: // DRAW_INDX_2: initiator, [inline indices]
         g_gpu.draws++;
-        FrameOnDraw(arg(0), 0, 0);
+        SubmitDraw(arg(0), 0, 0);
         break;
     case 0x46: // EVENT_WRITE
     case 0x48: // ME_INIT
@@ -635,7 +847,7 @@ void LookaheadBuffer(uint32_t address, uint32_t dwords, int depth, LookState& st
 void GpuLookahead()
 {
     static const bool off = getenv("FM2_NO_LOOKAHEAD") != nullptr;
-    if (off)
+    if (off || work::Active()) // (the renderer runs on the draw worker; the stream is the CP's)
         return;
     constexpr uint32_t kFirst = 0x2000, kCount = 0x3000;
     std::vector<uint32_t> saved(kCount);
@@ -674,6 +886,33 @@ namespace
 void CommandProcessorLoop(PPCContext& ctx)
 {
     t_cpContext = &ctx;
+    if (work::g_enabled)
+    {
+        memcpy(work::g_file.data(), GuestPtr<uint8_t>(kRegisterBase), work::g_file.size());
+        std::thread worker(WorkerLoop);
+        static HANDLE workerHandle = nullptr;
+        DuplicateHandle(GetCurrentProcess(), worker.native_handle(), GetCurrentProcess(), &workerHandle, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        worker.detach();
+        work::g_started.store(true, std::memory_order_release);
+        Log("gpu: draw worker thread started");
+        std::thread([] {
+            for (;;)
+            {
+                Sleep(2000);
+                if (getenv("FM2_PERF"))
+                {
+                    static uint64_t lastBusy = 0;
+                    FILETIME c, e, k, u;
+                    uint64_t busy = 0;
+                    if (workerHandle && GetThreadTimes(workerHandle, &c, &e, &k, &u))
+                        busy = (uint64_t(k.dwHighDateTime) << 32 | k.dwLowDateTime) + (uint64_t(u.dwHighDateTime) << 32 | u.dwLowDateTime);
+                    Log("perf: draw worker: %.0f%% busy, %llu drains (%llu waited) in 2 s", (busy - lastBusy) / 1e7 / 2.0 * 100.0,
+                        (unsigned long long)work::g_drains.exchange(0), (unsigned long long)work::g_drainWaits.exchange(0));
+                    lastBusy = busy;
+                }
+            }
+        }).detach();
+    }
     for (;;)
     {
         const uint32_t base = g_gpu.ringBase, size = g_gpu.ringDwords;

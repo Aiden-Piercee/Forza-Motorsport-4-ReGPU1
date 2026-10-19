@@ -4578,7 +4578,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // Byte-swapped block copy of both constant banks (1024 dwords each).
         const __m128i swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
         // Only the constants each shader reads (the rest of the block is never read).
-        const auto* src = GuestPtr<const __m128i>(gpureg::kBase + gpureg::AluConstants * 4);
+        const auto* src = reinterpret_cast<const __m128i*>(gpureg::File() + gpureg::AluConstants * 4);
         auto* dv = reinterpret_cast<__m128i*>(vc->c);
         auto* dp = reinterpret_cast<__m128i*>(pc->c);
         static const bool allConstants = getenv("FM2_ALL_CONSTANTS") != nullptr; // A/B

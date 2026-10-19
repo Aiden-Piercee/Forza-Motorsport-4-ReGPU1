@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <cstring>
 
 #include "memory.h"
 
@@ -14,8 +15,21 @@ constexpr uint32_t FetchConstants = 0x4800;
 constexpr uint32_t BoolConstants = 0x4900;
 constexpr uint32_t LoopConstants = 0x4908;
 
-inline uint32_t Get(uint32_t index) { return LoadBE32(kBase + index * 4); }
-inline void Set(uint32_t index, uint32_t value) { StoreBE32(kBase + index * 4, value); }
+// The register file this thread reads: the guest's (written by the command processor), or
+// the draw worker's own copy, which follows the command processor's writes in order.
+inline thread_local uint8_t* t_file = nullptr;
+inline uint8_t* File() { return t_file ? t_file : GuestPtr<uint8_t>(kBase); }
+inline uint32_t Get(uint32_t index)
+{
+    uint32_t v;
+    memcpy(&v, File() + index * 4, 4);
+    return __builtin_bswap32(v);
+}
+inline void Set(uint32_t index, uint32_t value)
+{
+    value = __builtin_bswap32(value);
+    memcpy(File() + index * 4, &value, 4);
+}
 }
 
 // Physical addresses as the GPU sees them, in our 0xA0000000 view.
