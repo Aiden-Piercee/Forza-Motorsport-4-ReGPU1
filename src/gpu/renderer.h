@@ -18,6 +18,9 @@ void RendererPredictDraw(uint32_t initiator);
 bool RendererCompileIdle();
 // Flushes the pipeline library to disk (called when the tour finishes).
 void RendererSaveCaches();
+// Benchmark: frame times are recorded while on; the report summarises them.
+void BenchmarkRecord(bool on);
+void BenchmarkWriteReport(const char* path);
 // True while FM2_TRACE_DRAWS's frame is being recorded.
 bool RendererTracing();
 

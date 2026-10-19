@@ -22,6 +22,19 @@ has not hung. Later starts load the compiled shaders from `Documents\fm2\shaderc
 `play-cold.cmd` moves the caches aside and starts like a first boot with
 `FM2_PERF=1`: slow frames are logged to `out\play.log` with their cause.
 
+## Benchmark
+
+`benchmark.cmd` measures performance the same way on every machine: it drives the
+menus into a Sunset race with 8 cars, holds the throttle for 25 seconds, and writes
+`out\benchmark.txt` with the average fps, the 1% and 0.1% lows, the slowest frame, the
+CPU, GPU and RAM, and the resolution and upscaler. It takes about 75 seconds.
+
+- Start the game once with `play.cmd` first (the first start compiles shaders).
+- Pick the resolution and upscaler in the launcher beforehand: the benchmark uses the
+  saved settings, without a frame cap or VSync, and its own `Benchmark` profile.
+- Don't touch the keyboard or controller while it runs.
+- Send `out\benchmark.txt` with your results.
+
 ## Controls
 
 An Xbox controller (XInput) works as on the console, rumble included.

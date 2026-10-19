@@ -29,6 +29,7 @@
 #include <unordered_map>
 
 #include <d3d12.h>
+#include <dxgi1_4.h>
 #include <d3dcompiler.h>
 #include <windows.h>
 #include <wrl/client.h>
@@ -5517,6 +5518,102 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 
 }
 
+// ---- Benchmark (benchmark.cmd) ------------------------------------------------------
+// Frame times while recording (the tour's timed race), and the report written at the end.
+std::atomic<bool> g_benchRecording{ false };
+std::mutex g_benchMutex;
+std::vector<float> g_benchFrames; // ms
+
+void BenchmarkRecord(bool on)
+{
+    g_benchRecording.store(on, std::memory_order_relaxed);
+}
+
+void BenchmarkWriteReport(const char* path)
+{
+    std::vector<float> frames;
+    {
+        std::lock_guard lock(g_benchMutex);
+        frames = g_benchFrames;
+    }
+    std::string cpu = "?", gpu = "?";
+    {
+        char name[256];
+        DWORD size = sizeof(name);
+        if (RegGetValueA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "ProcessorNameString", RRF_RT_REG_SZ, nullptr,
+                name, &size) == ERROR_SUCCESS)
+            cpu = name;
+        while (!cpu.empty() && cpu.back() == ' ')
+            cpu.pop_back();
+    }
+    uint32_t cores = 0;
+    {
+        DWORD bytes = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
+        std::vector<uint8_t> buffer(bytes);
+        if (bytes && GetLogicalProcessorInformationEx(RelationProcessorCore, reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data()), &bytes))
+            for (DWORD at = 0; at < bytes; at += reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + at)->Size)
+                cores++;
+    }
+    MEMORYSTATUSEX memory{ sizeof(memory) };
+    GlobalMemoryStatusEx(&memory);
+    if (g_r.device)
+    {
+        ComPtr<IDXGIFactory4> factory;
+        ComPtr<IDXGIAdapter1> adapter;
+        DXGI_ADAPTER_DESC1 desc{};
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && SUCCEEDED(factory->EnumAdapterByLuid(g_r.device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))) &&
+            SUCCEEDED(adapter->GetDesc1(&desc)))
+        {
+            char name[128];
+            WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name), nullptr, nullptr);
+            gpu = std::string(name) + " (" + std::to_string(desc.DedicatedVideoMemory >> 20) + " MB)";
+        }
+    }
+    const Settings& st = GetSettings();
+    static const char* upscalers[] = { "off", "FSR 1", "FSR 3", "DLSS" };
+    static const char* qualities[] = { "native (AA)", "quality", "balanced", "performance", "ultra performance" };
+    std::string upscaler = upscalers[std::min<uint32_t>(uint32_t(st.upscaler), 3)];
+    if (st.upscaler != Settings::Upscaler::Off)
+        upscaler += std::string(", ") + qualities[std::min<uint32_t>(st.quality, 4)];
+
+    FILE* out = fopen(path, "w");
+    if (!out)
+        return;
+    fprintf(out, "FM2 benchmark (Sunset race, 8 cars, throttle held)\n\n");
+    fprintf(out, "CPU:        %s (%u cores, %u threads)\n", cpu.c_str(), cores, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
+    fprintf(out, "GPU:        %s\n", gpu.c_str());
+    fprintf(out, "RAM:        %.0f GB\n", memory.ullTotalPhys / 1073741824.0);
+    fprintf(out, "Resolution: %ux%u%s\n", OutputWidth(), OutputHeight(), st.fullscreen ? " fullscreen" : " windowed");
+    fprintf(out, "Upscaler:   %s\n\n", upscaler.c_str());
+    if (frames.size() < 100)
+    {
+        fprintf(out, "Not enough frames recorded (%zu): the run did not reach the race. Start the game once with play.cmd\n"
+                     "(the first start compiles shaders), then run the benchmark again.\n", frames.size());
+        fclose(out);
+        return;
+    }
+    double total = 0;
+    for (float f : frames)
+        total += f;
+    std::vector<float> sorted = frames;
+    std::sort(sorted.begin(), sorted.end());
+    // Lows: the average frame rate over the slowest 1% / 0.1% of frames.
+    auto low = [&](double fraction) {
+        const size_t n = std::max<size_t>(1, size_t(sorted.size() * fraction));
+        double sum = 0;
+        for (size_t i = sorted.size() - n; i < sorted.size(); i++)
+            sum += sorted[i];
+        return 1000.0 * double(n) / sum;
+    };
+    fprintf(out, "Average:    %.1f fps (%zu frames in %.1f s)\n", 1000.0 * double(frames.size()) / total, frames.size(), total / 1000.0);
+    fprintf(out, "1%% low:     %.1f fps\n", low(0.01));
+    fprintf(out, "0.1%% low:   %.1f fps\n", low(0.001));
+    fprintf(out, "Slowest:    %.1f ms\n", double(sorted.back()));
+    fclose(out);
+    Log("benchmark: report written to %s", path);
+}
+
 void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer);
 void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
 {
@@ -5531,6 +5628,11 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
     {
         const double dt = std::chrono::duration<double>(now - lastSwap).count() * 1000.0;
         lastSwap = now;
+        if (g_benchRecording.load(std::memory_order_relaxed))
+        {
+            std::lock_guard lock(g_benchMutex);
+            g_benchFrames.push_back(float(dt));
+        }
         g_perf.maxFrame = std::max(g_perf.maxFrame, dt);
         if (dt > 20.0)
             g_perf.slowFrames++;

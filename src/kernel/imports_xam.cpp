@@ -506,6 +506,12 @@ bool ReadPad(uint32_t user, PadState& s)
                 {
                     if (step == "QUIT")
                     {
+                        static const char* benchmark = getenv("FM2_BENCHMARK"); // report path
+                        if (benchmark)
+                        {
+                            BenchmarkRecord(false);
+                            BenchmarkWriteReport(benchmark);
+                        }
                         RendererSaveCaches();
                         Log("tour: finished, caches saved");
                         fflush(nullptr);
@@ -522,6 +528,8 @@ bool ReadPad(uint32_t user, PadState& s)
                 {
                     s.rightTrigger = 255;
                     advance = elapsed >= atof(step.c_str() + 3);
+                    // The benchmark measures the race, from 3 s after the throttle is held.
+                    BenchmarkRecord(!advance && elapsed >= 3.0);
                 }
                 else
                 {
