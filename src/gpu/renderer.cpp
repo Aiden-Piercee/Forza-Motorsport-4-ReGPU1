@@ -574,7 +574,10 @@ struct SlotBinding
     float tbias[4] = {};
     bool samplesResolve = false;
 };
-thread_local SlotBinding g_slotBindings[32];
+// Bindings by fetch constant: a texture bound by many draws (in any slot) is looked up once
+// per frame and resolve epoch (textures are still checked once per frame for changes).
+thread_local std::unordered_map<uint64_t, SlotBinding> g_bindings;
+thread_local uint64_t g_bindingsFrame = ~0ull, g_bindingsEpoch = ~0ull;
 
 // Per-draw timing (several clock reads per draw) only for FM2_PERF.
 const bool g_perfTiming = getenv("FM2_PERF") != nullptr;
@@ -5144,11 +5147,20 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     memset(pc->tinfo, 0, sizeof(pc->tinfo));
     memset(pc->tbias, 0, sizeof(pc->tbias));
     const uint32_t usedSlots = ps.info.usedTextureSlots | vs.info.usedTextureSlots;
+    if (g_bindingsFrame != g_r.frame || g_bindingsEpoch != g_resolveEpoch)
+    {
+        g_bindings.clear();
+        g_bindingsFrame = g_r.frame;
+        g_bindingsEpoch = g_resolveEpoch;
+    }
     for (uint32_t m = usedSlots; m; m &= m - 1)
     {
         const uint32_t slot = uint32_t(__builtin_ctz(m));
         const TextureFetch fetch = ReadTextureFetch(slot);
-        SlotBinding& memo = g_slotBindings[slot];
+        uint64_t bindingKey = 0xCBF29CE484222325ull;
+        for (uint32_t d : fetch.dwords)
+            bindingKey = (bindingKey ^ d) * 0x100000001B3ull;
+        SlotBinding& memo = g_bindings[bindingKey];
         static const bool noSlotMemo = getenv("FM2_NO_SLOT_MEMO") != nullptr || getenv("FM2_DUMP_PS_TEXTURES") != nullptr;
         if (!noSlotMemo && memo.frame == g_r.frame && memo.epoch == g_resolveEpoch && memcmp(memo.fetch, fetch.dwords, sizeof(memo.fetch)) == 0)
         {
