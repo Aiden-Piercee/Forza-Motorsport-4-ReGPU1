@@ -605,6 +605,16 @@ struct FrameMap
 thread_local std::unordered_map<uint64_t, SlotBinding> g_bindings;
 thread_local uint64_t g_bindingsFrame = ~0ull, g_bindingsEpoch = ~0ull;
 
+// The frame to trace (draws and resolves logged, the image and resolves written out):
+// FM2_TRACE_DRAWS=<frame>, or the one after F12 is pressed in the game window.
+std::atomic<uint64_t> g_hotkeyFrame{ 0 };
+uint64_t TraceFrame()
+{
+    static const uint64_t env = getenv("FM2_TRACE_DRAWS") ? strtoull(getenv("FM2_TRACE_DRAWS"), nullptr, 10) : 0;
+    const uint64_t hot = g_hotkeyFrame.load(std::memory_order_relaxed);
+    return hot ? hot : env;
+}
+
 // Per-draw timing (several clock reads per draw) only for FM2_PERF.
 const bool g_perfTiming = getenv("FM2_PERF") != nullptr;
 
@@ -814,10 +824,12 @@ void Init()
     for (UINT i = 0; i < 4; i++)
     {
         samplers[i].Filter = filters[i];
-        // Linear filtering is anisotropic, as the title asks for the road and ground: plain
-        // trilinear picks blurred levels at grazing angles (blotchy asphalt).
+        // Wrapping linear filtering (surface textures: road, ground) is anisotropic: plain
+        // trilinear picks blurred levels at grazing angles (blotchy asphalt). Not the clamped
+        // sampler: it also reads shadow maps and other render targets, where averaging depth
+        // over a long footprint breaks the shadows (black patches, glitchy car shadows).
         static const bool noAniso = getenv("FM2_NO_ANISO") != nullptr; // A/B
-        if (filters[i] == D3D12_FILTER_MIN_MAG_MIP_LINEAR && !noAniso)
+        if (filters[i] == D3D12_FILTER_MIN_MAG_MIP_LINEAR && modes[i] == D3D12_TEXTURE_ADDRESS_MODE_WRAP && !noAniso)
         {
             samplers[i].Filter = D3D12_FILTER_ANISOTROPIC;
             samplers[i].MaxAnisotropy = 16;
@@ -3900,7 +3912,7 @@ void Resolve()
         return;
 
     const uint32_t sourceSelect = control & 7;
-    static const uint64_t traceFrame = getenv("FM2_TRACE_DRAWS") ? strtoull(getenv("FM2_TRACE_DRAWS"), nullptr, 10) : 0;
+    const uint64_t traceFrame = TraceFrame();
     if (traceFrame && g_r.frame + 1 == traceFrame)
         Log("resolve: control %08X dest %08X pitch %08X info %08X rect %ld,%ld-%ld,%ld clear %08X (color info %08X depth info %08X surface %08X)", control,
             gpureg::Get(RB_COPY_DEST_BASE), gpureg::Get(RB_COPY_DEST_PITCH), gpureg::Get(RB_COPY_DEST_INFO), rect.left, rect.top, rect.right, rect.bottom,
@@ -4649,7 +4661,7 @@ namespace
 {
 void TraceSkip(const char* why, uint32_t initiator)
 {
-    static const uint64_t traceFrame = getenv("FM2_TRACE_DRAWS") ? strtoull(getenv("FM2_TRACE_DRAWS"), nullptr, 10) : 0;
+    const uint64_t traceFrame = TraceFrame();
     if (traceFrame && g_r.frame + 1 == traceFrame)
         Log("skip draw (%s): prim %u count %u mode %u vs %016llx ps %016llx", why, initiator & 0x3F, initiator >> 16,
             gpureg::Get(RB_MODECONTROL) & 7, (unsigned long long)C().vsHash, (unsigned long long)C().psHash);
@@ -5314,8 +5326,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     pc->info[1] = (gpureg::Get(SQ_PROGRAM_CNTL) >> 18) & 1 ? (gpureg::Get(SQ_CONTEXT_MISC) >> 8) & 0xFF : 0xFF;
 
     const uint32_t colorControl = gpureg::Get(RB_COLORCONTROL);
-    // Depth-only passes (EDRAM mode 5) run no pixel shader, so there is no alpha to test.
-    static const bool depthAlphaTest = getenv("FM2_DEPTH_ALPHATEST") != nullptr;
+    // Depth-only passes (EDRAM mode 5) keep the alpha test: the showroom's car shadow map has
+    // cut-out geometry that otherwise lands in it as solid blocks (jagged shadow under the
+    // car). FM2_NO_DEPTH_ALPHATEST=1 skips it (as before; race shadows render either way).
+    static const bool depthAlphaTest = getenv("FM2_NO_DEPTH_ALPHATEST") == nullptr;
     pc->info[0] = (colorControl >> 3) & 1 && (edramMode != 5 || depthAlphaTest) ? (colorControl & 7) : 7;
     pc->info2[0] = RegFloat(RB_ALPHA_REF);
     pc->info2[1] = 1.0f / ScaleX();
@@ -5523,7 +5537,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         ds.table3 = t3;
         C().list->SetGraphicsRootDescriptorTable(3, t3);
     }
-    static const uint64_t traceFrame = getenv("FM2_TRACE_DRAWS") ? strtoull(getenv("FM2_TRACE_DRAWS"), nullptr, 10) : 0;
+    const uint64_t traceFrame = TraceFrame();
     if (traceFrame && g_r.frame + 1 == traceFrame)
     {
         std::string tex;
@@ -6037,12 +6051,27 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     ID3D12Resource* shown = graded ? graded : image;
     const bool presenting = fromResolve && PresenterRecordCopy(C().list->Real(), shown, overlay, kOverlayW, kOverlayH);
     {
-        static const uint64_t traceFrame = getenv("FM2_TRACE_DRAWS") ? strtoull(getenv("FM2_TRACE_DRAWS"), nullptr, 10) : 0;
+        const uint64_t traceFrame = TraceFrame();
         if (traceFrame && g_r.frame + 1 == traceFrame)
             Log("swap: front buffer %08X, %s", frontBuffer, fromResolve ? "resolved" : "not resolved: showing the render target");
     }
 
     static uint64_t dumpFrame = getenv("FM2_DUMP_FRAME") ? strtoull(getenv("FM2_DUMP_FRAME"), nullptr, 10) : 0;
+    {
+        // F12 in the game window: capture the next frame (frame.png, the resolves in out\res,
+        // and the frame's draws in out\play.log) to report rendering bugs.
+        static bool wasDown = false;
+        const bool down = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+        if (down && !wasDown && pid == GetCurrentProcessId())
+        {
+            g_hotkeyFrame = g_r.frame + 2;
+            dumpFrame = g_r.frame + 2;
+            Log("capture: F12 pressed, tracing frame %llu", (unsigned long long)dumpFrame);
+        }
+        wasDown = down;
+    }
     ++g_r.frame;
     // FM2_DUMP_AT=<seconds>: dump the first resolved frame after that long (comparable
     // screenshots whatever the frame rate).
@@ -6072,7 +6101,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     // FM2_DUMP_RESOLVES=1 (with FM2_DUMP_FRAME): also write every resolved texture to out/res.
     static std::vector<ResolveDump> resolveDumps;
     resolveDumps.clear();
-    if (dump && getenv("FM2_DUMP_RESOLVES"))
+    if (dump && (getenv("FM2_DUMP_RESOLVES") || g_hotkeyFrame.load()))
     {
         auto add = [&](uint32_t base, ResolvedTexture& r, int variant) {
             if (!r.resource)
@@ -6262,7 +6291,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
 
 bool RendererTracing()
 {
-    static const uint64_t traceFrame = getenv("FM2_TRACE_DRAWS") ? strtoull(getenv("FM2_TRACE_DRAWS"), nullptr, 10) : 0;
+    const uint64_t traceFrame = TraceFrame();
     return traceFrame && g_r.frame + 1 == traceFrame;
 }
 
