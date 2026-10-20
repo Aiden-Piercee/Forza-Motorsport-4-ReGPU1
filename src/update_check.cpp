@@ -20,7 +20,7 @@ namespace
 std::mutex g_resultMutex;
 std::wstring g_result;
 
-const wchar_t* kRepoPage = L"github.com/zer0ducksgiven/fm2-port/releases";
+const wchar_t* kRepoPage = L"github.com/zer0ducksgiven/Forza-Motorsport-2-ReGPU/releases";
 
 // The first three numbers of a version such as "v0.2.1-alpha" (0 for any missing one).
 void VersionNumbers(const std::string& text, unsigned (&out)[3])
@@ -70,7 +70,7 @@ std::string FetchLatestTag()
     WinHttpSetTimeouts(session, 4000, 4000, 4000, 4000);
     std::string body;
     HINTERNET connect = WinHttpConnect(session, L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
-    HINTERNET request = connect ? WinHttpOpenRequest(connect, L"GET", L"/repos/zer0ducksgiven/fm2-port/releases/latest", nullptr,
+    HINTERNET request = connect ? WinHttpOpenRequest(connect, L"GET", L"/repos/zer0ducksgiven/Forza-Motorsport-2-ReGPU/releases/latest", nullptr,
                                                      WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr;
     if (request && WinHttpSendRequest(request, L"Accept: application/vnd.github+json\r\n", DWORD(-1L), nullptr, 0, 0, 0) &&
         WinHttpReceiveResponse(request, nullptr))
