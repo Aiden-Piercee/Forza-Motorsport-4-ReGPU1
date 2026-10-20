@@ -359,6 +359,24 @@ bool DecodeTexture(const TextureFetch& fetch, const uint8_t* source, std::vector
     return true;
 }
 
+size_t TextureSourceSize(const TextureFetch& fetch)
+{
+    FormatInfo info;
+    const uint32_t width = fetch.Width(), height = fetch.Height();
+    if (!Info(fetch.Format(), info) || !width || !height || width > 4096 || height > 4096)
+        return 0;
+    const uint32_t blocksX = (width + info.blockSize - 1) / info.blockSize;
+    const uint32_t blocksY = (height + info.blockSize - 1) / info.blockSize;
+    uint32_t pitchBlocks = std::max(fetch.Pitch() / info.blockSize, blocksX);
+    uint32_t rows = blocksY;
+    if (fetch.Tiled())
+    {
+        pitchBlocks = (pitchBlocks + 31) & ~31u;
+        rows = (rows + 31) & ~31u;
+    }
+    return size_t(pitchBlocks) * rows * (size_t(1) << info.log2Bytes);
+}
+
 uint32_t TextureBCKind(uint32_t format)
 {
     switch (format)

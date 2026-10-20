@@ -85,6 +85,17 @@ The keyboard only works while the game window has focus.
     translation failures in the log (X3504 array index out of bounds, and "invalid access of
     unbound variable" in a pixel shader).
 
+## Capturing a rendering bug (F12)
+
+With the game window focused, press F12 when the wrong picture is on screen (it pauses for a
+moment while it writes). Then keep, from the game folder:
+
+- `frame.png`: what the game drew,
+- `out/capture/textures.txt` and `out/capture/tex/`: every texture the frame used, whether it was
+  bound or fell back to white (and why), with its decoded image,
+- `out/res/`: the render targets the frame drew into,
+- `out/play.log`: the frame's draw calls (shaders, textures, geometry).
+
 ## What to report
 
 - Anything that renders wrong: which screen, car, track and camera, plus a

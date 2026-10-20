@@ -615,6 +615,14 @@ uint64_t TraceFrame()
     return hot ? hot : env;
 }
 
+// Why GetTexture last found nothing to bind (the draw then samples the white fallback): shown in
+// the F12 capture (out/capture/textures.txt).
+thread_local char g_textureFailure[96] = "";
+void NoteTextureFailure(const char* why, const TextureFetch& fetch)
+{
+    snprintf(g_textureFailure, sizeof(g_textureFailure), "%s (type %u dim %u format %u)", why, fetch.Type(), fetch.Dimension(), fetch.Format());
+}
+
 // Per-draw timing (several clock reads per draw) only for FM2_PERF.
 const bool g_perfTiming = getenv("FM2_PERF") != nullptr;
 
@@ -653,14 +661,14 @@ uint64_t Fnv(const void* data, size_t bytes, uint64_t h = 0xCBF29CE484222325ull)
 
 // Sampled hash for large texture sources: every 64th dword plus the ends.
 // (Word-wise: it runs for every small buffer of every draw.)
-uint64_t ContentHash(const uint8_t* data, size_t bytes)
+uint64_t ContentHash(const uint8_t* data, size_t bytes, size_t stride = 256)
 {
     auto mix = [](uint64_t h, uint64_t v) {
         h = (h ^ v) * 0xFF51AFD7ED558CCDull;
         return h ^ (h >> 32);
     };
     uint64_t h = mix(0xCBF29CE484222325ull, bytes);
-    for (size_t i = 0; i + 4 <= bytes; i += 256)
+    for (size_t i = 0; i + 4 <= bytes; i += stride)
     {
         uint32_t v;
         memcpy(&v, data + i, 4);
@@ -2813,7 +2821,10 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
         return resolvedTexture->resource.Get();
     }
     if (fetch.Type() != 2 || fetch.Dimension() != 1 || !TextureFormatSupported(fetch.Format()))
+    {
+        NoteTextureFailure("not a supported 2D texture", fetch);
         return nullptr;
+    }
     const uint32_t w = fetch.Width(), h = fetch.Height();
     auto& cached = g_r.textures[TextureKey(fetch.Address(), fetch.Format(), w, h)];
     static const bool dumpAll = getenv("FM2_DUMP_TEXTURES") != nullptr;
@@ -2842,9 +2853,14 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
     static const bool noNativeBC = getenv("FM2_NO_NATIVE_BC") != nullptr;
     const uint32_t bc = !noNativeBC && w % 4 == 0 && h % 4 == 0 && !forceDecode ? TextureBCKind(fetch.Format()) : 0;
     const uint8_t* source = GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address()));
-    const size_t sourceBytes = std::max<size_t>(size_t(std::max(fetch.Pitch(), w)) * h / 2, 64); // conservative: >= 4 bpp
+    // The whole base level: the old guess (pitch * height / 2) covered only the first half of a
+    // one-byte-per-texel texture (DXT5), so a thumbnail filled in later went unnoticed.
+    const size_t sourceBytes = std::max<size_t>({ size_t(std::max(fetch.Pitch(), w)) * h / 2, TextureSourceSize(fetch), 64 });
     // Only what changes the decoded image: sampler state (clamp, filter) varies per draw.
-    const uint64_t hash = ContentHash(source, sourceBytes) ^ (bc ? 0 : uint64_t(fetch.Swizzle()) << 8) ^ (uint64_t(fetch.Pitch()) << 24) ^
+    // Small textures (icons, thumbnails) are hashed densely, big ones sampled: a change confined
+    // to a few dwords must not slip between the samples.
+    const size_t hashStride = sourceBytes <= (64u << 10) ? 4 : sourceBytes <= (512u << 10) ? 64 : 256;
+    const uint64_t hash = ContentHash(source, sourceBytes, hashStride) ^ (bc ? 0 : uint64_t(fetch.Swizzle()) << 8) ^ (uint64_t(fetch.Pitch()) << 24) ^
         (uint64_t(fetch.Tiled()) << 40) ^ (uint64_t(fetch.Endian()) << 44);
     if (cached.resource && cached.contentHash == hash && !forceDecode)
     {
@@ -2923,7 +2939,10 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
             const UINT rowPitch = (((lw + 3) / 4) * blockBytes + 255) & ~255u;
             const UINT64 offset = RingAlloc(UINT64(rowPitch) * ((lh + 3) / 4), 512);
             if (offset == ~0ull)
+            {
+                NoteTextureFailure("upload ring full (compressed)", fetch);
                 return nullptr;
+            }
             CopyTextureBlocks(levels[l], Frame().ringCpu + offset, rowPitch);
             D3D12_TEXTURE_COPY_LOCATION dst{};
             dst.pResource = cached.resource.Get();
@@ -2949,7 +2968,10 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
 
     std::vector<uint8_t> rgba;
     if (!DecodeTexture(fetch, rgba))
+    {
+        NoteTextureFailure("decode failed", fetch);
         return nullptr;
+    }
     if (RendererTracing())
         Log("texture upload: %08X %s %ux%u (%s)", fetch.Address(), TextureFormatName(fetch.Format()), w, h, cached.resource ? "changed" : "new");
     static const uint32_t dumpAddress = getenv("FM2_DUMP_TEXTURE") ? uint32_t(strtoul(getenv("FM2_DUMP_TEXTURE"), nullptr, 16)) : 0;
@@ -2999,12 +3021,18 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
     for (UINT16 l = 0; l < mipCount; l++)
     {
         if (l > 0 && !DecodeTexture(levels[l], rgba))
+        {
+            NoteTextureFailure("mip decode failed", fetch);
             return nullptr;
+        }
         const uint32_t lw = levels[l].Width(), lh = levels[l].Height();
         const UINT rowPitch = (lw * 4 + 255) & ~255u;
         const UINT64 offset = RingAlloc(UINT64(rowPitch) * lh, 512);
         if (offset == ~0ull)
+        {
+            NoteTextureFailure("upload ring full", fetch);
             return nullptr;
+        }
         for (uint32_t y = 0; y < lh; y++)
             memcpy(Frame().ringCpu + offset + UINT64(y) * rowPitch, &rgba[size_t(y) * lw * 4], size_t(lw) * 4);
         D3D12_TEXTURE_COPY_LOCATION dst{};
@@ -3027,6 +3055,57 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
     C().list->ResourceBarrier(1, &b);
     cached.contentHash = hash;
     return cached.resource.Get();
+}
+
+// F12 capture: every distinct texture a draw of the traced frame binds goes into
+// out/capture/textures.txt with its decoded image in out/capture/tex/, and a texture that could not
+// be bound (the draw samples the white fallback) is named in out/play.log with the reason.
+void CaptureTexture(const TextureFetch& fetch, uint32_t slot, bool cube, bool bound, uint32_t index, bool native, const char* why)
+{
+    static uint64_t captureFrame = 0;
+    static std::set<uint64_t> seen;
+    static std::ofstream summary;
+    const uint64_t frame = TraceFrame();
+    if (frame != captureFrame)
+    {
+        captureFrame = frame;
+        seen.clear();
+        std::filesystem::create_directories("out/capture/tex");
+        summary.close();
+        summary.open("out/capture/textures.txt");
+        summary << "frame " << frame << " (draw numbers are those of the 'draw #N' lines in out/play.log)\n";
+        summary << "draw slot address format size pitch tiled swizzle: status [image]\n";
+    }
+    const bool resolved = ResolvedFor(fetch) != nullptr;
+    if (!bound && !cube)
+        Log("    texture t%u %08X %s %ux%u is not bound: the draw samples white (%s)", slot, fetch.Address(), TextureFormatName(fetch.Format()), fetch.Width(),
+            fetch.Height(), why[0] ? why : "unknown");
+    const uint64_t key = (uint64_t(fetch.Address()) << 24) ^ (uint64_t(fetch.Format()) << 16) ^ (uint64_t(fetch.Width()) << 4) ^ fetch.Height() ^
+        (uint64_t(cube) << 62);
+    if (!seen.insert(key).second)
+        return;
+    char status[160];
+    if (!bound)
+        snprintf(status, sizeof(status), "WHITE FALLBACK: %s", why[0] ? why : "unknown");
+    else if (resolved)
+        snprintf(status, sizeof(status), "a resolved render target (out/res)");
+    else
+        snprintf(status, sizeof(status), "bound%s, bindless %u", native ? " (compressed on the GPU)" : "", index);
+    std::string image;
+    std::vector<uint8_t> rgba;
+    if (!cube && !resolved && fetch.Type() == 2 && fetch.Dimension() == 1 && TextureFormatSupported(fetch.Format()) && DecodeTexture(fetch, rgba))
+    {
+        char name[160];
+        snprintf(name, sizeof(name), "out/capture/tex/%08X_%s_%ux%u.png", fetch.Address(), TextureFormatName(fetch.Format()), fetch.Width(), fetch.Height());
+        if (WritePng(name, fetch.Width(), fetch.Height(), rgba))
+            image = name;
+    }
+    char line[400];
+    snprintf(line, sizeof(line), "%u t%u %08X %s %ux%u pitch %u %s sw%03X: %s %s%s\n", g_r.drawsThisFrame.load(), slot, fetch.Address(),
+        TextureFormatName(fetch.Format()), fetch.Width(), fetch.Height(), fetch.Pitch(), fetch.Tiled() ? "tiled" : "linear", fetch.Swizzle(), status,
+        cube ? "(cube map) " : "", image.c_str());
+    summary << line;
+    summary.flush();
 }
 
 uint32_t ReadIndex(uint32_t base, uint32_t i, bool is32, uint32_t endian)
@@ -5389,8 +5468,11 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
         DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
         bool native = false;
+        g_textureFailure[0] = 0;
         ID3D12Resource* texture = cube ? GetCubeTexture(fetch, format) : GetTexture(fetch, format, native);
         const uint32_t index = texture ? BindlessIndex(texture, format, cube) : (cube ? 1u : 0u);
+        if (RendererTracing())
+            CaptureTexture(fetch, slot, cube, texture != nullptr, index, native, g_textureFailure);
         // w: dimension (1 2D, 3 cube); bit 31 + bits 8-19: the fetch swizzle, applied in the
         // shader for textures that live on the GPU (resolves). Decoded ones are swizzled already.
         static const bool noGpuSwizzle = getenv("FM2_NO_GPU_SWIZZLE") != nullptr;
@@ -6070,7 +6152,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     static uint64_t dumpFrame = getenv("FM2_DUMP_FRAME") ? strtoull(getenv("FM2_DUMP_FRAME"), nullptr, 10) : 0;
     {
         // F12 in the game window: capture the next frame (frame.png, the resolves in out\res,
-        // and the frame's draws in out\play.log) to report rendering bugs.
+        // and the frame's draws in out/play.log) to report rendering bugs.
         static bool wasDown = false;
         const bool down = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
         DWORD pid = 0;

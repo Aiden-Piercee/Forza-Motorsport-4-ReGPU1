@@ -44,5 +44,9 @@ bool CopyTextureBlocks(const TextureFetch& fetch, uint8_t* dst, uint32_t dstRowP
 // power-of-two textures down to the packed tail (levels 32 texels and up); false otherwise.
 bool TextureMipLevel(const TextureFetch& base, uint32_t level, TextureFetch& out);
 
+// The bytes the base level occupies in memory (rows padded to the pitch, tiled surfaces to 32
+// blocks); 0 for a format this does not know.
+size_t TextureSourceSize(const TextureFetch& fetch);
+
 // Bytes between the faces of a cube texture (each face is a padded 2D slice).
 uint32_t TextureFaceStride(const TextureFetch& fetch);
