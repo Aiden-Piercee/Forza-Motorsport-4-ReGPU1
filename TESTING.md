@@ -85,12 +85,10 @@ The keyboard only works while the game window has focus.
   "XBOX 360 (Vertical Format)" are in Media/DB/gamedb.slt. Changing the length needs the LSB2
   offsets rebuilt. The car name "#5 XBOX 360 911 GT3-RSR" is a livery name, so decide whether
   it changes.
-- Not traced yet: Laguna Seca kerbs show a smeared red line instead of the pattern, race dirt
-  cuts across the car body, the Hire Driver text overflows after a few selections, a blue stripe
-  appears on tyres at random, a faint occlusion ghost sits above the car model, and Tsukuba
-  variant 2 has the wrong skybox colours. Use F12 on each, and see the shader translation
-  failures in out/play.log (X3504 array index out of bounds, and "invalid access of unbound
-  variable" in a pixel shader) as a first lead for the tyre, dirt and kerb artefacts.
+- Not traced yet: race dirt cuts across the car body (streaks along the bonnet), the Hire
+  Driver text overflows after a few selections, a blue stripe appears on tyres at random, and a
+  soft glow sits above bright car roofs (the bloom). Use F12 on each. The "not translated"
+  shaders in out/play.log are never drawn (no "draw dropped" lines), so they are not a lead.
 
 ## Capturing a rendering bug (F12)
 
