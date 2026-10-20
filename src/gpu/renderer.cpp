@@ -119,8 +119,29 @@ struct Upscale
     uint32_t constantsFrame = 0;
 } g_upscale;
 
-float ScaleY() { return float(OutputHeight()) / float(kHeight) * g_sceneScale; }
-float ScaleWide() { return float(OutputWidth()) / float(kWidth) * g_sceneScale; }
+// A pass taller than the screen (the paint editor's 1024x1024 livery target) is scaled as a whole
+// by kHeight / its height so it fits the surface, and the vertex shader divides by its height.
+// It is found by its window scissor (WindowScissor) and recognised by its surface info.
+uint32_t g_tallInfo = 0, g_tallHeight = 0;
+std::atomic<bool> g_tallSeen{ false }; // FM2_CAPTURE_TALL: a tall pass was drawn
+// A surface wider than the screen (the paint editor's 2048x2048 livery composite, drawn in 256-row
+// tiles) is a square pass of its pitch less the tile padding (2080 -> 2048, 1040 -> 1024).
+uint32_t BigPassSize()
+{
+    const uint32_t pitch = gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF;
+    static const bool off = getenv("FM2_NO_BIG_PASS") != nullptr;
+    return !off && pitch > kWidth ? std::min<uint32_t>(2048, pitch * 64 / 65) : 0;
+}
+uint32_t PassWidth() { const uint32_t big = BigPassSize(); return big ? big : kWidth; }
+uint32_t PassHeight()
+{
+    if (const uint32_t big = BigPassSize())
+        return big;
+    return g_tallHeight && gpureg::Get(0x2000 /* RB_SURFACE_INFO */) == g_tallInfo ? g_tallHeight : kHeight;
+}
+float PassScale() { return std::min(float(kWidth) / float(PassWidth()), float(kHeight) / float(PassHeight())); }
+float ScaleY() { return float(OutputHeight()) / float(kHeight) * g_sceneScale * PassScale(); }
+float ScaleWide() { return float(OutputWidth()) / float(kWidth) * g_sceneScale * PassScale(); }
 bool WidePass() { return (gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF) == kWidth; }
 float ScaleX() { return WidePass() ? ScaleWide() : ScaleY(); }
 LONG HostX(LONG v) { return LONG(std::lround(double(v) * ScaleX())); }
@@ -2825,7 +2846,9 @@ const ResolvedTexture* ResolvedFor(const TextureFetch& fetch)
     if (name && (strncmp(name, "DXT", 3) == 0 || strncmp(name, "DXN", 3) == 0 || strncmp(name, "CTX", 3) == 0))
         return nullptr;
     auto it = g_r.resolved.find(fetch.Address() & 0x1FFFFFFF);
-    return it == g_r.resolved.end() ? nullptr : &it->second;
+    if (it == g_r.resolved.end())
+        return nullptr;
+    return &it->second;
 }
 
 // Decodes (if changed) and uploads a texture; returns its resource.
@@ -3373,7 +3396,28 @@ D3D12_RECT WindowScissor()
     {
         x0 -= wx; x1 -= wx; y0 -= wy; y1 -= wy; // back to screen space
     }
-    return { std::clamp<LONG>(x0, 0, kWidth), std::clamp<LONG>(y0, 0, kHeight), std::clamp<LONG>(x1, 0, kWidth), std::clamp<LONG>(y1, 0, kHeight) };
+    // Taller than the screen on a pass narrower than it: a tall render target (see PassHeight).
+    const uint32_t surfaceInfo = gpureg::Get(0x2000 /* RB_SURFACE_INFO */);
+    static const bool noTall = getenv("FM2_NO_TALL_PASS") != nullptr;
+    if (!noTall && y1 > int32_t(kHeight) && y1 <= 2048 && (surfaceInfo & 0x3FFF) < kWidth)
+    {
+        if (g_tallInfo != surfaceInfo || g_tallHeight != uint32_t(y1))
+            Log("tall pass: scissor y %d..%d x %d..%d window offset %d,%d vertexOffset %d surface %08X", y0, y1, x0, x1, wx, wy, int(vertexOffset), surfaceInfo);
+        g_tallInfo = surfaceInfo;
+        g_tallHeight = uint32_t(y1);
+        // FM2_CAPTURE_TALL=1: trace this very frame from here on (its dump is taken at the swap).
+        static const bool captureTall = getenv("FM2_CAPTURE_TALL") != nullptr;
+        static bool traced = false;
+        if (captureTall && !traced)
+        {
+            traced = true;
+            g_hotkeyFrame = g_r.frame + 1;
+            g_tallSeen = true;
+        }
+    }
+    const LONG maxY = LONG(PassHeight());
+    const LONG maxX = LONG(PassWidth());
+    return { std::clamp<LONG>(x0, 0, maxX), std::clamp<LONG>(y0, 0, maxY), std::clamp<LONG>(x1, 0, maxX), std::clamp<LONG>(y1, 0, maxY) };
 }
 
 void TransitionColor(D3D12_RESOURCE_STATES to)
@@ -4158,8 +4202,12 @@ void Resolve()
         const uint32_t pitchReg = gpureg::Get(RB_COPY_DEST_PITCH);
         const uint32_t pitch = pitchReg & 0x3FFF;
         const uint32_t base = ((gpureg::Get(RB_COPY_DEST_BASE) & 0x1FFFFFFF) - uint32_t(rect.top) * pitch * 4) & 0x1FFFFFFF;
-        const uint32_t width = std::clamp<uint32_t>(pitch, 1, kWidth);
-        const uint32_t height = std::clamp<uint32_t>(((pitchReg >> 16) & 0x3FFF) + uint32_t(rect.top), 1, kHeight);
+        const uint32_t width = std::clamp<uint32_t>(pitch, 1, std::max<uint32_t>(kWidth, BigPassSize()));
+        // Taller than the screen is possible: the paint editor's 1024x1024 livery target is
+        // resolved 720 rows at a time and sampled as 1024 rows. The texture keeps all its rows
+        // (clamped to kHeight it was stretched 1.4x vertically when sampled).
+        constexpr uint32_t kMaxResolveHeight = 2048;
+        const uint32_t height = std::clamp<uint32_t>(((pitchReg >> 16) & 0x3FFF) + uint32_t(rect.top), 1, kMaxResolveHeight);
         const uint32_t info = gpureg::Get(RB_COPY_DEST_INFO);
         const bool depth = sourceSelect == 4;
         // Destination: 8888 stays 8-bit (clamped, as the hardware does); other
@@ -4207,7 +4255,7 @@ void Resolve()
     const uint32_t surfacePitch = gpureg::Get(RB_SURFACE_INFO) & 0x3FFF;
     static const bool noClearExtend = getenv("FM2_NO_CLEAR_EXTEND") != nullptr;
     if (!noClearExtend && surfacePitch && uint32_t(rect.right - rect.left) >= std::min<uint32_t>(surfacePitch, kWidth) && rect.left == 0)
-        clearRect.bottom = kHeight;
+        clearRect.bottom = PassHeight();
     if ((control >> 8) & 1) // colour clear (ARGB)
     {
         const uint32_t c = gpureg::Get(RB_COLOR_CLEAR);
@@ -5180,7 +5228,7 @@ void RendererTrackTile(RendererTile& tile)
     const D3D12_RECT scissor = WindowScissor();
     const uint32_t offsetReg = gpureg::Get(PA_SC_WINDOW_OFFSET);
     const int32_t wy = ((gpureg::Get(PA_SU_SC_MODE_CNTL) >> 16) & 1) ? int32_t((offsetReg >> 16) << 17) >> 17 : 0;
-    const bool full = scissor.left <= 0 && scissor.top <= 0 && scissor.right >= LONG(kWidth) && scissor.bottom >= LONG(kHeight);
+    const bool full = scissor.left <= 0 && scissor.top <= 0 && scissor.right >= LONG(PassWidth()) && scissor.bottom >= LONG(PassHeight());
     if (!full)
     {
         tile.originY = -wy;
@@ -5649,8 +5697,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         vc->vte[2] = dmaBase & 0x1FFFFFFF & ~(is32 ? 3u : 1u);
         vc->vte[3] = gpureg::Get(VGT_INDX_OFFSET);
     }
-    vc->info[2] = kWidth;
-    vc->info[3] = kHeight;
+    vc->info[2] = PassWidth();
+    vc->info[3] = PassHeight();
     // Point sizes are 12.4 fixed-point radii.
     const uint32_t pointSize = gpureg::Get(PA_SU_POINT_SIZE), pointMinMax = gpureg::Get(PA_SU_POINT_MINMAX);
     vc->point[0] = float(pointSize >> 16) / 8.0f;
@@ -5783,7 +5831,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     {
         const uint32_t offsetReg = gpureg::Get(PA_SC_WINDOW_OFFSET);
         const int32_t wy = ((gpureg::Get(PA_SU_SC_MODE_CNTL) >> 16) & 1) ? int32_t((offsetReg >> 16) << 17) >> 17 : 0;
-        const bool full = scissor.left <= 0 && scissor.top <= 0 && scissor.right >= LONG(kWidth) && scissor.bottom >= LONG(kHeight);
+        const bool full = scissor.left <= 0 && scissor.top <= 0 && scissor.right >= LONG(PassWidth()) && scissor.bottom >= LONG(PassHeight());
         if (!full)
         {
             g_tile.originY = -wy;
@@ -5798,7 +5846,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             scissor.bottom = std::min(scissor.bottom, g_tile.rect.bottom);
         }
     }
-    const D3D12_VIEWPORT vp{ 0, shiftY * ScaleY(), float(kWidth) * ScaleX(), float(kHeight) * ScaleY(), 0, 1 };
+    const D3D12_VIEWPORT vp{ 0, shiftY * ScaleY(), float(PassWidth()) * ScaleX(), float(PassHeight()) * ScaleY(), 0, 1 };
     if (scissor.right <= scissor.left || scissor.bottom <= scissor.top)
     {
         TraceSkip("empty scissor", initiator);
@@ -6416,6 +6464,17 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
             Log("capture: F12 pressed, tracing frame %llu", (unsigned long long)dumpFrame);
         }
         wasDown = down;
+    }
+    // FM2_CAPTURE_TALL=1: the same capture as F12, once a pass taller than the screen was drawn.
+    {
+        static const bool captureTall = getenv("FM2_CAPTURE_TALL") != nullptr;
+        static bool capturedTall = false;
+        if (captureTall && !capturedTall && g_tallSeen)
+        {
+            capturedTall = true;
+            dumpFrame = g_r.frame + 1; // the frame the tall pass was drawn in (already being traced)
+            Log("capture: tall pass seen, dumping frame %llu", (unsigned long long)dumpFrame);
+        }
     }
     // FM2_CAPTURE_AT=<seconds>: the same capture as F12, that long after the start (for replays).
     {
