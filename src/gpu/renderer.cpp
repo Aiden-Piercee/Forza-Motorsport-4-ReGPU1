@@ -5527,6 +5527,16 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     if (!pso)
     {
+        // A shader that failed to translate or compile: the draw is lost (logged once per pair).
+        if (vs.state.load() == CompiledShader::Failed || ps.state.load() == CompiledShader::Failed)
+        {
+            static std::mutex failedMutex;
+            static std::set<std::pair<uint64_t, uint64_t>> failedSeen;
+            std::lock_guard failedLock(failedMutex);
+            if (failedSeen.insert({ vs.hash, ps.hash }).second)
+                Log("renderer: draw dropped, vs %016llx%s ps %016llx%s", (unsigned long long)vs.hash, vs.state.load() == CompiledShader::Failed ? " (failed)" : "",
+                    (unsigned long long)ps.hash, ps.state.load() == CompiledShader::Failed ? " (failed)" : "");
+        }
         TraceSkip("pipeline", initiator);
         g_skippedPipeline++;
         return;
@@ -5825,13 +5835,17 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                     swizzle ^= (sel ^ (2 - sel)) << (3 * c);
             }
         pc->tinfo[slot][3] = (cube ? 3 : 1) | (onGpu ? (1u << 31) | (swizzle << 8) : 0);
-        // Clamp X (dword 0 bits 10-12): 0 wrap, else clamp. Filter: dword 3 bits 19-20 (mag): 0 point.
-        const bool clamp = ((fetch.dwords[0] >> 10) & 7) != 0;
+        // Clamp X and Y (dword 0 bits 10-12, 13-15): 0 wrap, else clamp. Filter: dword 3 bits
+        // 19-20 (mag): 0 point. With only one axis clamped (kerbs: clamped across, repeating
+        // along) the wrapping sampler is used and the shader clamps that axis (bits 18, 19).
+        const uint32_t clampX = (fetch.dwords[0] >> 10) & 7, clampY = (fetch.dwords[0] >> 13) & 7;
+        const bool clamp = clampX != 0 && clampY != 0;
         const bool point = ((fetch.dwords[3] >> 19) & 3) == 0;
         pc->tinfo[slot][0] = (point ? (clamp ? 2 : 3) : (clamp ? 1 : 0)) | ((uint32_t(fetch.ExpAdjust()) & 0x3F) << 8);
+        if (!clamp)
+            pc->tinfo[slot][0] |= (clampX ? 1u << 18 : 0u) | (clampY ? 1u << 19 : 0u);
         // Clamp to border on both axes (modes 6, 7): the shader returns the border colour
         // outside the image (dword 5 bits 0-1: 1 white, else black).
-        const uint32_t clampX = (fetch.dwords[0] >> 10) & 7, clampY = (fetch.dwords[0] >> 13) & 7;
         if (clampX >= 6 && clampY >= 6)
             pc->tinfo[slot][0] |= (1u << 16) | ((fetch.dwords[5] & 3) == 1 ? 1u << 17 : 0u);
         pc->tbias[slot][0] = fetch.LodBias();
