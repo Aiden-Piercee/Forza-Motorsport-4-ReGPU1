@@ -20,7 +20,7 @@ namespace
 {
 enum : int
 {
-    kProfile = 100, kResolution, kAspect, kDisplay, kVsync, kMaxFps, kMsaa, kEnhance, kPlay, kQuit
+    kProfile = 100, kResolution, kAspect, kDisplay, kVsync, kMaxFps, kMsaa, kEnhance, kSkipIntro, kPlay, kQuit
 };
 
 const std::pair<uint32_t, uint32_t> kAspects[] = { { 0, 0 }, { 16, 9 }, { 21, 9 }, { 32, 9 } };
@@ -32,7 +32,7 @@ const wchar_t* kMsaaNames[] = { L"Off", L"2x MSAA", L"4x MSAA", L"8x MSAA" };
 struct State
 {
     HWND window = nullptr;
-    HWND profile = nullptr, resolution = nullptr, aspect = nullptr, display = nullptr, vsync = nullptr, maxFps = nullptr, msaa = nullptr, enhance = nullptr, updateLabel = nullptr;
+    HWND profile = nullptr, resolution = nullptr, aspect = nullptr, display = nullptr, vsync = nullptr, maxFps = nullptr, msaa = nullptr, enhance = nullptr, skipIntro = nullptr, updateLabel = nullptr;
     std::vector<std::pair<uint32_t, uint32_t>> resolutions;
     bool play = false, done = false;
 } g_state;
@@ -86,6 +86,7 @@ void Apply()
     s.fullscreen = SendMessageW(g_state.display, CB_GETCURSEL, 0, 0) == 1;
     s.vsync = SendMessageW(g_state.vsync, BM_GETCHECK, 0, 0) == BST_CHECKED;
     s.enhance = SendMessageW(g_state.enhance, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    s.skipIntro = SendMessageW(g_state.skipIntro, BM_GETCHECK, 0, 0) == BST_CHECKED;
     const LRESULT m = SendMessageW(g_state.msaa, CB_GETCURSEL, 0, 0);
     if (m >= 0 && size_t(m) < std::size(kMsaaSamples))
         s.msaa = kMsaaSamples[size_t(m)];
@@ -147,7 +148,7 @@ bool RunLauncher()
     wc.lpszClassName = L"fm2launcher";
     wc.hIcon = HICON(LoadImageW(wc.hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR));
     RegisterClassW(&wc);
-    RECT r{ 0, 0, S(380), S(380) };
+    RECT r{ 0, 0, S(380), S(414) };
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     AdjustWindowRect(&r, style, FALSE);
     const int ww = r.right - r.left, wh = r.bottom - r.top;
@@ -222,6 +223,9 @@ bool RunLauncher()
 
     g_state.enhance = Control(w, L"BUTTON", L"Enhanced lighting (experimental)", BS_AUTOCHECKBOX, lx, y, 320, 26, kEnhance, font);
     SendMessageW(g_state.enhance, BM_SETCHECK, s.enhance ? BST_CHECKED : BST_UNCHECKED, 0);
+    y += 34;
+    g_state.skipIntro = Control(w, L"BUTTON", L"Skip intro videos", BS_AUTOCHECKBOX, lx, y, 320, 26, kSkipIntro, font);
+    SendMessageW(g_state.skipIntro, BM_SETCHECK, s.skipIntro ? BST_CHECKED : BST_UNCHECKED, 0);
     y += 40;
     g_state.updateLabel = Label(w, L"", lx, y + 44, font);
     Control(w, L"BUTTON", L"Play", BS_DEFPUSHBUTTON, cx, y, 105, 32, kPlay, font);

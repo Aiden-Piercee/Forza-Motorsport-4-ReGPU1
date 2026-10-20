@@ -66,6 +66,8 @@ void Load()
             g_settings.maxFps = uint32_t(atoi(value.c_str()));
         else if (key == "enhance")
             g_settings.enhance = value == "1";
+        else if (key == "skip_intro")
+            g_settings.skipIntro = value == "1";
         else if (key == "msaa")
             g_settings.msaa = uint32_t(atoi(value.c_str()));
         else if (key == "upscaler")
@@ -102,6 +104,8 @@ void Load()
         g_settings.fullscreen = atoi(v) != 0;
     if (const char* v = getenv("FM2_ENHANCE"))
         g_settings.enhance = atoi(v) != 0;
+    if (const char* v = getenv("FM2_SKIP_INTRO"))
+        g_settings.skipIntro = atoi(v) != 0;
     if (const char* v = getenv("FM2_MSAA"))
         g_settings.msaa = uint32_t(atoi(v));
     g_settings.msaa = g_settings.msaa >= 8 ? 8 : g_settings.msaa >= 4 ? 4 : g_settings.msaa >= 2 ? 2 : 1;
@@ -162,6 +166,7 @@ void SaveSettings()
     out << "vsync=" << (s.vsync ? 1 : 0) << "\n";
     out << "max_fps=" << s.maxFps << "\n";
     out << "enhance=" << (s.enhance ? 1 : 0) << "\n";
+    out << "skip_intro=" << (s.skipIntro ? 1 : 0) << "\n";
     out << "msaa=" << s.msaa << "\n";
     out << "upscaler=" << UpscalerName(s.upscaler) << "\n";
     out << "upscale_quality=" << s.quality << "\n";

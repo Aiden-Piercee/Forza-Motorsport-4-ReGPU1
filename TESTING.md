@@ -71,10 +71,10 @@ The keyboard only works while the game window has focus.
 - Ultrawide (a resolution or aspect ratio wider than 16:9) is experimental: some objects at the
   sides of the screen still pop in late, and the HUD stays in the centre 16:9 area.
 - The logo on the loading screen still looks wrong (not yet described or traced).
-- The intro videos (Turn 10, Microsoft, Dolby, Forza: about 90 seconds) cannot be skipped by a
-  button, and a launcher/FM2_SKIP_INTRO option does not exist yet (the splash code is in the
-  executable; see the notes in the project memory). Input recordings made before the clock fix
-  start about 90 seconds too early.
+- The intro (legal text and the Turn 10, Microsoft, Dolby and Forza videos: about 107 seconds)
+  cannot be skipped by a button. Tick "Skip intro videos" in the launcher (or set
+  FM2_SKIP_INTRO=1) to go straight to the title screen. Input recordings made before the clock
+  fix start about 90 seconds too early.
 - Photo Mode shows a black screen. Probably the same cause as the garage thumbnails below: it
   reads a render target back through memory. FM2_RESOLVE_WRITEBACK handles small ones; a
   full-screen readback would need an on-demand path (the capture tools in out/capture and
