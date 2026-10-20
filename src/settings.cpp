@@ -64,6 +64,8 @@ void Load()
             g_settings.vsync = value == "1";
         else if (key == "max_fps")
             g_settings.maxFps = uint32_t(atoi(value.c_str()));
+        else if (key == "msaa")
+            g_settings.msaa = uint32_t(atoi(value.c_str()));
         else if (key == "upscaler")
             g_settings.upscaler = ParseUpscaler(value);
         else if (key == "upscale_quality")
@@ -96,6 +98,9 @@ void Load()
     g_settings.sharpness = std::clamp(g_settings.sharpness, 0.0f, 1.0f);
     if (const char* v = getenv("FM2_FULLSCREEN"))
         g_settings.fullscreen = atoi(v) != 0;
+    if (const char* v = getenv("FM2_MSAA"))
+        g_settings.msaa = uint32_t(atoi(v));
+    g_settings.msaa = g_settings.msaa >= 8 ? 8 : g_settings.msaa >= 4 ? 4 : g_settings.msaa >= 2 ? 2 : 1;
     g_settings.width = std::clamp<uint32_t>(g_settings.width, 640, 15360);
     g_settings.height = std::clamp<uint32_t>(g_settings.height, 360, 8640);
     g_settings.maxFps = std::clamp<uint32_t>(g_settings.maxFps ? g_settings.maxFps : 60, 30, 360);
@@ -152,6 +157,7 @@ void SaveSettings()
     out << "fullscreen=" << (s.fullscreen ? 1 : 0) << "\n";
     out << "vsync=" << (s.vsync ? 1 : 0) << "\n";
     out << "max_fps=" << s.maxFps << "\n";
+    out << "msaa=" << s.msaa << "\n";
     out << "upscaler=" << UpscalerName(s.upscaler) << "\n";
     out << "upscale_quality=" << s.quality << "\n";
     out << "sharpness=" << s.sharpness << "\n";

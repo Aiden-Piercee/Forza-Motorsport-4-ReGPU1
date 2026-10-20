@@ -151,6 +151,9 @@ constexpr UINT kBindlessBase = kDescriptorsPerFrame * 3;
 // The EDRAM colour target: half floats hold the title's HDR (7e3) range.
 constexpr DXGI_FORMAT kColorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 constexpr UINT kMaxSurfaces = 64; // EDRAM bases with host surfaces
+// Samples per pixel of the scene surfaces (anti-aliasing, Settings::msaa). The blits that
+// read them use multisampled shaders when this is above 1.
+uint32_t g_msaa = 1;
 constexpr uint32_t RB_SURFACE_INFO = 0x2000, RB_COLOR_INFO = 0x2001, RB_DEPTH_INFO = 0x2002;
 constexpr uint32_t kDirectFetchBytes = 64 * 1024;
 
@@ -314,6 +317,7 @@ struct Renderer
     ComPtr<ID3D12RootSignature> motionRootSignature; // root signature + b2 (motion-vector pipelines)
     ComPtr<ID3D12PipelineState> depthBlit;                // depth buffer -> R32_FLOAT
     ComPtr<ID3D12PipelineState> colorBlit8, colorBlit16;  // colour -> 8888 / RGBA16F, scaled
+    ComPtr<ID3D12PipelineState> depthBlitMs, colorBlitMs8, colorBlitMs16; // the same from multisampled surfaces
     // EDRAM surfaces: one host colour and one host depth target per EDRAM base
     // (RB_COLOR_INFO / RB_DEPTH_INFO bits 0-11), so passes that the title
     // places at different EDRAM offsets do not overwrite each other.
@@ -721,6 +725,20 @@ ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RES
 void InitDepthBlit()
 {
     auto* d = g_r.device;
+    // Anti-aliasing: the highest sample count the setting asks for that the device supports
+    // for both the colour and depth formats (1 when none).
+    g_msaa = 1;
+    for (uint32_t want = GetSettings().msaa; want > 1; want /= 2)
+    {
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS colour{ kColorFormat, want }, depth{ DXGI_FORMAT_D32_FLOAT_S8X24_UINT, want };
+        if (SUCCEEDED(d->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &colour, sizeof colour)) && colour.NumQualityLevels &&
+            SUCCEEDED(d->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &depth, sizeof depth)) && depth.NumQualityLevels)
+        {
+            g_msaa = want;
+            break;
+        }
+    }
+    Log("renderer: anti-aliasing %ux (setting %u)", g_msaa, GetSettings().msaa);
     D3D12_DESCRIPTOR_RANGE range{};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     range.NumDescriptors = 1;
@@ -786,6 +804,45 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
     Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.colorBlit8)), "CreateGraphicsPipelineState(colour blit 8)");
     pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
     Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.colorBlit16)), "CreateGraphicsPipelineState(colour blit 16)");
+    if (g_msaa > 1)
+    {
+        // The same passes reading a multisampled surface: depth takes sample 0, colour averages all samples.
+        const std::string msSource = "#define SAMPLES " + std::to_string(g_msaa) + R"(
+Texture2DMS<float, SAMPLES> depthMs : register(t0);
+Texture2DMS<float4, SAMPLES> colorMs : register(t0);
+cbuffer Blit : register(b0) { float scale; uint swapRB; };
+float4 vs(uint id : SV_VertexID) : SV_Position
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float ps(float4 pos : SV_Position) : SV_Target
+{
+    return depthMs.Load(int2(pos.xy), 0);
+}
+float4 psColor(float4 pos : SV_Position) : SV_Target
+{
+    float4 c = 0;
+    [unroll] for (int i = 0; i < SAMPLES; i++)
+        c += colorMs.Load(int2(pos.xy), i);
+    c = c / SAMPLES * scale;
+    return swapRB ? c.bgra : c;
+}
+)";
+        ComPtr<ID3DBlob> msVs, msPs, msColor;
+        Check(D3DCompile(msSource.data(), msSource.size(), nullptr, nullptr, nullptr, "vs", "vs_5_0", 0, 0, &msVs, &error), "D3DCompile(blit ms vs)");
+        Check(D3DCompile(msSource.data(), msSource.size(), nullptr, nullptr, nullptr, "ps", "ps_5_0", 0, 0, &msPs, &error), "D3DCompile(blit ms depth)");
+        Check(D3DCompile(msSource.data(), msSource.size(), nullptr, nullptr, nullptr, "psColor", "ps_5_0", 0, 0, &msColor, &error), "D3DCompile(blit ms colour)");
+        pd.VS = { msVs->GetBufferPointer(), msVs->GetBufferSize() };
+        pd.PS = { msPs->GetBufferPointer(), msPs->GetBufferSize() };
+        pd.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
+        Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.depthBlitMs)), "CreateGraphicsPipelineState(depth blit ms)");
+        pd.PS = { msColor->GetBufferPointer(), msColor->GetBufferSize() };
+        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.colorBlitMs8)), "CreateGraphicsPipelineState(colour blit ms 8)");
+        pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        Check(d->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&g_r.colorBlitMs16)), "CreateGraphicsPipelineState(colour blit ms 16)");
+    }
 }
 
 void InitPipelineLibrary(ID3D12Device* device);
@@ -982,7 +1039,7 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
     td.Height = OutputHeight();
     td.DepthOrArraySize = 1;
     td.MipLevels = 1;
-    td.SampleDesc.Count = 1;
+    td.SampleDesc.Count = g_msaa;
     D3D12_CLEAR_VALUE cv{};
     const UINT index = UINT(map.size() - 1);
     if (depth)
@@ -999,7 +1056,7 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
         s.view.ptr += SIZE_T(index) * g_r.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc{};
         dsvDesc.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
-        dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        dsvDesc.ViewDimension = g_msaa > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
         C().list->CreateDepthStencilView(g_r.device, s.resource.Get(), dsvDesc, s.view); // in order with the recorded commands
     }
     else
@@ -2390,7 +2447,7 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = kColorFormat;
     pd.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
-    pd.SampleDesc.Count = 1;
+    pd.SampleDesc.Count = g_msaa;
     const bool motion = key.flags & 4; // motion-vector variants: a second target for the motion
     if (motion)
     {
@@ -3417,7 +3474,7 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     const UINT slot = f.descriptorBase + f.descriptorsUsed++;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format = depth ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : kColorFormat;
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.ViewDimension = g_msaa > 1 ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
     g_r.device->CreateShaderResourceView(depth ? C().depth.Get() : C().color.Get(), &srv, Cpu(g_r.srvHeap.Get(), slot, g_r.srvStride));
@@ -3442,8 +3499,10 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
         TransitionColor(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     C().list->ResourceBarrier(barriers, b);
 
-    ID3D12PipelineState* pso = depth ? g_r.depthBlit.Get()
-        : format == DXGI_FORMAT_R8G8B8A8_UNORM ? g_r.colorBlit8.Get() : g_r.colorBlit16.Get();
+    const bool ms = g_msaa > 1;
+    ID3D12PipelineState* pso = depth ? (ms ? g_r.depthBlitMs.Get() : g_r.depthBlit.Get())
+        : format == DXGI_FORMAT_R8G8B8A8_UNORM ? (ms ? g_r.colorBlitMs8.Get() : g_r.colorBlit8.Get())
+        : (ms ? g_r.colorBlitMs16.Get() : g_r.colorBlit16.Get());
     C().list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     C().list->SetGraphicsRootSignature(g_r.blitRootSignature.Get());
     C().list->SetPipelineState(pso);
