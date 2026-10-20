@@ -78,6 +78,26 @@ void GammaMain(uint3 id : SV_DispatchThreadID)
     dst[id.xy] = float4(GammaCurve(c.r, p), GammaCurve(c.g, p), GammaCurve(c.b, p), c.a);
 }
 
+// Enhanced lighting (experimental): local contrast on the finished frame. rcasCon.x is the
+// strength (float bits). Each pixel is pushed away from the average of its four neighbours,
+// so shading steps, edges and highlights read more clearly.
+[numthreads(8, 8, 1)]
+void EnhanceMain(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= outSize.xy))
+        return;
+    const int2 p = int2(id.xy);
+    const int2 last = int2(outSize.xy) - 1;
+    const float strength = asfloat(rcasCon.x);
+    const float4 c = src.Load(int3(p, 0));
+    const float4 l = src.Load(int3(max(p.x - 1, 0), p.y, 0));
+    const float4 r = src.Load(int3(min(p.x + 1, last.x), p.y, 0));
+    const float4 u = src.Load(int3(p.x, max(p.y - 1, 0), 0));
+    const float4 d = src.Load(int3(p.x, min(p.y + 1, last.y), 0));
+    const float4 blur = (l + r + u + d) * 0.25;
+    dst[id.xy] = float4(saturate(c.rgb + strength * (c.rgb - blur.rgb)), c.a);
+}
+
 // 64 threads, each a 2x2 quad of a 16x16 tile (the layout FSR 1 is written for).
 [numthreads(64, 1, 1)]
 void EasuMain(uint3 lid : SV_GroupThreadID, uint3 gid : SV_GroupID)

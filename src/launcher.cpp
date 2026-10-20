@@ -19,7 +19,7 @@ namespace
 {
 enum : int
 {
-    kProfile = 100, kResolution, kAspect, kDisplay, kVsync, kMaxFps, kMsaa, kPlay, kQuit
+    kProfile = 100, kResolution, kAspect, kDisplay, kVsync, kMaxFps, kMsaa, kEnhance, kPlay, kQuit
 };
 
 const std::pair<uint32_t, uint32_t> kAspects[] = { { 0, 0 }, { 16, 9 }, { 21, 9 }, { 32, 9 } };
@@ -31,7 +31,7 @@ const wchar_t* kMsaaNames[] = { L"Off", L"2x MSAA", L"4x MSAA", L"8x MSAA" };
 struct State
 {
     HWND window = nullptr;
-    HWND profile = nullptr, resolution = nullptr, aspect = nullptr, display = nullptr, vsync = nullptr, maxFps = nullptr, msaa = nullptr;
+    HWND profile = nullptr, resolution = nullptr, aspect = nullptr, display = nullptr, vsync = nullptr, maxFps = nullptr, msaa = nullptr, enhance = nullptr;
     std::vector<std::pair<uint32_t, uint32_t>> resolutions;
     bool play = false, done = false;
 } g_state;
@@ -84,6 +84,7 @@ void Apply()
         std::tie(s.aspectW, s.aspectH) = kAspects[size_t(a)];
     s.fullscreen = SendMessageW(g_state.display, CB_GETCURSEL, 0, 0) == 1;
     s.vsync = SendMessageW(g_state.vsync, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    s.enhance = SendMessageW(g_state.enhance, BM_GETCHECK, 0, 0) == BST_CHECKED;
     const LRESULT m = SendMessageW(g_state.msaa, CB_GETCURSEL, 0, 0);
     if (m >= 0 && size_t(m) < std::size(kMsaaSamples))
         s.msaa = kMsaaSamples[size_t(m)];
@@ -215,6 +216,9 @@ bool RunLauncher()
         SendMessageW(g_state.msaa, CB_SETCURSEL, 0, 0);
     y += 40;
 
+    g_state.enhance = Control(w, L"BUTTON", L"Enhanced lighting (experimental)", BS_AUTOCHECKBOX, lx, y, 320, 26, kEnhance, font);
+    SendMessageW(g_state.enhance, BM_SETCHECK, s.enhance ? BST_CHECKED : BST_UNCHECKED, 0);
+    y += 40;
     Control(w, L"BUTTON", L"Play", BS_DEFPUSHBUTTON, cx, y, 105, 32, kPlay, font);
     Control(w, L"BUTTON", L"Quit", BS_PUSHBUTTON, cx + 115, y, 105, 32, kQuit, font);
 

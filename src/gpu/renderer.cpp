@@ -92,7 +92,7 @@ struct Upscale
 {
     bool tried = false, ready = false;
     ComPtr<ID3D12RootSignature> root;
-    ComPtr<ID3D12PipelineState> easu, rcas, depthCopy, gamma;
+    ComPtr<ID3D12PipelineState> easu, rcas, depthCopy, gamma, enhance;
     ComPtr<ID3D12Resource> dlaaOut; // DLAA output (scene size), copied back into the scene image
     ComPtr<ID3D12Resource> depth; // temporal: the scene's depth as R32 (render size, top left)
     ComPtr<ID3D12Resource> temp; // EASU output (RGBA16F)
@@ -3825,6 +3825,9 @@ bool InitUpscale()
     pd.CS = { kGammaMain, sizeof(kGammaMain) };
     if (FAILED(g_r.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_upscale.gamma))))
         return false;
+    pd.CS = { kEnhanceMain, sizeof(kEnhanceMain) };
+    if (FAILED(g_r.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_upscale.enhance))))
+        return false;
     g_upscale.ready = true;
     Log("upscale: FSR 1 ready (scene at %.0f%% of %ux%u)", GetSettings().SceneScale() * 100.0f, OutputWidth(), OutputHeight());
     return true;
@@ -3837,6 +3840,7 @@ bool InitUpscale()
 std::atomic<uint32_t> g_gammaTable[256];
 std::atomic<bool> g_gammaSet{ false };
 ComPtr<ID3D12Resource> g_gammaOut;
+ComPtr<ID3D12Resource> g_enhanceOut; // enhanced lighting output (Settings::enhance)
 
 // Returns the graded copy of `image` (in COPY_SOURCE state), or null to show it as is.
 ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image)
@@ -3902,6 +3906,73 @@ ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image)
     C().list->ResourceBarrier(1, &b);
     g_drawState.Invalidate(); // the compute pipeline replaced the draw's
     return g_gammaOut.Get();
+}
+
+// Enhanced lighting (Settings::enhance): the frame through the local-contrast pass. `image` is
+// in COPY_SOURCE and so is the result; returns null when the option is off.
+ID3D12Resource* EnhanceFrontBuffer(ID3D12Resource* image)
+{
+    if (!GetSettings().enhance || !image || !InitUpscale())
+        return nullptr;
+    const D3D12_RESOURCE_DESC desc = image->GetDesc();
+    FrameResources& f = Frame();
+    if (f.descriptorsUsed + 2 > kDescriptorsPerFrame)
+        return nullptr;
+    if (!g_enhanceOut || g_enhanceOut->GetDesc().Width != desc.Width || g_enhanceOut->GetDesc().Height != desc.Height)
+    {
+        D3D12_RESOURCE_DESC td = desc;
+        td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        RetireTexture(std::move(g_enhanceOut));
+        g_enhanceOut = CreateTexture(td, D3D12_RESOURCE_STATE_COPY_SOURCE, "enhance");
+    }
+    const UINT slots = f.descriptorBase + f.descriptorsUsed;
+    f.descriptorsUsed += 2;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    g_r.device->CreateShaderResourceView(image, &srv, Cpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g_r.device->CreateUnorderedAccessView(g_enhanceOut.Get(), nullptr, &uav, Cpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
+
+    D3D12_RESOURCE_BARRIER b[2]{};
+    for (auto& x : b)
+        x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[0].Transition.pResource = image;
+    b[0].Transition.Subresource = 0;
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b[1].Transition.pResource = g_enhanceOut.Get();
+    b[1].Transition.Subresource = 0;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    C().list->ResourceBarrier(2, b);
+
+    // The strength (0.35) rides in the rcasCon slot of the constants (index 16), as float bits.
+    const float strength = 0.35f;
+    uint32_t c[24] = {};
+    c[16] = std::bit_cast<uint32_t>(strength);
+    c[20] = uint32_t(desc.Width);
+    c[21] = desc.Height;
+    C().list->SetComputeRootSignature(g_upscale.root.Get());
+    C().list->SetComputeRoot32BitConstants(0, 24, c, 0);
+    C().list->SetPipelineState(g_upscale.enhance.Get());
+    C().list->SetComputeRootDescriptorTable(1, Gpu(g_r.srvHeap.Get(), slots, g_r.srvStride));
+    C().list->SetComputeRootDescriptorTable(2, Gpu(g_r.srvHeap.Get(), slots + 1, g_r.srvStride));
+    C().list->Dispatch(UINT((desc.Width + 7) / 8), (desc.Height + 7) / 8, 1);
+
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    C().list->ResourceBarrier(2, b);
+    g_drawState.Invalidate(); // the compute pipeline replaced the draw's
+    return g_enhanceOut.Get();
 }
 
 // Upscales the resolved image at `base` (rendered at the scene scale) to the output size in
@@ -6320,6 +6391,9 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         g_hold.image = it->second.resource;
     ID3D12Resource* overlay = fromResolve ? PrepareOverlay() : nullptr;
     ID3D12Resource* shown = graded ? graded : image;
+    if (fromResolve)
+        if (ID3D12Resource* enhanced = EnhanceFrontBuffer(shown))
+            shown = enhanced;
     const bool presenting = fromResolve && PresenterRecordCopy(C().list->Real(), shown, overlay, kOverlayW, kOverlayH);
     {
         const uint64_t traceFrame = TraceFrame();
