@@ -106,6 +106,7 @@ void CreateWindowAndDevice()
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.lpszClassName = L"fm2";
+    wc.hIcon = HICON(LoadImageW(wc.hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR));
     RegisterClassW(&wc);
     // The swap chain is the chosen resolution (the game's image is centred in it with black
     // bars when an aspect ratio is forced). Windowed: the client area starts at that size,

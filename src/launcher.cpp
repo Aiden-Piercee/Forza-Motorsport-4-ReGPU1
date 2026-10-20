@@ -143,6 +143,7 @@ bool RunLauncher()
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = HBRUSH(COLOR_BTNFACE + 1);
     wc.lpszClassName = L"fm2launcher";
+    wc.hIcon = HICON(LoadImageW(wc.hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR));
     RegisterClassW(&wc);
     RECT r{ 0, 0, S(380), S(380) };
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;

@@ -1,0 +1,3 @@
+// The application icon (assets/fm2.ico, built by tools/makeico.py from assets/icon.png):
+// the exe's icon in Explorer and the class icon of the launcher and game windows (id 1).
+1 ICON "../assets/fm2.ico"
