@@ -3071,6 +3071,7 @@ void CaptureTexture(const TextureFetch& fetch, uint32_t slot, bool cube, bool bo
         captureFrame = frame;
         seen.clear();
         std::filesystem::create_directories("out/capture/tex");
+        std::filesystem::remove_all("out/capture/mem");
         summary.close();
         summary.open("out/capture/textures.txt");
         summary << "frame " << frame << " (draw numbers are those of the 'draw #N' lines in out/play.log)\n";
@@ -3099,6 +3100,20 @@ void CaptureTexture(const TextureFetch& fetch, uint32_t slot, bool cube, bool bo
         snprintf(name, sizeof(name), "out/capture/tex/%08X_%s_%ux%u.png", fetch.Address(), TextureFormatName(fetch.Format()), fetch.Width(), fetch.Height());
         if (WritePng(name, fetch.Width(), fetch.Height(), rgba))
             image = name;
+    }
+    // The raw bytes of the base level as the game left them (out/capture/mem/), to look at a texture the
+    // decode shows as noise: wrong layout, or not written yet.
+    if (!cube && !resolved && fetch.Type() == 2)
+    {
+        const size_t bytes = std::min<size_t>(TextureSourceSize(fetch), 16u << 20);
+        if (bytes)
+        {
+            std::filesystem::create_directories("out/capture/mem");
+            char name[160];
+            snprintf(name, sizeof(name), "out/capture/mem/%08X_%s_%ux%u.bin", fetch.Address(), TextureFormatName(fetch.Format()), fetch.Width(), fetch.Height());
+            std::ofstream raw(name, std::ios::binary);
+            raw.write(reinterpret_cast<const char*>(GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address()))), std::streamsize(bytes));
+        }
     }
     char line[400];
     snprintf(line, sizeof(line), "%u t%u %08X %s %ux%u pitch %u %s sw%03X: %s %s%s\n", g_r.drawsThisFrame.load(), slot, fetch.Address(),
@@ -3956,6 +3971,9 @@ void UpscaleScene(uint32_t base)
     g_upscale.switchedThisFrame = true;
 }
 
+// Copies the render target resolved to `base` into guest memory, tiled, for the title to read.
+void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t info);
+
 void Resolve()
 {
     g_resolveEpoch++; // texture bindings may now map to a new resolve
@@ -3997,7 +4015,9 @@ void Resolve()
 
     const uint32_t sourceSelect = control & 7;
     const uint64_t traceFrame = TraceFrame();
-    if (traceFrame && g_r.frame + 1 == traceFrame)
+    // FM2_TRACE_RESOLVES=1: every resolve (not just those of the traced frame), with its time.
+    static const bool traceAllResolves = getenv("FM2_TRACE_RESOLVES") != nullptr;
+    if (traceAllResolves || (traceFrame && g_r.frame + 1 == traceFrame))
         Log("resolve: control %08X dest %08X pitch %08X info %08X rect %ld,%ld-%ld,%ld clear %08X (color info %08X depth info %08X surface %08X)", control,
             gpureg::Get(RB_COPY_DEST_BASE), gpureg::Get(RB_COPY_DEST_PITCH), gpureg::Get(RB_COPY_DEST_INFO), rect.left, rect.top, rect.right, rect.bottom,
             gpureg::Get(RB_COLOR_CLEAR), gpureg::Get(RB_COLOR_INFO), gpureg::Get(RB_DEPTH_INFO), gpureg::Get(RB_SURFACE_INFO));
@@ -4029,6 +4049,26 @@ void Resolve()
         if (g_scenePhase && !depth && width >= kWidth && rect.left == 0 && rect.right >= LONG(kWidth) && rect.bottom >= LONG(kHeight))
             UpscaleScene(base);
         g_r.resolved[base].swapped = swapRB;
+        // The title reads some resolved images back on the CPU (the garage thumbnail it renders, then
+        // compresses and saves): our resolves stay on the GPU, so for the sizes listed in
+        // FM2_RESOLVE_WRITEBACK ("WxH,WxH", default 256x128) the pixels are also written to memory.
+        static const std::vector<std::pair<uint32_t, uint32_t>> writeback = [] {
+            std::vector<std::pair<uint32_t, uint32_t>> v;
+            const char* e = getenv("FM2_RESOLVE_WRITEBACK");
+            for (const char* p = e ? e : "256x128"; p && *p;)
+            {
+                uint32_t w = 0, h = 0;
+                if (sscanf(p, "%ux%u", &w, &h) == 2)
+                    v.emplace_back(w, h);
+                p = strchr(p, ',');
+                if (p)
+                    p++;
+            }
+            return v;
+        }();
+        if (!depth && destFormat == 6 && rect.left == 0 && rect.top == 0 &&
+            std::find(writeback.begin(), writeback.end(), std::pair<uint32_t, uint32_t>(width, height)) != writeback.end())
+            WriteResolveToGuest(base, width, height, info);
     }
     // Clears after a tile's resolve prepare the EDRAM for the next tile, which
     // we draw lower on the same host surface: a full-width clear covers every
@@ -4814,6 +4854,85 @@ void SplitMainList()
     ListPrologue(g_r.recorder);
     g_drawState.Invalidate();
     SelectSurfaces(true);
+}
+
+// Waits until everything submitted to the queue so far has finished.
+void WaitForQueueIdle()
+{
+    const UINT64 value = g_r.nextFence++;
+    g_r.queue->Signal(g_r.fence.Get(), value);
+    if (g_r.fence->GetCompletedValue() < value)
+    {
+        g_r.fence->SetEventOnCompletion(value, g_r.fenceEvent);
+        WaitForSingleObject(g_r.fenceEvent, 2000);
+    }
+}
+
+void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t info)
+{
+    const auto it = g_r.resolved.find(base);
+    if (it == g_r.resolved.end() || !it->second.resource || it->second.format != DXGI_FORMAT_R8G8B8A8_UNORM || !width || !height)
+        return;
+    ResolvedTexture& r = it->second;
+    // Run what has been recorded (the resolve's copy included) and let the GPU finish it.
+    BeginFrameIfNeeded();
+    SplitMainList();
+    WaitForQueueIdle();
+    const UINT pitch = (r.hostWidth * 4 + 255) & ~255u;
+    ComPtr<ID3D12Resource> buffer = CreateBuffer(UINT64(pitch) * r.hostHeight, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12GraphicsCommandList* list = AcquireList();
+    D3D12_RESOURCE_BARRIER bar{};
+    bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bar.Transition.pResource = r.resource.Get();
+    bar.Transition.Subresource = 0;
+    bar.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list->ResourceBarrier(1, &bar);
+    D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+    dst.pResource = buffer.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, r.hostWidth, r.hostHeight, 1, pitch };
+    src.pResource = r.resource.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    std::swap(bar.Transition.StateBefore, bar.Transition.StateAfter);
+    list->ResourceBarrier(1, &bar);
+    list->Close();
+    ID3D12CommandList* lists[] = { list };
+    g_r.queue->ExecuteCommandLists(1, lists);
+    WaitForQueueIdle();
+    uint8_t* pixels = nullptr;
+    buffer->Map(0, nullptr, reinterpret_cast<void**>(&pixels));
+    if (!pixels)
+        return;
+    // The surface in memory: tiled, 32-texel aligned, one A8R8G8B8 word per pixel (red and blue
+    // exchanged when the copy has the swap bit; the title's fetch swizzle expects that), in the
+    // byte order the copy's endian field names (2: big-endian words, 0: little-endian).
+    const uint32_t endian = info & 7;
+    const bool swapRB = ((info >> 24) & 1) != 0;
+    const uint32_t pitchTexels = (width + 31) & ~31u, rows = (height + 31) & ~31u;
+    uint8_t* guest = GuestPtr<uint8_t>(GpuPhysToGuest(base));
+    for (uint32_t y = 0; y < height; y++)
+    {
+        const uint8_t* line = pixels + size_t(y * r.hostHeight / height) * pitch;
+        for (uint32_t x = 0; x < width; x++)
+        {
+            const uint8_t* px = line + size_t(x * r.hostWidth / width) * 4;
+            const uint32_t red = swapRB ? px[2] : px[0], green = px[1], blue = swapRB ? px[0] : px[2], alpha = px[3];
+            const uint32_t word = alpha << 24 | red << 16 | green << 8 | blue;
+            uint8_t* out = guest + TextureTiledOffset(x, y, pitchTexels, 2);
+            if (endian == 0)
+                memcpy(out, &word, 4); // little-endian
+            else
+            {
+                const uint32_t be = __builtin_bswap32(word);
+                memcpy(out, &be, 4);
+            }
+        }
+    }
+    (void)rows;
+    buffer->Unmap(0, nullptr);
+    Log("resolve: wrote %ux%u back to guest memory at %08X (endian %u, swap %d)", width, height, base, endian, int(swapRB));
 }
 
 struct Workers
@@ -6164,6 +6283,19 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
             Log("capture: F12 pressed, tracing frame %llu", (unsigned long long)dumpFrame);
         }
         wasDown = down;
+    }
+    // FM2_CAPTURE_AT=<seconds>: the same capture as F12, that long after the start (for replays).
+    {
+        static const double captureAt = getenv("FM2_CAPTURE_AT") ? atof(getenv("FM2_CAPTURE_AT")) : 0;
+        static const auto captureStart = std::chrono::steady_clock::now();
+        static bool captured = false;
+        if (captureAt > 0 && !captured && std::chrono::duration<double>(std::chrono::steady_clock::now() - captureStart).count() >= captureAt)
+        {
+            captured = true;
+            g_hotkeyFrame = g_r.frame + 2;
+            dumpFrame = g_r.frame + 2;
+            Log("capture: FM2_CAPTURE_AT reached, tracing frame %llu", (unsigned long long)dumpFrame);
+        }
     }
     ++g_r.frame;
     // FM2_DUMP_AT=<seconds>: dump the first resolved frame after that long (comparable

@@ -348,6 +348,8 @@ GUEST_EXPORT(NtReadFile)
     const uint32_t iosb = ctx.r7.u32, buffer = ctx.r8.u32, length = ctx.r9.u32, offsetPtr = ctx.r10.u32;
     if (!file || file->directory)
     {
+        Log("io: NtReadFile on %s handle %08X (length %u -> %08X, thread %u, lr %08llX)", file ? "a directory" : "an invalid", ctx.r3.u32, length, buffer,
+            CurrentGuestThreadId(), ctx.lr);
         Return(ctx, X_STATUS_INVALID_HANDLE);
         return;
     }
@@ -407,6 +409,14 @@ GUEST_EXPORT(NtWriteFile)
     ov.Offset = DWORD(offset);
     ov.OffsetHigh = DWORD(offset >> 32);
     DWORD written = 0;
+    // FM2_TRACE_WRITES=<text>: writes to files whose path contains it, with the writer's stack.
+    static const char* traceWrites = getenv("FM2_TRACE_WRITES");
+    if (traceWrites && strstr(file->path.string().c_str(), traceWrites))
+    {
+        std::string CurrentHostStack(int maxFrames);
+        Log("io: write %s offset %llu length %u from %08X (thread %u): %s", file->path.filename().string().c_str(), (unsigned long long)offset, length, buffer,
+            CurrentGuestThreadId(), CurrentHostStack(8).c_str());
+    }
     const BOOL ok = WriteFile(file->host, GuestPtr(buffer), length, &written, &ov);
     file->position = offset + written;
     const uint32_t status = ok ? X_STATUS_SUCCESS : X_STATUS_ACCESS_DENIED;

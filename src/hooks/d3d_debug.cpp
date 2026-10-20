@@ -110,6 +110,10 @@ void StartWatch()
             {
                 Log("watch %08X: %08X -> %08X", address, last, now);
                 last = now;
+                // FM2_WATCH_STACKS=1: where every thread is at that moment (the writer is one of them).
+                static int stacks = 0;
+                if (getenv("FM2_WATCH_STACKS") && stacks++ < 6)
+                    LogGuestThreads();
             }
             _mm_pause();
         }

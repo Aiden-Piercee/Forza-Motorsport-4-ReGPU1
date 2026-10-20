@@ -359,6 +359,12 @@ bool DecodeTexture(const TextureFetch& fetch, const uint8_t* source, std::vector
     return true;
 }
 
+uint32_t TextureTiledOffset(uint32_t x, uint32_t y, uint32_t pitchBlocks, uint32_t log2Bytes)
+{
+    const int32_t rowOffset = TiledOffset2DOuter(y, pitchBlocks, log2Bytes);
+    return uint32_t(TiledOffset2DInner(x, y, log2Bytes, rowOffset) >> log2Bytes) << log2Bytes;
+}
+
 size_t TextureSourceSize(const TextureFetch& fetch)
 {
     FormatInfo info;

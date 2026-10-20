@@ -48,5 +48,8 @@ bool TextureMipLevel(const TextureFetch& base, uint32_t level, TextureFetch& out
 // blocks); 0 for a format this does not know.
 size_t TextureSourceSize(const TextureFetch& fetch);
 
+// The byte offset of texel (x, y) in a tiled surface of pitchBlocks (a multiple of 32) texels per row.
+uint32_t TextureTiledOffset(uint32_t x, uint32_t y, uint32_t pitchBlocks, uint32_t log2Bytes);
+
 // Bytes between the faces of a cube texture (each face is a padded 2D slice).
 uint32_t TextureFaceStride(const TextureFetch& fetch);
