@@ -126,9 +126,31 @@ uint32_t g_tallInfo = 0, g_tallHeight = 0;
 std::atomic<bool> g_tallSeen{ false }; // FM2_CAPTURE_TALL: a tall pass was drawn
 // A surface wider than the screen (the paint editor's 2048x2048 livery composite, drawn in 256-row
 // tiles) is a square pass of its pitch less the tile padding (2080 -> 2048, 1040 -> 1024).
+// The MSAA layout each EDRAM surface is drawn in (its last draw that is not a texture-less
+// rectangle), by colour base and row width in samples: views of the same EDRAM with another
+// MSAA mode (clears) are mapped onto it. Samples per pixel: 1x 1x1, 2x 1x2, 4x 2x2.
+std::atomic<uint32_t> g_nativeMsaa[0x1000]; // key << 2 | MSAA mode
+uint32_t MsaaAcross(uint32_t msaa) { return msaa == 2 ? 2u : 1u; }
+uint32_t MsaaDown(uint32_t msaa) { return msaa ? 2u : 1u; }
+uint32_t LayoutKey(uint32_t surface)
+{
+    return (gpureg::Get(0x2001 /* RB_COLOR_INFO */) & 0xFFF) | (surface & 0x3FFF) * MsaaAcross((surface >> 16) & 3) << 12;
+}
+std::atomic<uint32_t>& NativeSlot(uint32_t key) { return g_nativeMsaa[(key ^ key >> 12) & 0xFFF]; }
+// The surface's MSAA layout when the current view is another one of an MSAA surface, else -1.
+int ForeignNativeMsaa()
+{
+    const uint32_t surface = gpureg::Get(0x2000 /* RB_SURFACE_INFO */), key = LayoutKey(surface);
+    const uint32_t native = NativeSlot(key).load(std::memory_order_relaxed);
+    return native >> 2 == key && (native & 3) != ((surface >> 16) & 3) && (native & 3) != 0 ? int(native & 3) : -1;
+}
+
 uint32_t BigPassSize()
 {
-    const uint32_t pitch = gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF;
+    uint32_t pitch = gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF;
+    // A view of a big MSAA surface in another MSAA mode belongs to the same pass.
+    if (const int native = ForeignNativeMsaa(); native >= 0)
+        pitch = pitch * MsaaAcross((gpureg::Get(0x2000) >> 16) & 3) / MsaaAcross(uint32_t(native));
     static const bool off = getenv("FM2_NO_BIG_PASS") != nullptr;
     return !off && pitch > kWidth ? std::min<uint32_t>(2048, pitch * 64 / 65) : 0;
 }
@@ -2434,10 +2456,10 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     pd.DepthStencilState.DepthEnable = (depth >> 1) & 1;
     pd.DepthStencilState.DepthWriteMask = ((depth >> 2) & 1) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
     pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC(((depth >> 4) & 7) + 1);
-    // Stencil: Xenos ops 0 keep, 1 zero, 2 replace, 3 incr wrap, 4 decr wrap, 5 invert,
-    // 6 incr clamp, 7 decr clamp. Back faces use their own ops when enabled.
-    static const D3D12_STENCIL_OP kOps[8] = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_ZERO, D3D12_STENCIL_OP_REPLACE, D3D12_STENCIL_OP_INCR,
-        D3D12_STENCIL_OP_DECR, D3D12_STENCIL_OP_INVERT, D3D12_STENCIL_OP_INCR_SAT, D3D12_STENCIL_OP_DECR_SAT };
+    // Stencil: Xenos ops (the D3D9 order) 0 keep, 1 zero, 2 replace, 3 incr clamp, 4 decr clamp,
+    // 5 invert, 6 incr wrap, 7 decr wrap. Back faces use their own ops when enabled.
+    static const D3D12_STENCIL_OP kOps[8] = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_ZERO, D3D12_STENCIL_OP_REPLACE, D3D12_STENCIL_OP_INCR_SAT,
+        D3D12_STENCIL_OP_DECR_SAT, D3D12_STENCIL_OP_INVERT, D3D12_STENCIL_OP_INCR, D3D12_STENCIL_OP_DECR };
     static const bool noStencil = getenv("FM2_NO_STENCIL") != nullptr;
     if ((depth & 1) && !noStencil)
     {
@@ -4192,9 +4214,9 @@ void Resolve()
     // FM2_TRACE_RESOLVES=1: every resolve (not just those of the traced frame), with its time.
     static const bool traceAllResolves = getenv("FM2_TRACE_RESOLVES") != nullptr;
     if (traceAllResolves || (traceFrame && g_r.frame + 1 == traceFrame))
-        Log("resolve: control %08X dest %08X pitch %08X info %08X rect %ld,%ld-%ld,%ld clear %08X (color info %08X depth info %08X surface %08X)", control,
+        Log("resolve: control %08X dest %08X pitch %08X info %08X rect %ld,%ld-%ld,%ld clear %08X depth clear %08X (color info %08X depth info %08X surface %08X)", control,
             gpureg::Get(RB_COPY_DEST_BASE), gpureg::Get(RB_COPY_DEST_PITCH), gpureg::Get(RB_COPY_DEST_INFO), rect.left, rect.top, rect.right, rect.bottom,
-            gpureg::Get(RB_COLOR_CLEAR), gpureg::Get(RB_COLOR_INFO), gpureg::Get(RB_DEPTH_INFO), gpureg::Get(RB_SURFACE_INFO));
+            gpureg::Get(RB_COLOR_CLEAR), gpureg::Get(RB_DEPTH_CLEAR), gpureg::Get(RB_COLOR_INFO), gpureg::Get(RB_DEPTH_INFO), gpureg::Get(RB_SURFACE_INFO));
     if (command != 3 && sourceSelect <= 4)
     {
         // Each tile resolves to the destination row it starts at; key the
@@ -5667,6 +5689,23 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             vc->voffset[3] = 2.0f;
         }
     }
+    // The same trick between two MSAA views (the paint editor clears its 2x livery composite
+    // through a 4x view, 1000 pixels of it plus a 48-pixel 2x strip): texture-less rectangles
+    // are scaled from their view's layout to the surface's (see g_nativeMsaa).
+    else if (!noMsaaScale)
+    {
+        const uint32_t surface = gpureg::Get(RB_SURFACE_INFO), msaa = (surface >> 16) & 3;
+        if ((initiator & 0x3F) != 8 || ps.info.usedTextureSlots || vs.info.usedTextureSlots)
+        {
+            const uint32_t key = LayoutKey(surface);
+            NativeSlot(key).store(key << 2 | msaa, std::memory_order_relaxed);
+        }
+        else if (const int native = ForeignNativeMsaa(); native >= 0)
+        {
+            vc->vscale[3] = float(MsaaAcross(msaa)) / float(MsaaAcross(uint32_t(native)));
+            vc->voffset[3] = float(MsaaDown(msaa)) / float(MsaaDown(uint32_t(native)));
+        }
+    }
     vc->voffset[0] = RegFloat(PA_CL_VPORT_XOFFSET);
     vc->voffset[1] = RegFloat(PA_CL_VPORT_YOFFSET);
     vc->voffset[2] = RegFloat(PA_CL_VPORT_ZOFFSET);
@@ -5927,6 +5966,20 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         ds.table3 = t3;
         C().list->SetGraphicsRootDescriptorTable(3, t3);
     }
+    // FM2_CAPTURE_COMPOSITE=<n>: trace (as F12) the n-th frame that draws into the 2048-wide
+    // surface (pitch field 0x820: the paint editor's livery composite), from its first such draw on.
+    if (static const int compositeN = getenv("FM2_CAPTURE_COMPOSITE") ? atoi(getenv("FM2_CAPTURE_COMPOSITE")) : 0;
+        compositeN && (gpureg::Get(RB_SURFACE_INFO) & 0x3FFF) == 0x820)
+    {
+        static uint64_t lastFrame = ~0ull;
+        static int seen = 0;
+        if (g_r.frame != lastFrame && ++seen == compositeN)
+        {
+            g_hotkeyFrame = g_r.frame + 1;
+            Log("capture: composite pass %d, tracing frame %llu", seen, (unsigned long long)(g_r.frame + 1));
+        }
+        lastFrame = g_r.frame;
+    }
     const uint64_t traceFrame = TraceFrame();
     if (traceFrame && g_r.frame + 1 == traceFrame)
     {
@@ -5995,8 +6048,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             RegFloat(PA_CL_VPORT_XOFFSET), RegFloat(PA_CL_VPORT_YOFFSET), RegFloat(PA_CL_VPORT_XSCALE), RegFloat(PA_CL_VPORT_YSCALE));
         Log("    vport z scale %g offset %g, vte %08X, clip %08X, depth clamp/zrange regs %08X %08X", RegFloat(PA_CL_VPORT_ZSCALE), RegFloat(PA_CL_VPORT_ZOFFSET), gpureg::Get(0x2206), gpureg::Get(0x2204), gpureg::Get(0x2280), gpureg::Get(0x2281));
         Log("    alpha ref %g (pinfo.x %u) edram mode %u colormask %X", RegFloat(RB_ALPHA_REF), pc->info[0], edramMode, gpureg::Get(RB_COLOR_MASK));
-        Log("    surface %08X color %08X depth %08X depthctl %08X colorctl %08X mode %X", gpureg::Get(0x2000), gpureg::Get(0x2001), gpureg::Get(0x2002),
-            gpureg::Get(RB_DEPTHCONTROL), gpureg::Get(RB_COLORCONTROL), gpureg::Get(PA_SU_SC_MODE_CNTL));
+        Log("    surface %08X color %08X depth %08X depthctl %08X stencil %08X colorctl %08X mode %X", gpureg::Get(0x2000), gpureg::Get(0x2001), gpureg::Get(0x2002),
+            gpureg::Get(RB_DEPTHCONTROL), gpureg::Get(RB_STENCILREFMASK), gpureg::Get(RB_COLORCONTROL), gpureg::Get(PA_SU_SC_MODE_CNTL));
         for (uint32_t c : { 0u, 1u, 5u, 6u, 7u, 14u, 22u, 254u, 255u })
             Log("    pc%u = %g %g %g %g", c, pc->c[c][0], pc->c[c][1], pc->c[c][2], pc->c[c][3]);
     }
