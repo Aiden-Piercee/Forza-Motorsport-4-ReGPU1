@@ -1,5 +1,8 @@
 // Threads, synchronisation, handles, TLS, time.
 #include <atomic>
+#include <map>
+#include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 
@@ -398,13 +401,38 @@ GUEST_EXPORT(KeTlsSetValue)
 
 // Time -----------------------------------------------------------------------
 
+// FM2_TRACE_TIME=1: once a second, how many times each caller asked for the time.
+namespace
+{
+void NoteTimeCall(const char* what, uint64_t lr)
+{
+    static const bool trace = getenv("FM2_TRACE_TIME") != nullptr;
+    if (!trace)
+        return;
+    static std::mutex mutex;
+    static std::map<std::pair<std::string, uint64_t>, uint32_t> counts;
+    static auto last = Clock::now();
+    std::lock_guard lock(mutex);
+    counts[{ what, lr }]++;
+    if (Clock::now() - last >= std::chrono::seconds(1))
+    {
+        last = Clock::now();
+        for (const auto& [key, n] : counts)
+            Log("time: %s from %08llX x%u", key.first.c_str(), (unsigned long long)key.second, n);
+        counts.clear();
+    }
+}
+}
+
 GUEST_EXPORT(KeQueryPerformanceFrequency)
 {
-    Return(ctx, TscFrequency());
+    NoteTimeCall("KeQueryPerformanceFrequency", ctx.lr);
+    Return(ctx, kGuestTimebaseHz);
 }
 
 GUEST_EXPORT(KeQuerySystemTime)
 {
+    NoteTimeCall("KeQuerySystemTime", ctx.lr);
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
     StoreBE64(ctx.r3.u32, (uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime);

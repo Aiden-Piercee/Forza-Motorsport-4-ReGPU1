@@ -33,6 +33,15 @@ target_compile_options(fm2_ppc PUBLIC -msse4.1 -fno-strict-aliasing)
 # Function names in crash reports and profiles.
 target_compile_options(fm2_ppc PRIVATE -gline-tables-only "/FI${CMAKE_SOURCE_DIR}/src/ppc_hooks.h")
 
+# The recompiled code reads the host's raw timestamp counter for mftb; give it the console's
+# timebase instead (tools/patch_mftb.py, Fm2Timebase in src/kernel/runtime.cpp).
+execute_process(COMMAND py -3 -I "${CMAKE_SOURCE_DIR}/tools/patch_mftb.py" "${FM2_PPC_DIR}"
+                OUTPUT_VARIABLE FM2_MFTB_RESULT RESULT_VARIABLE FM2_MFTB_CODE OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT FM2_MFTB_CODE EQUAL 0)
+    message(FATAL_ERROR "tools/patch_mftb.py failed on ${FM2_PPC_DIR}")
+endif()
+message(STATUS "mftb: ${FM2_MFTB_RESULT}")
+
 file(GLOB_RECURSE FM2_SOURCES CONFIGURE_DEPENDS src/*.cpp)
 if(FM2_TITLE_UPDATE)
     set(FM2_TU_DIR "${CMAKE_SOURCE_DIR}/out/tu4")

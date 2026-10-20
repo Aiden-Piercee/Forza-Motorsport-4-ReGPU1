@@ -59,6 +59,9 @@ inline std::string ObjectAttributesName(uint32_t attributes, uint32_t* root = nu
 void CompleteOverlapped(uint32_t overlapped, uint32_t result, uint32_t extendedError = 0, uint32_t length = 0);
 
 uint32_t TscFrequency();
+// The Xbox 360's timebase (mftb, KeQueryPerformanceFrequency): 49.875 MHz.
+constexpr uint32_t kGuestTimebaseHz = 49875000;
+extern "C++" uint64_t Fm2Timebase();
 
 // Guest printf: arguments from registers/stack starting at firstArg (0 = r3),
 // or from a guest va_list (8-byte slots).

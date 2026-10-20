@@ -20,6 +20,8 @@ std::filesystem::path g_gameDir;
 std::filesystem::path g_userDir;
 std::filesystem::path g_contentDir;
 uint32_t g_tscFrequency = 0;
+double g_tscHz = 0;      // the host counter's exact rate
+uint64_t g_tscStart = 0;  // its value when the process started
 
 // KeTimeStampBundle: InterruptTime (100 ns since boot), SystemTime
 // (FILETIME), TickCount (ms). The title polls it for timing.
@@ -43,7 +45,7 @@ void TimeStampThread()
     }
 }
 
-uint32_t MeasureTsc()
+double MeasureTsc()
 {
     LARGE_INTEGER f, a, b;
     QueryPerformanceFrequency(&f);
@@ -55,7 +57,7 @@ uint32_t MeasureTsc()
     const double seconds = double(b.QuadPart - a.QuadPart) / double(f.QuadPart);
     // KeQueryPerformanceFrequency returns 32 bits on the console; a
     // multi-GHz TSC overflows it, so titles must see a scaled timebase.
-    return uint32_t(std::min((t1 - t0) / seconds, 4294967295.0));
+    return double(t1 - t0) / seconds;
 }
 }
 
@@ -72,7 +74,9 @@ void RuntimeInit(const std::filesystem::path& gameDir)
         g_userDir = g_gameDir.parent_path() / "user";
     std::filesystem::create_directories(g_userDir / "cache");
 
-    g_tscFrequency = MeasureTsc();
+    g_tscHz = MeasureTsc();
+    g_tscStart = __rdtsc();
+    g_tscFrequency = uint32_t(std::min(g_tscHz, 4294967295.0));
     Log("runtime: TSC %.3f MHz, user data in %s", g_tscFrequency / 1e6, g_userDir.string().c_str());
 
     std::thread(TimeStampThread).detach();
@@ -114,6 +118,15 @@ const std::filesystem::path& DlcDir()
     return dir;
 }
 uint32_t TscFrequency() { return g_tscFrequency; }
+
+// The guest's timebase (mftb in the recompiled code; tools/patch_mftb.py): the console's 49.875 MHz,
+// counted from the start of the process, so the title's tick arithmetic (ticks * 1,000,000 in 64 bits)
+// has the headroom it had on the console. KeQueryPerformanceFrequency reports the same rate.
+uint64_t Fm2Timebase()
+{
+    const double ticks = double(__rdtsc() - g_tscStart) * (double(kGuestTimebaseHz) / g_tscHz);
+    return uint64_t(ticks) + kGuestTimebaseHz; // (a console's timebase is never 0 at boot + 1 s)
+}
 
 void CompleteOverlapped(uint32_t overlapped, uint32_t result, uint32_t extendedError, uint32_t length)
 {

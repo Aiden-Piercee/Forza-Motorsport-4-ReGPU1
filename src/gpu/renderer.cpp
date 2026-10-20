@@ -6261,7 +6261,25 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
             for (uint32_t x = 0; x < kWidth; x++)
                 memcpy(&rgba[(size_t(y) * kWidth + x) * 4], &full[(size_t(y) * dh / kHeight * dw + size_t(x) * dw / kWidth) * 4], 4);
         static const uint64_t every = getenv("FM2_DUMP_EVERY") ? strtoull(getenv("FM2_DUMP_EVERY"), nullptr, 10) : 0;
-        if (every && g_r.frame % every == 0 && g_r.frame != dumpFrame)
+        // FM2_REGION_HASH="x,y,w,h" (with FM2_DUMP_EVERY): instead of a PNG, log a hash of the bright
+        // pixels in that part of the output, to see how often it changes (text, animations).
+        static uint32_t rx = 0, ry = 0, rw = 0, rh = 0;
+        static const bool regionHash = [] {
+            const char* e = getenv("FM2_REGION_HASH");
+            return e && sscanf(e, "%u,%u,%u,%u", &rx, &ry, &rw, &rh) == 4;
+        }();
+        if (regionHash && every && g_r.frame % every == 0)
+        {
+            uint64_t h = 0xCBF29CE484222325ull;
+            for (uint32_t y = ry; y < ry + rh && y < dh; y++)
+                for (uint32_t x = rx; x < rx + rw && x < dw; x++)
+                {
+                    const uint8_t* px = &full[(size_t(y) * dw + x) * 4];
+                    h = (h ^ (std::max({ px[0], px[1], px[2] }) > 90 ? 1u : 0u)) * 0x100000001B3ull;
+                }
+            Log("region: frame %llu hash %08X", (unsigned long long)g_r.frame, uint32_t(h ^ (h >> 32)));
+        }
+        else if (every && g_r.frame % every == 0 && g_r.frame != dumpFrame)
         {
             char name[64];
             std::filesystem::create_directories("out/frames");
