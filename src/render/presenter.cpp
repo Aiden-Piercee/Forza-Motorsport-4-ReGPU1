@@ -106,6 +106,7 @@ void CreateWindowAndDevice()
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.lpszClassName = L"fm2";
+    wc.hbrBackground = HBRUSH(GetStockObject(BLACK_BRUSH));
     wc.hIcon = HICON(LoadImageW(wc.hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR));
     RegisterClassW(&wc);
     // The swap chain is the chosen resolution (the game's image is centred in it with black
@@ -114,10 +115,21 @@ void CreateWindowAndDevice()
     // primary display. Either way the swap chain stretches to the window.
     const Settings& settings = GetSettings();
     const uint32_t outW = settings.width, outH = settings.height;
+    HWND surface = nullptr;
     if (settings.fullscreen)
     {
+        // Borderless window over the whole display; its black background shows around the picture.
+        // The picture (the swap chain) is a child window: the largest rectangle of the chosen
+        // aspect ratio, centred. Other windows cannot cover the black bars this way.
         const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
         g_p.window = CreateWindowExW(0, L"fm2", L"Forza Motorsport 2", WS_POPUP | WS_VISIBLE, 0, 0, sw, sh, nullptr, nullptr, wc.hInstance, nullptr);
+        LONG w = sw, h = sh;
+        if (int64_t(sw) * outH > int64_t(sh) * outW)
+            w = LONG(int64_t(sh) * outW / outH);
+        else
+            h = LONG(int64_t(sw) * outH / outW);
+        surface = CreateWindowExW(0, L"fm2", nullptr, WS_CHILD | WS_VISIBLE, (sw - w) / 2, (sh - h) / 2, w, h,
+            g_p.window, nullptr, wc.hInstance, nullptr);
     }
     else
     {
@@ -154,7 +166,7 @@ void CreateWindowAndDevice()
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
     ComPtr<IDXGISwapChain1> sc1;
-    Check(factory->CreateSwapChainForHwnd(g_p.queue.Get(), g_p.window, &sd, nullptr, nullptr, &sc1), "CreateSwapChainForHwnd");
+    Check(factory->CreateSwapChainForHwnd(g_p.queue.Get(), surface ? surface : g_p.window, &sd, nullptr, nullptr, &sc1), "CreateSwapChainForHwnd");
     Check(sc1.As(&g_p.swapChain), "IDXGISwapChain3");
     factory->MakeWindowAssociation(g_p.window, DXGI_MWA_NO_ALT_ENTER);
 
