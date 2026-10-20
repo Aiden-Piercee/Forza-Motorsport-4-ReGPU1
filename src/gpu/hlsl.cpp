@@ -33,7 +33,7 @@ cbuffer PSConstants : register(b1)
     float4 pc[256];
     uint4 pb[2];
     uint4 pinfo;      // x alpha test function (7 = always), y generated-parameter register (0xFF none)
-    float4 pinfo2;    // x alpha reference, y 1 / render scale (pixel positions back to game pixels)
+    float4 pinfo2;    // x alpha reference, y/z 1 / render scale (pixel positions back to game pixels), w colour ceiling (0 none)
     uint4 tinfo[32];  // x sampler (0 lin wrap, 1 lin clamp, 2 point clamp, 3 point wrap), y/z size, w dimension (3 cube)
     float4 tbias[32]; // x fetch-constant LOD bias, y (as uint) bindless descriptor index
 };
@@ -918,6 +918,7 @@ TranslatedShader TranslateShader(const Shader& shader)
              "    case 5: if (!(oC[0].a != pinfo2.x)) discard; break;\n"
              "    case 6: if (!(oC[0].a >= pinfo2.x)) discard; break;\n"
              "    }\n"
+             "    if (pinfo2.w > 0.0) oC[0].rgb = clamp(oC[0].rgb, 0.0, pinfo2.w); // 7e3 target range\n"
              "    return oC[0];\n}\n";
     }
     result.hlsl = h;

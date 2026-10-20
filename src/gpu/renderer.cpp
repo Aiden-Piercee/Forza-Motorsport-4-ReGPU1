@@ -5852,6 +5852,11 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     pc->info2[0] = RegFloat(RB_ALPHA_REF);
     pc->info2[1] = 1.0f / ScaleX();
     pc->info2[2] = 1.0f / ScaleY();
+    // Our colour target is half float: a 7e3 surface (formats 3 and 12, the title's HDR scene)
+    // saturates at 31.875, so its output is clamped to that, as the hardware does (the bloom
+    // reads those values).
+    const uint32_t colorFormat = (gpureg::Get(RB_COLOR_INFO) >> 16) & 0xF;
+    pc->info2[3] = colorFormat == 3 || colorFormat == 12 ? 31.875f : 0.0f;
 
     Section(4);
     // Textures are bindless: each one has a permanent descriptor in the heap's
