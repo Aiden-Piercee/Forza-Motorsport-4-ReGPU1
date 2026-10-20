@@ -15,17 +15,26 @@ for playing it.
 
 ## Install (0.1.0)
 
-The release zip contains no game files. You need your own copy of the European disc image and the title update.
+The installer contains no game files. You need your own copy of the European disc image and the title update.
 
-1. Download `FM2-0.1.0.zip` from the releases page and unzip it.
-2. Install Python 3 from python.org (tick "Add to PATH").
-3. Run `install.cmd`. It asks for:
-   - your European disc image (`.iso`), checked against this build,
-   - the title update file, checked against this build,
-   - optionally, a folder with your DLC packages.
-4. It builds the game files from the disc, sets up the port, and offers a desktop shortcut.
+1. Download `FM2-Setup-0.1.0.exe` from the [releases page](https://github.com/zer0ducksgiven/Forza-Motorsport-2-ReGPU/releases) and run it. No admin rights are needed.
+2. Choose an install folder (default `%LOCALAPPDATA%\FM2`).
+3. Choose your European disc image (`.iso`). It is checked against this build.
+4. Choose the title update file (named like `TU_16L61VA_...`). It is checked against this build.
+5. Optionally, choose a folder with your DLC packages. If you have none, keep the default and this step is skipped.
+6. The installer builds the game files from the disc, unpacks the title update into `Documents\fm2\update`, copies any DLC into `Documents\fm2\dlc`, and offers a desktop shortcut.
 
-Your title update and DLC go in `Documents\\fm2\\update` and `Documents\\fm2\\dlc`. The launcher checks GitHub for a newer release when it opens.
+The installer bundles its own Python, so nothing else needs installing. The launcher checks GitHub for a newer release when it opens.
+
+### Building the installer
+
+Needs Inno Setup 6 and a Python 3.12 embeddable package unpacked into `out\pyembed\py`. Then from the repository root:
+
+```
+powershell -ExecutionPolicy Bypass -File installer\build-installer.ps1 -Version 0.1.0
+```
+
+It stages `installer\payload` from `build\tu` and the scripts, and writes `installer\dist\FM2-Setup-0.1.0.exe`.
 
 ## Shaders compiled before you drive, smooth frame times while you do
 
