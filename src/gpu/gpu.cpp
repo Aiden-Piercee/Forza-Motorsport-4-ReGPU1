@@ -746,11 +746,20 @@ uint32_t ExecutePacket(uint32_t ptr)
             logged++;
             Log("zpd: %08X %08X %08X %08X %08X %08X %08X %08X%s", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], end ? " (end)" : "");
         }
+        // Real counts when draws are recorded here in stream order (not with the draw thread
+        // or workers, whose lists the query would not wrap): the sun flare fades behind trees.
+        static const bool fake = getenv("FM2_FAKE_OCCLUSION") != nullptr; // A/B: the old fixed answer
+        const bool real = !fake && !work::Active() && !seg::Enabled();
+        uint32_t samples = 1000;
+        if (real && !end)
+            RendererOcclusionBegin();
+        else if (real && !RendererOcclusionEnd(samples))
+            samples = 1000; // no result yet (the first frames): fully visible
         memset(c, 0, 8 * 4);
         if (end)
         {
-            c[4] = 1000; // ZPass_A
-            c[0] = 1000; // Total_A
+            c[4] = samples; // ZPass_A
+            c[0] = samples; // Total_A
         }
         break;
     }

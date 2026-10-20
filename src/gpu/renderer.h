@@ -38,6 +38,11 @@ bool RendererParallelReady();
 uint32_t RendererDrawWorkers();
 // The current draw is a resolve (EDRAM copy): a point the stream is not cut across.
 bool RendererIsResolveDraw();
+// Occlusion queries (EVENT_WRITE_ZPD): Begin starts counting the samples later draws pass;
+// End stops and gives the count in console samples (of the same query in the last completed
+// frame), false while there is none yet.
+void RendererOcclusionBegin();
+bool RendererOcclusionEnd(uint32_t& samples);
 // Follows the tile state draws set (see DrawImpl), for the state at each piece's start.
 void RendererTrackTile(RendererTile& tile);
 void RendererSetTile(const RendererTile& tile);

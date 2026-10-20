@@ -87,6 +87,7 @@ public:
         struct A { ID3D12Resource* dst; UINT64 dstOffset; ID3D12Resource* src; UINT64 srcOffset, bytes; } a{ dst, dstOffset, src, srcOffset, bytes };
         Put(kCopyBuffer, &a, sizeof(a));
     }
+    void BeginQuery(ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i) { struct A { ID3D12QueryHeap* h; D3D12_QUERY_TYPE t; UINT i; } a{ h, t, i }; Put(kBeginQuery, &a, sizeof(a)); }
     void EndQuery(ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i) { struct A { ID3D12QueryHeap* h; D3D12_QUERY_TYPE t; UINT i; } a{ h, t, i }; Put(kEndQuery, &a, sizeof(a)); }
     void ResolveQueryData(ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT start, UINT n, ID3D12Resource* dst, UINT64 offset)
     {
@@ -124,7 +125,7 @@ private:
     {
         kBarrier, kCopyTexture, kRootSignature, kTable, kCbv, kRoot32, kTargets, kPipeline, kViewports, kScissors, kStencilRef, kBlendFactor,
         kTopology, kHeaps, kDraw, kEndQuery, kResolveQuery, kClearRtv, kClearDsv, kCreateRtv, kCreateDsv, kDrawIndexed, kIndexBuffer, kCopyBuffer,
-        kComputeRootSignature, kComputeTable, kComputeRoot32, kDispatch
+        kComputeRootSignature, kComputeTable, kComputeRoot32, kDispatch, kBeginQuery
     };
     static constexpr size_t kChunk = 64 << 10;
 
@@ -265,6 +266,12 @@ private:
             {
                 const UINT* d = reinterpret_cast<const UINT*>(a);
                 l->DrawInstanced(d[0], d[1], d[2], d[3]);
+                break;
+            }
+            case kBeginQuery:
+            {
+                struct A { ID3D12QueryHeap* h; D3D12_QUERY_TYPE t; UINT i; };
+                l->BeginQuery(At<A>(a).h, At<A>(a).t, At<A>(a).i);
                 break;
             }
             case kEndQuery:

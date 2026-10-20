@@ -489,6 +489,18 @@ struct PassMarkInfo
 };
 std::vector<PassMarkInfo> g_passMarks[3];
 uint32_t g_passDraws = 0;
+
+// Occlusion queries (EVENT_WRITE_ZPD: the sun flare's visibility). Each guest query becomes a
+// D3D12 one; the guest gets the result of the same query (by order in the frame) from the
+// last frame that has completed, so the command processor never waits for the GPU.
+constexpr UINT kOcclusionPerFrame = 64;
+ComPtr<ID3D12QueryHeap> g_occlusionHeap;
+ComPtr<ID3D12Resource> g_occlusionReadback;
+std::vector<std::pair<UINT, UINT>> g_occlusionPending[3]; // per frame slot: (order in the frame, query index)
+std::vector<int64_t> g_occlusionResult;                     // by order in the frame: host samples, -1 none yet
+uint64_t g_occlusionFrame = ~0ull;
+UINT g_occlusionCount = 0, g_occlusionIndex = 0, g_occlusionOrder = 0;
+bool g_occlusionOpen = false;
 std::map<std::string, std::pair<double, uint64_t>> g_passTotals; // ms, draws
 uint64_t g_passFrames = 0;
 ComPtr<ID3D12Resource> g_timestampReadback;
@@ -1250,6 +1262,24 @@ void BeginFrameIfNeeded()
     f.garbage.clear();
     static const bool perf = getenv("FM2_PERF") != nullptr;
     const UINT frameIndex = UINT(&f - g_r.frames);
+    if (!g_occlusionPending[frameIndex].empty())
+    {
+        // This slot's previous frame has completed: keep its occlusion results.
+        uint64_t* counts = nullptr;
+        const D3D12_RANGE range{ size_t(frameIndex) * kOcclusionPerFrame * 8, size_t(frameIndex + 1) * kOcclusionPerFrame * 8 };
+        if (SUCCEEDED(g_occlusionReadback->Map(0, &range, reinterpret_cast<void**>(&counts))))
+        {
+            for (const auto& [order, index] : g_occlusionPending[frameIndex])
+            {
+                if (g_occlusionResult.size() <= order)
+                    g_occlusionResult.resize(order + 1, -1);
+                g_occlusionResult[order] = int64_t(counts[index]);
+            }
+            const D3D12_RANGE none{ 0, 0 };
+            g_occlusionReadback->Unmap(0, &none);
+        }
+        g_occlusionPending[frameIndex].clear();
+    }
     if (perf && !g_timestamps)
     {
         D3D12_QUERY_HEAP_DESC qd{};
@@ -5044,8 +5074,13 @@ void ListPrologue(RecordedList& list)
 }
 
 // Executes the main list so far and continues the frame in a fresh one.
+void EndOcclusionQuery();
+
 void SplitMainList()
 {
+    // A query must end in the list it began in.
+    if (g_occlusionOpen)
+        EndOcclusionQuery();
     ID3D12GraphicsCommandList* done = g_r.recorder.Real();
     done->Close();
     ID3D12CommandList* lists[] = { done };
@@ -5066,6 +5101,14 @@ void WaitForQueueIdle()
         g_r.fence->SetEventOnCompletion(value, g_r.fenceEvent);
         WaitForSingleObject(g_r.fenceEvent, 2000);
     }
+}
+
+void EndOcclusionQuery()
+{
+    g_occlusionOpen = false;
+    C().list->EndQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
+    C().list->ResolveQueryData(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex, 1, g_occlusionReadback.Get(), UINT64(g_occlusionIndex) * 8);
+    g_occlusionPending[g_r.frameIndex].push_back({ g_occlusionOrder, g_occlusionIndex });
 }
 
 void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t info)
@@ -5240,6 +5283,50 @@ bool RendererParallelReady()
 bool RendererIsResolveDraw()
 {
     return (gpureg::Get(RB_MODECONTROL) & 7) == 6;
+}
+
+void RendererOcclusionBegin()
+{
+    if (!g_r.ok)
+        Init();
+    BeginFrameIfNeeded();
+    if (g_occlusionFrame != g_r.frame)
+    {
+        g_occlusionFrame = g_r.frame;
+        g_occlusionCount = 0;
+    }
+    if (g_occlusionOpen || g_occlusionCount >= kOcclusionPerFrame)
+        return;
+    if (!g_occlusionHeap)
+    {
+        D3D12_QUERY_HEAP_DESC qd{};
+        qd.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
+        qd.Count = kOcclusionPerFrame * kFrames;
+        g_r.device->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_occlusionHeap));
+        g_occlusionReadback = CreateBuffer(8ull * kOcclusionPerFrame * kFrames, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!g_occlusionHeap || !g_occlusionReadback)
+            return;
+    }
+    g_occlusionOrder = g_occlusionCount++;
+    g_occlusionIndex = g_r.frameIndex * kOcclusionPerFrame + g_occlusionOrder;
+    C().list->BeginQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
+    g_occlusionOpen = true;
+}
+
+bool RendererOcclusionEnd(uint32_t& samples)
+{
+    if (!g_occlusionOpen)
+        return false;
+    const UINT order = g_occlusionOrder;
+    EndOcclusionQuery();
+    if (order >= g_occlusionResult.size() || g_occlusionResult[order] < 0)
+        return false;
+    // Host samples to the console's: the output is ScaleX x ScaleY host pixels per game pixel
+    // with g_msaa samples each; the guest surface has 1, 2 or 4 samples per pixel.
+    const uint32_t guestMsaa = (gpureg::Get(RB_SURFACE_INFO) >> 16) & 3;
+    const double perHost = double(1u << guestMsaa) / (double(ScaleX()) * double(ScaleY()) * double(g_msaa));
+    samples = uint32_t(std::min(double(g_occlusionResult[order]) * perHost + 0.5, 4294967295.0));
+    return true;
 }
 
 void RendererTrackTile(RendererTile& tile)
