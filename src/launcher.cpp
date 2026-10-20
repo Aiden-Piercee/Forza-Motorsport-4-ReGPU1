@@ -14,6 +14,7 @@
 
 #include "log.h"
 #include "settings.h"
+#include "update_check.h"
 
 namespace
 {
@@ -31,7 +32,7 @@ const wchar_t* kMsaaNames[] = { L"Off", L"2x MSAA", L"4x MSAA", L"8x MSAA" };
 struct State
 {
     HWND window = nullptr;
-    HWND profile = nullptr, resolution = nullptr, aspect = nullptr, display = nullptr, vsync = nullptr, maxFps = nullptr, msaa = nullptr, enhance = nullptr;
+    HWND profile = nullptr, resolution = nullptr, aspect = nullptr, display = nullptr, vsync = nullptr, maxFps = nullptr, msaa = nullptr, enhance = nullptr, updateLabel = nullptr;
     std::vector<std::pair<uint32_t, uint32_t>> resolutions;
     bool play = false, done = false;
 } g_state;
@@ -113,6 +114,9 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         break;
+    case WM_APP + 1:
+        SetWindowTextW(g_state.updateLabel, UpdateCheckResult().c_str());
+        return 0;
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
@@ -219,11 +223,13 @@ bool RunLauncher()
     g_state.enhance = Control(w, L"BUTTON", L"Enhanced lighting (experimental)", BS_AUTOCHECKBOX, lx, y, 320, 26, kEnhance, font);
     SendMessageW(g_state.enhance, BM_SETCHECK, s.enhance ? BST_CHECKED : BST_UNCHECKED, 0);
     y += 40;
+    g_state.updateLabel = Label(w, L"", lx, y + 44, font);
     Control(w, L"BUTTON", L"Play", BS_DEFPUSHBUTTON, cx, y, 105, 32, kPlay, font);
     Control(w, L"BUTTON", L"Quit", BS_PUSHBUTTON, cx + 115, y, 105, 32, kQuit, font);
 
     ShowWindow(w, SW_SHOW);
     SetForegroundWindow(w);
+    StartUpdateCheck(w, WM_APP + 1);
     SetFocus(GetDlgItem(w, kPlay));
     MSG m;
     while (!g_state.done && GetMessageW(&m, nullptr, 0, 0) > 0)

@@ -13,6 +13,20 @@ No game data is included: you need your own copy of the disc. See
 [FM2-native-scope.md](FM2-native-scope.md) for the plan and [TESTING.md](TESTING.md)
 for playing it.
 
+## Install (0.1.0)
+
+The release zip contains no game files. You need your own copy of the European disc image and the title update.
+
+1. Download `FM2-0.1.0.zip` from the releases page and unzip it.
+2. Install Python 3 from python.org (tick "Add to PATH").
+3. Run `install.cmd`. It asks for:
+   - your European disc image (`.iso`), checked against this build,
+   - the title update file, checked against this build,
+   - optionally, a folder with your DLC packages.
+4. It builds the game files from the disc, sets up the port, and offers a desktop shortcut.
+
+Your title update and DLC go in `Documents\\fm2\\update` and `Documents\\fm2\\dlc`. The launcher checks GitHub for a newer release when it opens.
+
 ## Shaders compiled before you drive, smooth frame times while you do
 
 Shader compilation stutter is the usual weak point of running Xbox 360 games on PC.
@@ -74,6 +88,11 @@ by default), and its saves live in `Documents\fm2\profiles\<name>\content`.
 
 ## Launcher and settings
 
+The launcher also has an **Anti-aliasing** option (Off, 2x, 4x, 8x MSAA, off by default),
+an experimental **Enhanced lighting** checkbox (off by default, adds local contrast to the
+final frame; reflections are not done yet), and it checks GitHub for a newer release
+when it opens (`FM2_NO_UPDATE_CHECK=1` turns that off).
+
 A small launcher opens before the game with the player settings: profile name,
 resolution, aspect ratio (Auto, 16:9, 21:9, 32:9; the image gets black bars when it
 differs from the resolution), windowed or borderless fullscreen, VSync, and max FPS
@@ -82,23 +101,11 @@ is also the display's refresh rate. `FM2_NO_LAUNCHER=1` skips the launcher and u
 saved settings; these variables override the file for one run: `FM2_PROFILE`,
 `FM2_RESOLUTION`, `FM2_RENDER_SCALE`, `FM2_MAX_FPS`, `FM2_VSYNC`, `FM2_FULLSCREEN`.
 
-### Upscaling
+### Upscaling (removed from the launcher for now)
 
-Upscaling renders the 3D scene smaller and upscales it to the output resolution right
-after the scene is finished; post-processing and the HUD are drawn at full resolution on
-top, so text and gauges stay sharp. The quality preset sets the scene size: Quality 67%,
-Balanced 59%, Performance 50%, Ultra performance 33% (per axis). Menus without a 3D scene
-stay at full resolution.
-
-- **AMD FSR 1** (spatial: edge-adaptive upscale plus RCAS sharpening) works on any GPU.
-- **AMD FSR 3** and **NVIDIA DLSS** (temporal) use per-pixel motion vectors: each scene
-  draw also runs its vertex shader with that draw's constants from the previous frame.
-  FSR 3 runs on any GPU; DLSS needs an RTX GPU (FSR 1 is used when it is unavailable).
-  At the Native preset DLSS runs as DLAA and FSR 3 as native anti-aliasing.
-
-This game's GPU cost is mostly per-draw work rather than pixels, so upscaling gains the
-most at 4K or on slower GPUs. Variables: `FM2_UPSCALER=off|fsr1|fsr3|dlss`, `FM2_UPSCALE_QUALITY=0-4`,
-`FM2_SHARPNESS=0-1` (settings.ini: `upscaler`, `upscale_quality`, `sharpness`).
+The upscaling code (AMD FSR 1, FSR 3 and NVIDIA DLSS) is still in the source and its
+environment variables still work, but the launcher no longer offers it. It is not part
+of 0.1.0's settings.
 
 ## Building
 

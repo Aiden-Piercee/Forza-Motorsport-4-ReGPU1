@@ -106,7 +106,7 @@ target_link_libraries(fm2 PRIVATE fm2_ppc XenonUtils synchronization winmm oneco
 target_compile_definitions(fm2 PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 target_compile_options(fm2 PRIVATE -gline-tables-only)
 target_link_options(fm2 PRIVATE /STACK:0x1000000 /DEBUG)
-target_link_libraries(fm2 PRIVATE dbghelp xaudio2 bcrypt)
+target_link_libraries(fm2 PRIVATE dbghelp xaudio2 bcrypt winhttp)
 
 # XMA decoding through FFmpeg's xma2 decoder (LGPL, linked dynamically): a shared build
 # with include/, lib/ and bin/ in thirdparty/ffmpeg (see README).
