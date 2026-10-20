@@ -64,26 +64,28 @@ The keyboard only works while the game window has focus.
   and place (out\play.log has the slow frames when run with FM2_PERF=1).
 - Ultrawide (a resolution or aspect ratio wider than 16:9) is experimental: some objects at the
   sides of the screen still pop in late, and the HUD stays in the centre 16:9 area.
-- Looping sounds restart at the start of the 2 KB packet holding the loop point, not
-  the exact sample: listen for clicks or stutters in engine and ambient loops.
-
-- Not fixed yet (triaged, not reproduced in this pass):
-  - "Xbox 360" text: the wording is UTF-16 inside the LSB2 string tables of every language zip
-    (Media\StringTables\*.zip, e.g. Forza_Flow.str, Livery_Decals.str), and the decal names
-    "XBOX 360 (Vertical Format)" are in Media\DB\gamedb.slt. Changing the length needs the
-    LSB2 offsets rebuilt. The car name "#5 XBOX 360 911 GT3-RSR" is a livery name, so decide
-    whether it changes.
-  - Loading-screen tips and logo run too fast: vblanks run at 720 Hz with the 360 fps cap
-    (gpu.cpp VblankLoop), and the title's UI timers look frame-driven. Check by setting Max FPS
-    to 60 and watching the tips.
-  - Laguna Seca kerbs show a smeared red line instead of the pattern, race dirt cuts across the
-    car body, some career thumbnails are corrupt, the eligibility screen's two icons appear
-    only after the first load, the Hire Driver text overflows after a few selections, a blue
-    stripe appears on tyres at random, a faint occlusion ghost sits above the car model,
-    Tsukuba variant 2 has the wrong skybox colours, and Photo Mode shows a black screen. None
-    has been traced. The first lead for the tyre, dirt and kerb artefacts is the shader
-    translation failures in the log (X3504 array index out of bounds, and "invalid access of
-    unbound variable" in a pixel shader).
+- The logo on the loading screen still looks wrong (not yet described or traced).
+- The intro videos (Turn 10, Microsoft, Dolby, Forza: about 90 seconds) cannot be skipped by a
+  button, and a launcher/FM2_SKIP_INTRO option does not exist yet (the splash code is in the
+  executable; see the notes in the project memory). Input recordings made before the clock fix
+  start about 90 seconds too early.
+- Photo Mode shows a black screen. Probably the same cause as the garage thumbnails below: it
+  reads a render target back through memory. FM2_RESOLVE_WRITEBACK handles small ones; a
+  full-screen readback would need an on-demand path (the capture tools in out/capture and
+  FM2_TRACE_RESOLVES show what it resolves).
+- Garage thumbnails: cars created from now on get a correct thumbnail. Thumbnails saved by
+  earlier runs are noise and stay that way in that profile.
+- "Xbox 360" text: the wording is UTF-16 inside the LSB2 string tables of every language zip
+  (Media/StringTables/*.zip, e.g. Forza_Flow.str, Livery_Decals.str), and the decal names
+  "XBOX 360 (Vertical Format)" are in Media/DB/gamedb.slt. Changing the length needs the LSB2
+  offsets rebuilt. The car name "#5 XBOX 360 911 GT3-RSR" is a livery name, so decide whether
+  it changes.
+- Not traced yet: Laguna Seca kerbs show a smeared red line instead of the pattern, race dirt
+  cuts across the car body, the Hire Driver text overflows after a few selections, a blue stripe
+  appears on tyres at random, a faint occlusion ghost sits above the car model, and Tsukuba
+  variant 2 has the wrong skybox colours. Use F12 on each, and see the shader translation
+  failures in out/play.log (X3504 array index out of bounds, and "invalid access of unbound
+  variable" in a pixel shader) as a first lead for the tyre, dirt and kerb artefacts.
 
 ## Capturing a rendering bug (F12)
 
