@@ -67,6 +67,24 @@ The keyboard only works while the game window has focus.
 - Looping sounds restart at the start of the 2 KB packet holding the loop point, not
   the exact sample: listen for clicks or stutters in engine and ambient loops.
 
+- Not fixed yet (triaged, not reproduced in this pass):
+  - "Xbox 360" text: the wording is UTF-16 inside the LSB2 string tables of every language zip
+    (Media\StringTables\*.zip, e.g. Forza_Flow.str, Livery_Decals.str), and the decal names
+    "XBOX 360 (Vertical Format)" are in Media\DB\gamedb.slt. Changing the length needs the
+    LSB2 offsets rebuilt. The car name "#5 XBOX 360 911 GT3-RSR" is a livery name, so decide
+    whether it changes.
+  - Loading-screen tips and logo run too fast: vblanks run at 720 Hz with the 360 fps cap
+    (gpu.cpp VblankLoop), and the title's UI timers look frame-driven. Check by setting Max FPS
+    to 60 and watching the tips.
+  - Laguna Seca kerbs show a smeared red line instead of the pattern, race dirt cuts across the
+    car body, some career thumbnails are corrupt, the eligibility screen's two icons appear
+    only after the first load, the Hire Driver text overflows after a few selections, a blue
+    stripe appears on tyres at random, a faint occlusion ghost sits above the car model,
+    Tsukuba variant 2 has the wrong skybox colours, and Photo Mode shows a black screen. None
+    has been traced. The first lead for the tyre, dirt and kerb artefacts is the shader
+    translation failures in the log (X3504 array index out of bounds, and "invalid access of
+    unbound variable" in a pixel shader).
+
 ## What to report
 
 - Anything that renders wrong: which screen, car, track and camera, plus a
