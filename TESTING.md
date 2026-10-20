@@ -6,9 +6,14 @@ Windows for stereo devices). Saves work.
 
 ## Run it
 
-Double-click `play.cmd` (or run `build\rel\fm2.exe` from the repository root).
+Double-click `play.cmd` (or run `build\tu\fm2.exe` from the repository root).
 The game needs `game\` (the extracted disc) next to it. Logs are written to
 `out\play.log`.
+
+This build is made for the title update (the game as patched by its last update, which also
+enables the downloadable cars and tracks). `update\` and `dlc\` next to `play.cmd` hold the
+update and the packs; `install-content.cmd` copies them into `Documents\fm2` when you start
+the game (nothing is overwritten).
 
 A launcher opens first: pick the profile name (your save slot; `Player` by
 default), resolution, aspect ratio, windowed or fullscreen, VSync and max FPS, then
@@ -27,9 +32,10 @@ has not hung. Later starts load the compiled shaders from `Documents\fm2\shaderc
 `benchmark.cmd` measures performance the same way on every machine: it drives the
 menus into a Sunset race with 8 cars, holds the throttle for 25 seconds, and writes
 `out\benchmark.txt` with the average fps, the 1% and 0.1% lows, the slowest frame, the
-CPU, GPU and RAM, and the resolution and upscaler. It takes about 75 seconds.
+CPU, GPU and RAM, and the resolution and upscaler. It takes about 75 seconds after the intro videos.
 
 - Start the game once with `play.cmd` first (the first start compiles shaders).
+- The intro videos play first (about 90 seconds), so the whole run takes about 3 minutes.
 - Pick the resolution and upscaler in the launcher beforehand: the benchmark uses the
   saved settings, without a frame cap or VSync, and its own `Benchmark` profile.
 - Don't touch the keyboard or controller while it runs.

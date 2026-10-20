@@ -4,6 +4,7 @@ rem aside (to Documents\fm2\cold-backup-<time>) so every shader compiles again, 
 rem with FM2_PERF=1. Slow frames and stalls are logged to out\play.log.
 cd /d "%~dp0"
 if not exist out mkdir out
+call "%~dp0install-content.cmd"
 set "U=%USERPROFILE%\Documents\fm2"
 for /f %%t in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss"') do set "STAMP=%%t"
 set "B=%U%\cold-backup-%STAMP%"
