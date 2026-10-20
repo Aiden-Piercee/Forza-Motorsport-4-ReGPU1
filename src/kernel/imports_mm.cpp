@@ -103,6 +103,13 @@ GUEST_EXPORT(MmSetAddressProtect) {}
 
 GUEST_EXPORT(MmQueryAllocationSize)
 {
+    static const bool trace = getenv("FM2_TRACE_PHYS") != nullptr;
+    if (trace)
+    {
+        uint32_t start = 0;
+        const uint32_t size = GuestAllocationSize(ctx.r3.u32, &start);
+        Log("phys: query size of %08X -> %X (block %08X, lr %08llX)", ctx.r3.u32, size, start, ctx.lr);
+    }
     Return(ctx, GuestAllocationSize(ctx.r3.u32));
 }
 

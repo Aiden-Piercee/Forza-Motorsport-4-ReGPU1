@@ -179,27 +179,31 @@ void CompositorLoop()
 
 const bool g_textureView = getenv("FM2_TEXVIEW") != nullptr;
 
+extern std::atomic<uint64_t> g_patchConfig;
+
 void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dwords, uint32_t guestAddress)
 {
     if (!dwords || dwords > 0x10000)
         return;
+    static const bool record = getenv("FM2_RECORD_CONFIGS") != nullptr;
     const uint64_t at = uint64_t(guestAddress) << 32 ^ uint64_t(dwords) << 2 ^ uint32_t(type);
     if (g_uploads.bucket_count() < kUploadGeneration * 2)
         g_uploads.reserve(kUploadGeneration * 2);
     UploadAt& slot = UploadSlot(at);
-    if (slot.at == at)
-        if (const ShaderUpload* u = FindUpload(slot.key); u && u->words.size() == dwords && memcmp(u->words.data(), microcodeBE, dwords * 4) == 0)
+    if (!record && slot.at == at)
+            if (const ShaderUpload* u = FindUpload(slot.key); u && u->words.size() == dwords && memcmp(u->words.data(), microcodeBE, dwords * 4) == 0)
+            {
+                RendererSetShader(uint32_t(type), microcodeBE, u->used, u->hash);
+                return;
+            }
+    const uint64_t key = FastKey(microcodeBE, dwords, uint32_t(type));
+    if (!record)
+        if (const ShaderUpload* u = FindUpload(key); u && u->words.size() == dwords && memcmp(u->words.data(), microcodeBE, dwords * 4) == 0)
         {
             RendererSetShader(uint32_t(type), microcodeBE, u->used, u->hash);
-            return;
+            slot = { at, key };
+            return; // seen before: already logged and dumped
         }
-    const uint64_t key = FastKey(microcodeBE, dwords, uint32_t(type));
-    if (const ShaderUpload* u = FindUpload(key); u && u->words.size() == dwords && memcmp(u->words.data(), microcodeBE, dwords * 4) == 0)
-    {
-        RendererSetShader(uint32_t(type), microcodeBE, u->used, u->hash);
-        slot = { at, key };
-        return; // seen before: already logged and dumped
-    }
     const uint32_t raw = dwords;
     dwords = ucode::UsedDwords(microcodeBE, dwords);
     const uint64_t hash = Fnv1a(microcodeBE, dwords) ^ uint64_t(type);
@@ -207,6 +211,22 @@ void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dw
     RotateUploads();
     g_uploads[key] = ShaderUpload{ std::vector<uint32_t>(microcodeBE, microcodeBE + raw), dwords, hash };
     slot = { at, key };
+    if (record)
+    {
+        static std::mutex recordMutex;
+        static std::set<std::pair<uint64_t, uint64_t>> recorded;
+        const uint64_t config = g_patchConfig.load();
+        std::lock_guard lock(recordMutex);
+        if (recorded.insert({ config, hash }).second)
+        {
+            static FILE* f = fopen("out/configs.txt", "w");
+            if (f)
+            {
+                fprintf(f, "%016llx %s %016llx\n", (unsigned long long)config, type == ShaderType::Vertex ? "vs" : "ps", (unsigned long long)hash);
+                fflush(f);
+            }
+        }
+    }
     if (!g_shaders.insert(hash).second)
         return;
     if (g_shaders.size() % 50 == 1)

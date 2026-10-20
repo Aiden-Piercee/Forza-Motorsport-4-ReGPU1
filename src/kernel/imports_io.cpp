@@ -367,6 +367,25 @@ GUEST_EXPORT(NtReadFile)
     ov.Offset = DWORD(offset);
     ov.OffsetHigh = DWORD(offset >> 32);
     DWORD read = 0;
+    if (length > (4u << 20))
+    {
+        std::string CurrentHostStack(int maxFrames);
+        Log("io: large read %s offset %llu length %u -> %08X: %s", file->path.filename().string().c_str(), (unsigned long long)offset, length, buffer,
+            CurrentHostStack(10).c_str());
+    }
+    static const char* traceReads = getenv("FM2_TRACE_READS");
+    if (traceReads && strstr(file->path.string().c_str(), traceReads))
+        Log("io: read %s offset %llu length %u -> %08X (handle %08X, offset ptr %08X, sync %d, thread %u)", file->path.filename().string().c_str(),
+            (unsigned long long)offset, length, buffer, ctx.r3.u32, offsetPtr, int(file->synchronous), CurrentGuestThreadId());
+    static const uint32_t watchIo = getenv("FM2_WATCH_IO") ? uint32_t(strtoul(getenv("FM2_WATCH_IO"), nullptr, 16)) : 0;
+    if (watchIo && (watchIo & 0x1FFFFFFF) - (buffer & 0x1FFFFFFF) < length)
+        Log("io: read into watched %08X: %s offset %llu length %u buffer %08X (lr %08llX)", watchIo, file->path.string().c_str(),
+            (unsigned long long)offset, length, buffer, ctx.lr);
+    if (length == 0x20000 && strstr(file->path.string().c_str(), ".bik"))
+    {
+        extern uint32_t g_binkRingBase;
+        g_binkRingBase = buffer - uint32_t(offset % 0x200000);
+    }
     const BOOL ok = ReadFile(file->host, GuestPtr(buffer), length, &read, &ov);
     file->position = offset + read;
     g_readBytes += read;

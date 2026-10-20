@@ -277,8 +277,68 @@ PPC_FUNC(sub_827C3CB8)
 // FM2_TRACE_PATCH=1: logs every call to the shader microcode patcher (sub_8272F650) with its
 // inputs and the return address, so each patched shader load can be matched to its inputs.
 PPC_FUNC_IMPL(__imp__sub_8272F650);
+std::atomic<uint64_t> g_patchConfig{ 0 }; // hash of the latest patcher call's inputs (FM2_RECORD_CONFIGS)
+
+// Hash of the patcher inputs that vary between calls (the 19 configurations).
+static uint64_t PatchConfigHash(PPCContext& ctx)
+{
+    const uint32_t words[] = { uint32_t(ctx.lr), ctx.r7.u32, ctx.r8.u32, ctx.r25.u32, ctx.r26.u32, ctx.r10.u32, ctx.r22.u32, ctx.r24.u32, ctx.r27.u32, ctx.r28.u32 };
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (uint32_t w : words)
+        for (int i = 0; i < 4; i++)
+            h = (h ^ ((w >> (8 * i)) & 0xFF)) * 0x100000001B3ull;
+    return h;
+}
+
 PPC_FUNC(sub_8272F650)
 {
+    static const bool record = getenv("FM2_RECORD_CONFIGS") != nullptr;
+    if (record)
+    {
+        // The configuration is the inputs on entry; the registers change during the call.
+        const uint64_t entry = PatchConfigHash(ctx);
+        // FM2_CAPTURE_PATCH=<dir>: the first call per configuration writes the full input state
+        // (registers, the 16 KB context at r31, the descriptors at r5/r6, and the output cursor
+        // region before and after) so the patcher can be replayed offline.
+        static const char* captureDir = getenv("FM2_CAPTURE_PATCH");
+        static std::set<uint64_t> captured;
+        const bool capture = captureDir && captured.insert(entry).second;
+        auto blob = [&](uint32_t addr, uint32_t bytes) {
+            std::vector<uint8_t> v(bytes);
+            for (uint32_t i = 0; i < bytes; i++)
+                v[i] = *GuestPtr<uint8_t>(addr + i);
+            return v;
+        };
+        std::vector<uint8_t> ctxBefore, cursorBefore, r5Before, r6Before;
+        uint32_t cursor = 0;
+        if (capture)
+        {
+            cursor = __builtin_bswap32(*GuestPtr<uint32_t>(ctx.r31.u32 + 48));
+            ctxBefore = blob(ctx.r31.u32, 0x4000);
+            cursorBefore = blob(cursor, 0x400);
+            r5Before = blob(ctx.r5.u32, 0x200);
+            r6Before = blob(ctx.r6.u32, 0x200);
+        }
+        const uint32_t regsBefore[] = { uint32_t(ctx.lr), ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32,
+            ctx.r10.u32, ctx.r11.u32, ctx.r22.u32, ctx.r24.u32, ctx.r25.u32, ctx.r26.u32, ctx.r27.u32, ctx.r28.u32, ctx.r29.u32, ctx.r30.u32, ctx.r31.u32 };
+        __imp__sub_8272F650(ctx, base);
+        g_patchConfig.store(entry);
+        if (capture)
+        {
+            char name[512];
+            snprintf(name, sizeof(name), "%s/%016llx.bin", captureDir, (unsigned long long)entry);
+            if (FILE* f = fopen(name, "wb"))
+            {
+                fwrite(regsBefore, 4, sizeof(regsBefore) / 4, f);
+                for (const auto* v : { &ctxBefore, &cursorBefore, &r5Before, &r6Before })
+                    fwrite(v->data(), 1, v->size(), f);
+                const auto cursorAfter = blob(cursor, 0x400);
+                fwrite(cursorAfter.data(), 1, cursorAfter.size(), f);
+                fclose(f);
+            }
+        }
+        return;
+    }
     static const bool trace = getenv("FM2_TRACE_PATCH") != nullptr;
     static std::atomic<uint64_t> calls{ 0 };
     if (trace && calls++ < 400000)

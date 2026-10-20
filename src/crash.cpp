@@ -20,8 +20,19 @@ void Describe(DWORD64 address, char* out, size_t size)
     symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
     symbol->MaxNameLen = 255;
     DWORD64 displacement = 0;
+    IMAGEHLP_LINE64 line{};
+    line.SizeOfStruct = sizeof(line);
+    DWORD lineDisplacement = 0;
     if (SymFromAddr(GetCurrentProcess(), address, &displacement, symbol))
-        snprintf(out, size, "%s+%llX", symbol->Name, displacement);
+    {
+        if (SymGetLineFromAddr64(GetCurrentProcess(), address, &lineDisplacement, &line))
+        {
+            const char* file = strrchr(line.FileName, '\\');
+            snprintf(out, size, "%s+%llX (%s:%lu)", symbol->Name, displacement, file ? file + 1 : line.FileName, line.LineNumber);
+        }
+        else
+            snprintf(out, size, "%s+%llX", symbol->Name, displacement);
+    }
     else
         snprintf(out, size, "%016llX", address);
 }
@@ -108,7 +119,7 @@ std::string HostStack(void* threadHandle, int maxFrames)
 
 void CrashHandlerInit()
 {
-    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
     SymInitialize(GetCurrentProcess(), nullptr, TRUE);
     SetUnhandledExceptionFilter(OnCrash);
 }
@@ -124,7 +135,8 @@ LONG WINAPI OnWatchHit(EXCEPTION_POINTERS* info)
 {
     if (info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(info->ContextRecord->Dr6 & 7))
         return EXCEPTION_CONTINUE_SEARCH;
-    if (g_watchHits++ < 40)
+    static const int watchLimit = getenv("FM2_WATCHRW") ? 3000 : 40;
+    if (g_watchHits++ < watchLimit)
     {
         CONTEXT context = *info->ContextRecord;
         STACKFRAME64 frame{};
@@ -144,8 +156,21 @@ LONG WINAPI OnWatchHit(EXCEPTION_POINTERS* info)
             out += where;
         }
         GuestThread* t = CurrentGuestThread();
-        Log("watchpoint: thread %u wrote %02X (dr6 %llX): %s", t ? t->id : 0, *reinterpret_cast<uint8_t*>(info->ContextRecord->Dr0),
-            info->ContextRecord->Dr6, out.c_str());
+        // (Reading the byte here would trigger a read watchpoint again.)
+        static const bool readsToo = getenv("FM2_WATCHRW") != nullptr;
+        Log("watchpoint: thread %u %s %02X (dr6 %llX): %s", t ? t->id : 0, readsToo ? "touched" : "wrote",
+            readsToo ? 0u : unsigned(*reinterpret_cast<uint8_t*>(info->ContextRecord->Dr0)), info->ContextRecord->Dr6, out.c_str());
+        static int ringDumps = 0;
+        if (const char* ring = getenv("FM2_DUMP_RING"); ring && (out.find("sub_829560A0") != std::string::npos || out.find("sub_82957260") != std::string::npos) && ringDumps++ == 0)
+        {
+            const uint32_t a = uint32_t(strtoul(ring, nullptr, 16)), b = uint32_t(strtoul(strchr(ring, ',') + 1, nullptr, 16));
+            if (FILE* f = fopen("out/ring.bin", "wb"))
+            {
+                fwrite(g_base + a, 1, b - a, f);
+                fclose(f);
+                Log("watchpoint: dumped ring %08X..%08X at the first hit", a, b);
+            }
+        }
         if (t && t->ctx)
         {
             const PPCContext& g = *t->ctx;
@@ -181,7 +206,8 @@ void ArmWatchpoint(void* threadHandle)
     c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     GetThreadContext(threadHandle, &c);
     c.Dr0 = address;
-    c.Dr7 = (c.Dr7 & ~0xF0003ull) | 1 | (1ull << 16); // L0, write, 1 byte
+    static const bool readsToo = getenv("FM2_WATCHRW") != nullptr; // trap reads as well as writes
+    c.Dr7 = (c.Dr7 & ~0xF0003ull) | 1 | ((readsToo ? 3ull : 1ull) << 16); // L0, write (or read/write), 1 byte
     const uint32_t guest = uint32_t(address - uint64_t(g_base));
     if (guest >= 0xA0000000)
     {
@@ -200,4 +226,32 @@ void ArmWatchpoint(void* threadHandle)
     }
     SetThreadContext(threadHandle, &c);
     ResumeThread(threadHandle);
+}
+
+// Host call stack of the calling thread (recompiled frames name the guest functions).
+std::string CurrentHostStack(int maxFrames)
+{
+    CONTEXT context{};
+    RtlCaptureContext(&context);
+    STACKFRAME64 frame{};
+    frame.AddrPC.Offset = context.Rip;
+    frame.AddrPC.Mode = AddrModeFlat;
+    frame.AddrFrame.Offset = context.Rbp;
+    frame.AddrFrame.Mode = AddrModeFlat;
+    frame.AddrStack.Offset = context.Rsp;
+    frame.AddrStack.Mode = AddrModeFlat;
+    std::string out;
+    char where[300];
+    for (int i = 0; i < maxFrames + 1; i++)
+    {
+        if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, GetCurrentProcess(), GetCurrentThread(), &frame, &context, nullptr, SymFunctionTableAccess64,
+                SymGetModuleBase64, nullptr) || !frame.AddrPC.Offset)
+            break;
+        if (i == 0)
+            continue; // this function
+        Describe(frame.AddrPC.Offset, where, sizeof(where));
+        out += out.empty() ? "" : " < ";
+        out += where;
+    }
+    return out;
 }
