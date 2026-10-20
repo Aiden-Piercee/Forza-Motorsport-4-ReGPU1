@@ -5723,6 +5723,17 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     for (uint32_t i = 0; i < 8; i++)
         vc->b[i] = pc->b[i] = gpureg::Get(gpureg::BoolConstants + i);
+    // Debug: FM2_FORCE_BOOL=<index>:<0|1> forces one boolean constant for every draw.
+    if (static const char* force = getenv("FM2_FORCE_BOOL"); force)
+    {
+        static uint32_t index = 0, value = 0;
+        static const bool parsed = sscanf(force, "%u:%u", &index, &value) == 2 && index < 256;
+        if (parsed)
+        {
+            const uint32_t bit = 1u << (index & 31);
+            vc->b[index >> 5] = pc->b[index >> 5] = value ? (pc->b[index >> 5] | bit) : (pc->b[index >> 5] & ~bit);
+        }
+    }
     memset(vc->vf, 0, sizeof(vc->vf));
     for (uint32_t k : vs.info.vertexFetchConstants)
     {
@@ -5908,6 +5919,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         bool native = false;
         g_textureFailure[0] = 0;
         ID3D12Resource* texture = cube ? GetCubeTexture(fetch, format) : GetTexture(fetch, format, native);
+        // Debug: FM2_NO_LIVE_CUBE=1 binds the fallback for cubes the title rendered (live reflections).
+        if (static const bool noLiveCube = getenv("FM2_NO_LIVE_CUBE") != nullptr; noLiveCube && cube && ResolvedFor(fetch))
+            texture = nullptr;
         const uint32_t index = texture ? BindlessIndex(texture, format, cube) : (cube ? 1u : 0u);
         if (RendererTracing())
             CaptureTexture(fetch, slot, cube, texture != nullptr, index, native, g_textureFailure);
@@ -6148,6 +6162,34 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 nz += t;
             }
             Log("    vf%u normal z per vertex:%s", k, nz.c_str());
+            // FM2_TRACE_VSTAT=<dword>,<stride>: min/max/mean of that big-endian float over the
+            // vertices this draw indexes (e.g. 3,15: the per-vertex dirt of the car body).
+            if (const char* e = getenv("FM2_TRACE_VSTAT"))
+            {
+                uint32_t off = 0, stride = 0;
+                const uint32_t dwordsInBuffer = (d1 >> 2) & 0xFFFFFF;
+                if (sscanf(e, "%u,%u", &off, &stride) == 2 && stride && off < stride && !list.empty())
+                {
+                    double lo = 1e30, hi = -1e30, sum = 0;
+                    uint32_t n = 0, above = 0;
+                    for (uint32_t index : list)
+                    {
+                        const uint64_t at = uint64_t(index) * stride + off;
+                        if (at >= dwordsInBuffer)
+                            continue;
+                        const uint32_t b = __builtin_bswap32(v[at]);
+                        float f;
+                        memcpy(&f, &b, 4);
+                        lo = std::min<double>(lo, f);
+                        hi = std::max<double>(hi, f);
+                        sum += f;
+                        n++;
+                        above += f > 0.5f;
+                    }
+                    if (n)
+                        Log("    vf%u dword %u of %u: min %g max %g mean %g, %u of %u above 0.5", k, off, stride, lo, hi, sum / n, above, n);
+                }
+            }
         }
         Log("    scissors: generic %08X-%08X screen %08X-%08X window %08X-%08X offset %08X vport %g,%g +%g,%g", gpureg::Get(0x2090), gpureg::Get(0x2091),
             gpureg::Get(0x200E), gpureg::Get(0x200F), gpureg::Get(PA_SC_WINDOW_SCISSOR_TL), gpureg::Get(PA_SC_WINDOW_SCISSOR_BR), gpureg::Get(PA_SC_WINDOW_OFFSET),

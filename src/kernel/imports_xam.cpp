@@ -653,6 +653,14 @@ GUEST_EXPORT(XamInputGetState)
         Return(ctx, X_ERROR_DEVICE_NOT_CONNECTED);
         return;
     }
+    // FM2_LOOK_BACK_AT=<seconds>: from then on the right stick is held down (the chase camera
+    // looks back at the car's front), over a replay too: for captures of the bonnet.
+    if (static const double lookBack = getenv("FM2_LOOK_BACK_AT") ? atof(getenv("FM2_LOOK_BACK_AT")) : 0; lookBack > 0)
+    {
+        static const auto start = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= lookBack)
+            s.ry = -32767;
+    }
     static std::atomic<uint32_t> packet{ 0 };
     const uint32_t state = ctx.r5.u32;
     StoreBE32(state, ++packet);
