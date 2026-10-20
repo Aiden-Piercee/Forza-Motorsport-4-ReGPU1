@@ -1,4 +1,4 @@
-# fm2
+# Forza Motorsport 2 ReGPU
 
 A native Windows port of **Forza Motorsport 2** (Xbox 360). Nothing is emulated:
 
