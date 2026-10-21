@@ -531,6 +531,12 @@ bool ReadPad(uint32_t user, PadState& s)
                     // The benchmark measures the race, from 3 s after the throttle is held.
                     BenchmarkRecord(!advance && elapsed >= 3.0);
                 }
+                else if (step.rfind("LS:", 0) == 0 || step.rfind("RS:", 0) == 0)
+                {
+                    // "LS:2" / "RS:2": left stick up / right stick right, held that long (moves Photo Mode's camera)
+                    (step[0] == 'L' ? s.ly : s.rx) = 24000;
+                    advance = elapsed >= atof(step.c_str() + 3);
+                }
                 else
                 {
                     for (auto& [n, b] : names)

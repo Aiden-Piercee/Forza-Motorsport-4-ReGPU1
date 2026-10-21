@@ -3504,6 +3504,7 @@ struct TileState
     uint32_t surface = ~0u; // RB_SURFACE_INFO of the tiled pass (~0: any)
 };
 thread_local TileState g_tile;
+static const bool g_noForeignTile = getenv("FM2_NO_FOREIGN_TILE") != nullptr; // A/B for the paint-editor tile fix
 
 // Tiling: each tile pass is shifted into EDRAM by the window offset and
 // clipped to the tile. We render in screen space, so draws (and resolves)
@@ -4344,7 +4345,8 @@ void Resolve()
         // depth copies give the full 720 rows for every tile (976, 1232 with the tile's offset),
         // and each "taller" copy recreated the texture, dropping the tiles before it (the lower
         // two thirds of the picture came out black). It grows only when the rows don't fit.
-        if (auto it = g_r.resolved.find(base); it != g_r.resolved.end() && it->second.resource && rect.top > 0 &&
+        static const bool noKeep = getenv("FM2_NO_HEIGHT_KEEP") != nullptr;
+        if (auto it = g_r.resolved.find(base); !noKeep && it != g_r.resolved.end() && it->second.resource && rect.top > 0 &&
                                                 uint32_t(rect.bottom) <= it->second.height && it->second.height < height)
             height = it->second.height;
         const uint32_t info = gpureg::Get(RB_COPY_DEST_INFO);
@@ -4367,12 +4369,13 @@ void Resolve()
             UpscaleScene(base);
         g_r.resolved[base].swapped = swapRB;
         // The title reads some resolved images back on the CPU (the garage thumbnail it renders, then
-        // compresses and saves): our resolves stay on the GPU, so for the sizes listed in
-        // FM2_RESOLVE_WRITEBACK ("WxH,WxH", default 256x128) the pixels are also written to memory.
+        // compresses and saves, and the 1024x1024 livery a race compresses for the car body): our
+        // resolves stay on the GPU, so for the sizes listed in FM2_RESOLVE_WRITEBACK ("WxH,WxH",
+        // default 256x128,1024x1024) the pixels are also written to memory.
         static const std::vector<std::pair<uint32_t, uint32_t>> writeback = [] {
             std::vector<std::pair<uint32_t, uint32_t>> v;
             const char* e = getenv("FM2_RESOLVE_WRITEBACK");
-            for (const char* p = e ? e : "256x128"; p && *p;)
+            for (const char* p = e ? e : "256x128,1024x1024"; p && *p;)
             {
                 uint32_t w = 0, h = 0;
                 if (sscanf(p, "%ux%u", &w, &h) == 2)
@@ -5436,7 +5439,10 @@ void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_
     // exchanged when the copy has the swap bit; the title's fetch swizzle expects that), in the
     // byte order the copy's endian field names (2: big-endian words, 0: little-endian).
     const uint32_t endian = info & 7;
-    const bool swapRB = ((info >> 24) & 1) != 0;
+    // The race livery is compressed on the CPU, which reads the words as they are (like the photo
+    // saver): there red stays in bits 16-23 when the copy swaps (written swapped, blue came out orange).
+    const bool cpuRead = width == 1024 && height == 1024;
+    const bool swapRB = (((info >> 24) & 1) != 0) != cpuRead;
     const uint32_t pitchTexels = (width + 31) & ~31u, rows = (height + 31) & ~31u;
     uint8_t* guest = GuestPtr<uint8_t>(GpuPhysToGuest(base));
     for (uint32_t y = 0; y < height; y++)
@@ -6309,7 +6315,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // third (the rest of the picture was black).
         // Another MSAA view of the tiled surface itself (the paint editor's stencil clears) is still
         // tile-relative.
-        else if (g_tile.originY != 0 && (g_tile.surface == ~0u || g_tile.surface == gpureg::Get(RB_SURFACE_INFO) || ForeignNativeMsaa() >= 0))
+        else if (g_tile.originY != 0 && (g_tile.surface == ~0u || g_tile.surface == gpureg::Get(RB_SURFACE_INFO) || (!g_noForeignTile && ForeignNativeMsaa() >= 0)))
         {
             shiftY = float(g_tile.originY + wy);
             scissor.left = std::max(scissor.left, g_tile.rect.left);
