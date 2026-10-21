@@ -214,13 +214,18 @@ void Start()
 void DealerOnChar(wchar_t c)
 {
     static size_t matched = 0;
-    static std::once_flag started;
+    static std::atomic<bool> busy{ false };
     const char ch = char(towlower(c));
     matched = ch == kCode[matched] ? matched + 1 : (ch == kCode[0] ? 1 : 0);
+    // Once it plays, that's it until the game closes; before that (no song yet) typing it again retries.
     if (matched == sizeof(kCode) - 1)
     {
         matched = 0;
-        std::call_once(started, [] { std::thread(Start).detach(); });
+        if (!g_on && !busy.exchange(true))
+            std::thread([] {
+                Start();
+                busy = false;
+            }).detach();
     }
 }
 
