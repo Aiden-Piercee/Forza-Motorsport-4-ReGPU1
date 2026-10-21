@@ -15,7 +15,8 @@ enables the downloadable cars and tracks). `update\` and `dlc\` next to `play.cm
 update and the packs; `install-content.cmd` copies them into `Documents\fm2` when you start
 the game (nothing is overwritten).
 
-A launcher opens first: pick the profile name (your save slot; `Player` by
+The installed shortcuts open the launcher; `play.cmd` starts `fm2.exe` directly, which shows its own
+smaller settings window first. Either way, pick the profile name (your save slot; `Player` by
 default), resolution, aspect ratio, windowed or fullscreen, VSync and max FPS, then
 Play. The choices are kept in `Documents\fm2\settings.ini` for next time. Each
 profile name has its own saves (`Documents\fm2\profiles\<name>`); saves made

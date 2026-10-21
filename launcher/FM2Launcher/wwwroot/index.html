@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Forza Motorsport 2 ReGPU</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <img src="icon.png" alt="" class="mark">
+      <div>
+        <div class="logo">FORZA MOTORSPORT 2 <span>ReGPU</span></div>
+        <div class="tag" id="version">Native PC port</div>
+      </div>
+    </div>
+    <nav class="tabs" id="tabs">
+      <button data-tab="play" class="on">Play</button>
+      <button data-tab="settings">Settings</button>
+      <button data-tab="updates">Updates <span class="dot-badge" id="update-badge" hidden></span></button>
+    </nav>
+    <div class="chips" id="chips"></div>
+  </header>
+
+  <!-- PLAY -->
+  <main class="page grid3" id="page-play">
+    <section class="panel">
+      <div class="panel-head"><h2>Display</h2></div>
+      <label class="field" data-tip="Your save slot. Each name keeps its own saves, career and garage. Up to 15 characters.">
+        <span>Profile name</span>
+        <input id="profile" maxlength="15" spellcheck="false">
+      </label>
+      <label class="field" data-tip="The size the game renders at. Your display's own modes from 1280x720 up.">
+        <span>Resolution</span>
+        <select id="resolution"></select>
+      </label>
+      <label class="field" data-tip="Forces a picture shape. Auto follows the resolution. Wider than 16:9 is experimental: the HUD stays in the centre and some objects at the sides can pop in late.">
+        <span>Aspect ratio</span>
+        <select id="aspect"></select>
+      </label>
+      <div class="field">
+        <span>Display mode</span>
+        <div class="segmented" id="display">
+          <button data-full="0" data-tip="A normal window you can move and resize.">Windowed</button>
+          <button data-full="1" data-tip="Fills the main display without changing its mode. A narrower aspect ratio is centred with black bars.">Fullscreen</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2>Graphics &amp; game</h2></div>
+      <label class="field" data-tip="The frame-rate cap. The game's physics run at this rate too, so very high caps need a fast CPU. With VSync on, the display's refresh rate also limits it.">
+        <span>Max FPS</span>
+        <select id="maxFps"></select>
+      </label>
+      <div class="toggle-row" data-tip="Waits for the display's refresh: no tearing, slightly more input lag.">
+        <div><div class="toggle-title">VSync</div><div class="toggle-sub">Sync frames to the display</div></div>
+        <button class="switch" id="vsync" role="switch"></button>
+      </div>
+      <label class="field" data-tip="Smooths jagged edges. Each step costs GPU time: 4x is a good balance on most cards.">
+        <span>Anti-aliasing</span>
+        <select id="msaa"></select>
+      </label>
+      <div class="toggle-row" data-tip="An extra local-contrast pass on the final picture. Experimental: it can look too strong on some tracks.">
+        <div><div class="toggle-title">Enhanced lighting <span class="badge">beta</span></div><div class="toggle-sub">Extra contrast on the final frame</div></div>
+        <button class="switch" id="enhance" role="switch"></button>
+      </div>
+      <div class="toggle-row" data-tip="Skips the legal screen and the Turn 10, Microsoft, Dolby and Forza videos (about 100 seconds) and goes straight to the title screen.">
+        <div><div class="toggle-title">Skip intro videos</div><div class="toggle-sub">Straight to "Press START"</div></div>
+        <button class="switch" id="skipIntro" role="switch"></button>
+      </div>
+      <label class="field" data-tip="The language of the game's menus and text, from the string tables on your disc.">
+        <span>Language</span>
+        <select id="language"></select>
+      </label>
+      <div class="hint" id="lang-note"></div>
+    </section>
+
+    <section class="panel launch-panel">
+      <div class="panel-head"><h2>Ready</h2></div>
+      <div class="summary" id="summary"></div>
+      <div class="checklist" id="checklist"></div>
+      <div class="launch-box">
+        <button class="launch" id="launch" data-tip="Saves these settings and starts the game.">Play</button>
+        <div class="status" id="status"></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- SETTINGS -->
+  <main class="page grid3" id="page-settings" hidden>
+    <section class="panel">
+      <div class="panel-head"><h2>Shader cache</h2></div>
+      <p class="hint">Every shader in the game is compiled on the first start and kept here, so races don't stutter later.</p>
+      <div class="stats" id="shader-stats"></div>
+      <div class="buttons-col">
+        <button class="ghost" id="shaders-rebuild" data-tip="Deletes the cache and starts the game, which compiles everything again behind the loading screen (a few minutes, then up to a minute of black screen while pipelines build). Use it if graphics look broken after an update.">Rebuild now</button>
+        <button class="ghost danger" id="shaders-delete" data-tip="Deletes the compiled shaders and pipelines. The next start rebuilds them. Nothing else is touched: saves and settings stay.">Delete cache</button>
+        <button class="ghost" data-open="shaders" data-tip="Opens Documents\fm2, where the cache lives.">Open folder</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>DLC packs</h2>
+        <button class="primary small" id="dlc-add" data-tip="Copies DLC packages (the files as downloaded from Xbox Live) into the game's DLC folder. The game unpacks them on the next start.">Add DLC</button>
+      </div>
+      <p class="hint">Cars and tracks packs. Switch one off to keep it out of the game without deleting it.</p>
+      <div class="list" id="dlc"></div>
+      <div class="buttons-row">
+        <button class="ghost small" data-open="dlc" data-tip="Opens Documents\fm2\dlc.">Open DLC folder</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2>Folders</h2></div>
+      <div class="kv" id="folders"></div>
+      <div class="buttons-col">
+        <button class="ghost" data-open="user" data-tip="Saves, settings, caches, DLC and the title update.">Open user folder</button>
+        <button class="ghost" data-open="install" data-tip="The installed game and this launcher.">Open install folder</button>
+        <button class="ghost" data-open="log" data-tip="out\play.log: send it with bug reports.">Open logs</button>
+      </div>
+    </section>
+  </main>
+
+  <!-- UPDATES -->
+  <main class="page grid-updates" id="page-updates" hidden>
+    <section class="panel">
+      <div class="panel-head"><h2>Version</h2></div>
+      <div class="versions">
+        <div><div class="v-label">Installed</div><div class="v-num" id="v-installed">-</div></div>
+        <div class="arrow">→</div>
+        <div><div class="v-label">Latest</div><div class="v-num" id="v-latest">-</div></div>
+      </div>
+      <div class="update-state" id="update-state"></div>
+      <div class="buttons-col">
+        <button class="primary" id="update-apply" disabled data-tip="Downloads the patch from GitHub and installs it over this install. Close the game first.">Download &amp; install</button>
+        <button class="ghost" id="update-check" data-tip="Asks GitHub for the latest release.">Check again</button>
+        <button class="ghost" id="update-page" data-tip="Opens the release page in your browser.">Release page</button>
+      </div>
+      <div class="progress" id="progress"><div class="bar"></div></div>
+      <div class="status" id="update-status"></div>
+    </section>
+    <section class="panel notes-panel">
+      <div class="panel-head"><h2 id="notes-title">Release notes</h2></div>
+      <div class="notes" id="notes"><div class="empty">Checking GitHub…</div></div>
+    </section>
+  </main>
+
+  <div class="modal" id="confirm" hidden>
+    <div class="dialog">
+      <h2 id="confirm-title"></h2>
+      <p id="confirm-text"></p>
+      <div class="buttons">
+        <button class="ghost" data-choice="no">Cancel</button>
+        <button class="primary" data-choice="yes" id="confirm-yes">OK</button>
+      </div>
+    </div>
+  </div>
+  <div class="tooltip" id="tooltip" hidden></div>
+  <div class="toast" id="toast" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>

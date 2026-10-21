@@ -30,7 +30,7 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayName={#AppName} {#AppVersion}
-UninstallDisplayIcon={app}\build\tu\fm2.exe
+UninstallDisplayIcon={app}\launcher\FM2Launcher.exe
 CloseApplications=yes
 
 [Messages]
@@ -42,6 +42,7 @@ Name: "desktop"; Description: "Create a desktop shortcut"; GroupDescription: "Sh
 [Files]
 ; The port
 Source: "{#Payload}\build\tu\*"; DestDir: "{app}\build\tu"; Excludes: "nvngx_dlss.dll,xenos_dis.exe"; Flags: ignoreversion
+Source: "{#Payload}\launcher\*"; DestDir: "{app}\launcher"; Flags: ignoreversion recursesubdirs
 Source: "{#Payload}\scripts\*"; DestDir: "{app}"; Flags: ignoreversion
 ; The helper and the Python that runs it (installed copy)
 Source: "{#Payload}\py\*"; DestDir: "{app}\py"; Flags: ignoreversion recursesubdirs
@@ -49,8 +50,11 @@ Source: "{#Payload}\py\*"; DestDir: "{app}\py"; Flags: ignoreversion recursesubd
 Source: "{#Payload}\py\*"; DestDir: "{tmp}"; Flags: dontcopy
 
 [Icons]
-Name: "{userprograms}\{#AppName}"; Filename: "{app}\play.cmd"; WorkingDir: "{app}"
-Name: "{userdesktop}\{#AppName}"; Filename: "{app}\play.cmd"; WorkingDir: "{app}"; Tasks: desktop
+Name: "{userprograms}\{#AppName}"; Filename: "{app}\launcher\FM2Launcher.exe"; WorkingDir: "{app}"
+Name: "{userdesktop}\{#AppName}"; Filename: "{app}\launcher\FM2Launcher.exe"; WorkingDir: "{app}"; Tasks: desktop
+
+[Run]
+Filename: "{app}\launcher\FM2Launcher.exe"; Description: "Open the launcher"; Flags: postinstall nowait skipifsilent
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\py"
@@ -61,6 +65,7 @@ var
   IsoPage: TInputFileWizardPage;
   TuPage: TInputFileWizardPage;
   DlcPage: TInputDirWizardPage;
+  DownloadPage: TDownloadWizardPage;
   Python: String;
   Helper: String;
 
@@ -74,8 +79,19 @@ begin
   Result := '"' + S + '"';
 end;
 
+// The launcher needs the .NET 10 Desktop Runtime (x64).
+function DesktopRuntimeInstalled: Boolean;
+var
+  Found: TFindRec;
+begin
+  Result := FindFirst(ExpandConstant('{commonpf64}\dotnet\shared\Microsoft.WindowsDesktop.App\10.*'), Found);
+  if Result then
+    FindClose(Found);
+end;
+
 procedure InitializeWizard;
 begin
+  DownloadPage := CreateDownloadPage('Getting the .NET Desktop Runtime', 'The launcher needs Microsoft''s .NET 10 Desktop Runtime. Downloading it...', nil);
   ExtractTemporaryFiles('*');
   Python := ExpandConstant('{tmp}\python.exe');
   Helper := ExpandConstant('{tmp}\setup_game.py');
@@ -104,6 +120,25 @@ var
   Iso, Tu: String;
 begin
   Result := True;
+  if (CurPageID = wpReady) and not DesktopRuntimeInstalled then
+  begin
+    DownloadPage.Clear;
+    DownloadPage.Add('https://aka.ms/dotnet/10.0/windowsdesktop-runtime-win-x64.exe', 'windowsdesktop-runtime.exe', '');
+    DownloadPage.Show;
+    try
+      try
+        DownloadPage.Download;
+        // Microsoft's installer asks for administrator rights itself
+        Exec(ExpandConstant('{tmp}\windowsdesktop-runtime.exe'), '/install /quiet /norestart', '', SW_SHOW, ewWaitUntilTerminated, ResultCode);
+      except
+        MsgBox('The .NET Desktop Runtime could not be downloaded: ' + GetExceptionMessage + #13#10#13#10 +
+          'The game installs anyway. Get the runtime from https://dotnet.microsoft.com/download/dotnet/10.0 (".NET Desktop Runtime") to use the launcher.', mbError, MB_OK);
+      end;
+    finally
+      DownloadPage.Hide;
+    end;
+    exit;
+  end;
   if CurPageID = IsoPage.ID then
   begin
     Iso := IsoPage.Values[0];

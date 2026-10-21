@@ -24,7 +24,7 @@ The installer contains no game files. You need your own copy of the European dis
 5. Optionally, choose a folder with your DLC packages. If you have none, keep the default and this step is skipped.
 6. The installer builds the game files from the disc, unpacks the title update into `Documents\fm2\update`, copies any DLC into `Documents\fm2\dlc`, and offers a desktop shortcut.
 
-The installer bundles its own Python, so nothing else needs installing. The launcher checks GitHub for a newer release when it opens.
+The installer bundles its own Python. The launcher needs Microsoft's .NET 10 Desktop Runtime; the installer downloads and installs it when it is missing (Windows asks for administrator rights for that step). WebView2, which the launcher draws its window with, is part of Windows 11.
 
 ### Building the installer
 
@@ -97,12 +97,27 @@ by default), and its saves live in `Documents\fm2\profiles\<name>\content`.
 
 ## Launcher and settings
 
-The launcher also has an **Anti-aliasing** option (Off, 2x, 4x, 8x MSAA, off by default),
-an experimental **Enhanced lighting** checkbox (off by default, adds local contrast to the
-final frame; reflections are not done yet), and it checks GitHub for a newer release
-when it opens (`FM2_NO_UPDATE_CHECK=1` turns that off).
+The Start menu and desktop shortcuts open the launcher (`launcher\FM2Launcher.exe`, source in
+`launcher/FM2Launcher`: a .NET 10 WinForms window hosting WebView2, its page in `wwwroot`). Hover over any
+option for an explanation.
 
-A small launcher opens before the game with the player settings: profile name,
+- **Play**: profile name, resolution, aspect ratio, windowed or fullscreen, max FPS, VSync,
+  anti-aliasing (Off, 2x, 4x, 8x MSAA), enhanced lighting (experimental), skip intro videos, and the
+  game's language (English, German, French, Spanish, Italian, Japanese, Korean, Simplified and Traditional
+  Chinese, as on the disc; the disc's Polish, Czech and Hungarian text can't be picked yet). Every change is
+  saved to `Documents\fm2\settings.ini` straight away.
+- **Settings**: the shader cache (size, delete, rebuild now), the DLC packs (switch one off to keep it out of
+  the game, add packages, open the folder), and the install and user folders.
+- **Updates**: checks GitHub for the latest release, shows its notes, and downloads and installs its
+  `FM2-x.y.z-patch.zip` over the install. Files of the running launcher are renamed to `*.old` and replaced;
+  the next start removes them.
+
+`FM2Launcher.exe --play` starts the game with the saved settings without opening the window, and
+`--apply <patch.zip>` installs a downloaded patch. `tools/make_patch.py <version>` builds the patch zip
+(`fm2.exe`, the launcher published by `installer/build-installer.ps1`, and the changelog).
+
+`fm2.exe` started on its own (`play.cmd`) still shows its built-in settings window first. That window has
+the profile name,
 resolution, aspect ratio (Auto, 16:9, 21:9, 32:9; the image gets black bars when it
 differs from the resolution), windowed or borderless fullscreen, VSync, and max FPS
 (30-360). Play saves them to `Documents\fm2\settings.ini`. With VSync on, the cap
