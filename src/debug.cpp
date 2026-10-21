@@ -17,6 +17,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -343,6 +344,43 @@ std::string Handle(const std::string& line)
         const bool known = LiveSwitch::Set(name, on);
         return Ok(std::string("\"name\":\"") + Escape(name) + "\",\"on\":" + (on ? "true" : "false") +
                   ",\"reached\":" + (known ? "true" : "false"));
+    }
+    // find TEXT: guest addresses holding TEXT as ASCII, UTF-16 big- or little-endian (the first 64)
+    if (cmd == "find")
+    {
+        std::string text;
+        std::getline(in, text);
+        text.erase(0, text.find_first_not_of(' '));
+        if (text.empty())
+            return Error("find TEXT");
+        std::vector<std::pair<std::string, std::string>> needles = { { "ascii", text }, { "utf16be", "" }, { "utf16le", "" } };
+        for (char c : text)
+        {
+            needles[1].second += '\0', needles[1].second += c;
+            needles[2].second += c, needles[2].second += '\0';
+        }
+        std::string out;
+        int found = 0;
+        for (uint64_t a = 0x10000; a < 0x100000000ull && found < 64;)
+        {
+            MEMORY_BASIC_INFORMATION mi{};
+            if (!VirtualQuery(g_base + a, &mi, sizeof(mi)))
+                break;
+            const uint64_t start = uint64_t(static_cast<uint8_t*>(mi.BaseAddress) - g_base), end = start + mi.RegionSize;
+            if (mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            {
+                const std::string_view region(reinterpret_cast<const char*>(g_base + start), size_t(end - start));
+                for (const auto& [kind, n] : needles)
+                    for (size_t at = region.find(n); at != std::string_view::npos && found < 64; at = region.find(n, at + 1), found++)
+                    {
+                        char buf[48];
+                        snprintf(buf, sizeof(buf), "%s{\"address\":\"%08llX\",\"as\":\"%s\"}", out.empty() ? "" : ",", (unsigned long long)(start + at), kind.c_str());
+                        out += buf;
+                    }
+            }
+            a = end;
+        }
+        return Ok("\"hits\":[" + out + "]");
     }
     // env NAME [value]: set (or clear) an environment variable, for the switches that take a value (read once
     // at their first use, so mostly before that happens).

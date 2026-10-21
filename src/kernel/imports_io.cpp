@@ -203,6 +203,14 @@ bool VfsResolve(std::string guest, fs::path& host, bool* readOnly)
     while (!rest.empty() && rest.front() == '\\')
         rest.erase(rest.begin());
     host = rest.empty() ? root : root / fs::path(rest);
+#ifdef FM2_TITLE_UPDATE
+    // The update's media with the main menu's X button relabelled "Quit" (update_media.cpp).
+    if (lower.rfind("update:", 0) == 0 && Lower(rest) == "media.zip")
+    {
+        fs::path UpdateMediaZip(const fs::path& original);
+        host = UpdateMediaZip(host);
+    }
+#endif
     if (readOnly)
         *readOnly = ro;
     return true;
