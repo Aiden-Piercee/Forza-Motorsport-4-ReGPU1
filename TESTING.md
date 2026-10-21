@@ -75,11 +75,12 @@ The keyboard only works while the game window has focus.
   cannot be skipped by a button. Tick "Skip intro videos" in the launcher (or set
   FM2_SKIP_INTRO=1) to go straight to the title screen. Input recordings made before the clock
   fix start about 90 seconds too early.
-- Photo Mode: the viewfinder renders now (it was black below the top third). Taking and saving
-  a photo is not tested yet: if the saved picture is black, it reads the image back through
-  memory like the garage thumbnails below (FM2_RESOLVE_WRITEBACK handles small ones).
-- Garage thumbnails: cars created from now on get a correct thumbnail. Thumbnails saved by
-  earlier runs are noise and stay that way in that profile.
+- Photo Mode: saved photos include the "A Save / B Back" prompt. The saver reads the picture
+  from memory, which our copy updates a frame or two late; whether the console's photos have
+  the prompt is not known yet.
+- Garage thumbnails: cars added from 0.4.0 on get a correct thumbnail. Thumbnails saved by
+  earlier builds (noise, or red and blue swapped) stay that way; the game makes one per car,
+  when it joins the garage, so a painted livery isn't in it either.
 - "Xbox 360" text: the wording is UTF-16 inside the LSB2 string tables of every language zip
   (Media/StringTables/*.zip, e.g. Forza_Flow.str, Livery_Decals.str), and the decal names
   "XBOX 360 (Vertical Format)" are in Media/DB/gamedb.slt. Changing the length needs the LSB2
