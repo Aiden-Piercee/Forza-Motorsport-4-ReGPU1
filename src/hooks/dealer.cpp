@@ -3,11 +3,11 @@
 //
 // The song isn't ours to ship: put your own copy in Documents\fm2\easter\ (any format Windows decodes: mp3,
 // m4a, wav, ...; the first file there), or point FM2_DEALER_SONG at one. It's decoded once with Media
-// Foundation, played on a voice of its own, and its bass drives the bounce, so the cars move with the
-// music itself: a 40-150 Hz band, an envelope with a fast attack and a short release, minus its slow
-// average (a held bass note doesn't keep the car up). The bounce is looked up at the voice's playback
-// position each frame (FM2_DEALER_OFFSET_MS shifts it for audio/display latency, default 0).
-// The car-body vertex shaders lift their output by it (renderer.cpp: ApplyDirtSeamFix, vpoint.w).
+// Foundation, played on a voice of its own, and its beats are found (Analyse: tempo and phase from the kick
+// drum, each beat snapped to its kick, quiet passages skipped). On every beat the car bodies squash low and
+// wide and spring back (DealerSquash), timed from the voice's playback position each frame
+// (FM2_DEALER_OFFSET_MS shifts it for audio/display latency, default 0). The car-body vertex shaders scale
+// their model-space position by it (renderer.cpp: ApplyDirtSeamFix, vpoint.xyz).
 #include <windows.h>
 
 #include <mfapi.h>
@@ -37,11 +37,10 @@ namespace fs = std::filesystem;
 namespace
 {
 constexpr char kCode[] = "whysthisdealer";
-constexpr float kLift = 0.045f;  // clip-space lift at the strongest hit (about 2% of the screen height)
+constexpr double kSquash = 0.3;  // the strongest hit squashes the body to 70% of its height
 constexpr uint32_t kHopHz = 200; // bounce curve resolution (5 ms)
 
 std::atomic<bool> g_on{ false };
-std::vector<float> g_curve; // bounce 0..1 per hop
 uint32_t g_rate = 0, g_frames = 0;
 IXAudio2SourceVoice* g_voice = nullptr;
 double g_offset = 0; // seconds
@@ -118,11 +117,20 @@ bool Decode(const fs::path& file, std::vector<float>& pcm, uint32_t& rate)
     return rate && !pcm.empty();
 }
 
-// The bounce per hop, from the bass.
-std::vector<float> Analyse(const std::vector<float>& pcm, uint32_t rate)
+// The beats, from the kick drum: a 40-150 Hz band's energy every 5 ms; its rises (onsets); the tempo from
+// their autocorrelation (70-180 BPM) and the phase that lines a grid up with them; each grid beat moved to
+// the strongest onset within 25 ms of it, and kept only where there's a kick (not in quiet intros or
+// breaks). Strength 0.6-1 per beat (how hard it hits).
+struct Beat
+{
+    double time;
+    float strength;
+};
+std::vector<Beat> g_beats;
+
+std::vector<Beat> Analyse(const std::vector<float>& pcm, uint32_t rate)
 {
     const size_t frames = pcm.size() / 2, hop = std::max<size_t>(1, rate / kHopHz);
-    // A 40-150 Hz band: two one-pole low-passes at 150 Hz minus one at 40 Hz.
     auto alpha = [&](double hz) { return float(1.0 - std::exp(-2.0 * 3.14159265358979 * hz / rate)); };
     const float aHi = alpha(150), aLo = alpha(40);
     float lp1 = 0, lp2 = 0, lo = 0;
@@ -138,26 +146,81 @@ std::vector<float> Analyse(const std::vector<float>& pcm, uint32_t rate)
         sum += double(band) * band;
         if ((i + 1) % hop == 0)
         {
-            energy.push_back(float(std::sqrt(sum / hop)));
+            energy.push_back(float(std::log(1e-7 + std::sqrt(sum / hop))));
             sum = 0;
         }
     }
-    // Envelope: instant attack, ~120 ms release; minus a ~0.6 s average; normalised to the loud hits.
-    std::vector<float> curve(energy.size());
-    const float release = std::exp(-1.0f / (0.12f * kHopHz)), slow = 1.0f / (0.6f * kHopHz);
-    float env = 0, avg = 0;
-    for (size_t i = 0; i < energy.size(); i++)
+    const size_t n = energy.size();
+    std::vector<float> onset(n, 0.0f);
+    for (size_t i = 4; i < n; i++)
     {
-        env = std::max(energy[i], env * release);
-        avg += slow * (env - avg);
-        curve[i] = std::max(0.0f, env - 0.8f * avg);
+        const float before = 0.25f * (energy[i - 1] + energy[i - 2] + energy[i - 3] + energy[i - 4]);
+        onset[i] = std::max(0.0f, energy[i] - before);
     }
-    std::vector<float> sorted = curve;
-    std::sort(sorted.begin(), sorted.end());
-    const float top = sorted.empty() ? 1.0f : std::max(sorted[sorted.size() * 97 / 100], 1e-6f);
-    for (float& c : curve)
-        c = std::min(c / top, 1.0f);
-    return curve;
+    std::vector<Beat> beats;
+    if (n < kHopHz * 4)
+        return beats;
+    // Tempo: the lag (in hops) whose autocorrelation is strongest.
+    const size_t minLag = kHopHz * 60 / 180, maxLag = kHopHz * 60 / 70;
+    double best = -1;
+    size_t lag = minLag;
+    for (size_t l = minLag; l <= maxLag; l++)
+    {
+        double r = 0;
+        for (size_t i = l; i < n; i++)
+            r += double(onset[i]) * onset[i - l];
+        if (r > best)
+            best = r, lag = l;
+    }
+    // Phase: the grid offset that lands on the most onset.
+    best = -1;
+    size_t phase = 0;
+    for (size_t ph = 0; ph < lag; ph++)
+    {
+        double r = 0;
+        for (size_t i = ph; i < n; i += lag)
+            r += onset[i];
+        if (r > best)
+            best = r, phase = ph;
+    }
+    // Follow the song: each beat is predicted from the last (one period on), moved to the strongest onset
+    // within 60 ms if there's a clear one, and the period eases towards what was found, so a tempo that is a
+    // fraction off (or drifts) never slides off the kicks.
+    std::vector<float> sortedOnset(onset);
+    std::sort(sortedOnset.begin(), sortedOnset.end());
+    const float clear = std::max(sortedOnset[sortedOnset.size() * 98 / 100], 1e-6f);
+    const double window = 0.06 * kHopHz;
+    double period = double(lag), at = double(phase);
+    std::vector<float> peaks;
+    while (at < double(n))
+    {
+        size_t peak = size_t(at);
+        for (size_t k = size_t(std::max(0.0, at - window)); k < std::min(n, size_t(at + window) + 1); k++)
+            if (onset[k] > onset[peak])
+                peak = k;
+        double beat = at;
+        if (onset[peak] > 0.5f * clear)
+        {
+            if (!beats.empty())
+                period += 0.15 * ((double(peak) - beats.back().time * kHopHz) - period);
+            beat = double(peak);
+        }
+        period = std::clamp(period, double(lag) * 0.97, double(lag) * 1.03);
+        beats.push_back({ beat / kHopHz, onset[std::min(n - 1, size_t(beat))] });
+        peaks.push_back(beats.back().strength);
+        at = beat + period;
+    }
+    std::sort(peaks.begin(), peaks.end());
+    const float top = std::max(peaks[peaks.size() * 9 / 10], 1e-6f);
+    std::vector<Beat> kept;
+    for (const Beat& b : beats)
+        if (b.strength > 0.3f * top)
+            kept.push_back({ b.time, std::clamp(b.strength / top, 0.6f, 1.0f) });
+    if (getenv("FM2_DEALER_TRACE"))
+        for (const Beat& b : beats)
+            Log("dealer: beat %.3f strength %.2f%s", b.time, b.strength / top, b.strength > 0.3f * top ? "" : " (skipped)");
+    Log("dealer: %.1f BPM, %zu beats with a kick (of %zu)", 60.0 * kHopHz / lag, kept.size(), beats.size());
+    return kept;
 }
 
 void Start()
@@ -176,7 +239,7 @@ void Start()
         Log("dealer: couldn't decode %s", song.string().c_str());
         return;
     }
-    g_curve = Analyse(pcm, rate);
+    g_beats = Analyse(pcm, rate);
     g_rate = rate;
     g_frames = uint32_t(pcm.size() / 2);
     if (const char* o = getenv("FM2_DEALER_OFFSET_MS"))
@@ -229,16 +292,27 @@ void DealerOnChar(wchar_t c)
     }
 }
 
-// The car bodies' lift this frame (clip space), 0 when the egg is off.
-float DealerBounce()
+// The car bodies' scale this frame (x width, y height, z length), 1, 1, 1 when the egg is off. Each beat
+// is a damped spring: squashed low and wide on the hit, a small stretch back up, settled by ~0.4 s.
+void DealerSquash(float scale[3])
 {
-    if (!g_on.load(std::memory_order_relaxed))
-        return 0;
+    scale[0] = scale[1] = scale[2] = 1;
+    if (!g_on.load(std::memory_order_relaxed) || g_beats.empty())
+        return;
     XAUDIO2_VOICE_STATE st{};
     g_voice->GetState(&st, 0);
     const double t = double(st.SamplesPlayed % g_frames) / g_rate + g_offset;
-    const size_t i = size_t(std::max(0.0, t) * kHopHz);
-    return i < g_curve.size() ? kLift * g_curve[i] : 0.0f;
+    auto it = std::upper_bound(g_beats.begin(), g_beats.end(), t, [](double v, const Beat& b) { return v < b.time; });
+    if (it == g_beats.begin())
+        return;
+    --it;
+    const double dt = t - it->time;
+    if (dt > 0.6)
+        return;
+    const double hit = 1.0 - std::exp(-dt / 0.012); // a 12 ms attack, not a jump
+    const double y = 1.0 - kSquash * it->strength * hit * std::exp(-dt / 0.11) * std::cos(2.0 * 3.14159265358979 * 3.0 * dt);
+    scale[1] = float(y);
+    scale[0] = scale[2] = float(1.0 / std::sqrt(y)); // keeps the volume: squashed means wider and longer
 }
 
 // The game's music is silent from the moment the song starts until the game closes (xma.cpp).

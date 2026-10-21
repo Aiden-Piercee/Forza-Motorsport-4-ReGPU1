@@ -61,7 +61,7 @@ using Microsoft::WRL::ComPtr;
 
 void LogAllHostThreadStacks(const char* why); // hang.cpp
 extern std::atomic<bool> g_cameraAspectWidened; // hooks/camera_aspect.cpp
-float DealerBounce(); // hooks/dealer.cpp: the car bodies' bounce
+void DealerSquash(float scale[3]); // hooks/dealer.cpp: the car bodies' squash (1, 1, 1 when off)
 
 namespace
 {
@@ -2051,11 +2051,18 @@ bool ApplyDirtSeamFix(std::string& hlsl, bool pixel)
             return false;
         if (!off && hlsl.find("o[9]") == std::string::npos)
             hlsl.insert(at + uv.size(), " o[9] = float4(frac(o[0].z + 0.5), 1, 0, 0);");
-        // The bounce: a lift in clip space, from vpoint.w (point sprites only use vpoint, and these
-        // draws are never point sprites; the renderer sets it to the bounce, 0 normally).
-        static const std::string end = "}\nvoid GuestVS(uint vindex, out float4 opos, out float4 o[16])\n";
-        if (size_t e = hlsl.find(end); e != std::string::npos)
-            hlsl.insert(e, "            opos.y += vpoint.w * opos.w;\n");
+        // The easter egg's squash: the model-space position (fetch 0, dequantised as q * w + vc[191]) is
+        // scaled per axis (x width, y height, z length) by vpoint.xyz. Point sprites are the only other
+        // reader of vpoint and these draws never are; the renderer sets it to 1, 1, 1 normally.
+        static const std::string fetch = "{ float4 t = VFetchK(0, r[0].x); r[";
+        if (size_t f = hlsl.find(fetch); f != std::string::npos)
+        {
+            const size_t from = f + fetch.size();
+            const std::string n = hlsl.substr(from, hlsl.find(']', from) - from);
+            const std::string r = "r[" + n + "]";
+            hlsl.insert(hlsl.find('\n', f) + 1, "    if (" + r + ".w != 0) { float3 m = " + r + ".xyz * " + r + ".w + vc[191].xyz; " + r +
+                ".xyz = (m * vpoint.xyz - vc[191].xyz) / " + r + ".w; }\n");
+        }
         return true;
     }
     if (off)
@@ -2161,6 +2168,8 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
         return cs;
     }
     cs.carBody = ApplyDirtSeamFix(cs.info.hlsl, pixel);
+    if (cs.carBody)
+        Log("renderer: vs %016llx is a car body", (unsigned long long)hash);
     if (g_dumpHlsl)
     {
         std::filesystem::create_directories("out/hlsl");
@@ -6358,10 +6367,11 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     vc->point[1] = float(pointSize & 0xFFFF) / 8.0f;
     vc->point[2] = float(pointMinMax & 0xFFFF) / 8.0f;
     vc->point[3] = float(pointMinMax >> 16) / 8.0f;
-    // Car bodies read vpoint.w as their bounce (the "whysthisdealer" easter egg, dealer.cpp).
+    // Car bodies read vpoint.xyz as their squash (the "whysthisdealer" easter egg, dealer.cpp).
     if (vs.carBody)
     {
-        vc->point[3] = DealerBounce();
+        DealerSquash(vc->point);
+        vc->point[3] = 0;
     }
     pc->info[1] = (gpureg::Get(SQ_PROGRAM_CNTL) >> 18) & 1 ? (gpureg::Get(SQ_CONTEXT_MISC) >> 8) & 0xFF : 0xFF;
 
