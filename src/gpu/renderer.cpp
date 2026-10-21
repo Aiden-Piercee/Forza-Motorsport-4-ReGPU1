@@ -6211,7 +6211,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // depth-of-field composite once, full-screen, into another view of the same EDRAM after
         // the 4x scene's three tiles, and clipped to the last tile it covered only the bottom
         // third (the rest of the picture was black).
-        else if (g_tile.originY != 0 && (g_tile.surface == ~0u || g_tile.surface == gpureg::Get(RB_SURFACE_INFO)))
+        // Another MSAA view of the tiled surface itself (the paint editor's stencil clears) is still
+        // tile-relative.
+        else if (g_tile.originY != 0 && (g_tile.surface == ~0u || g_tile.surface == gpureg::Get(RB_SURFACE_INFO) || ForeignNativeMsaa() >= 0))
         {
             shiftY = float(g_tile.originY + wy);
             scissor.left = std::max(scissor.left, g_tile.rect.left);
