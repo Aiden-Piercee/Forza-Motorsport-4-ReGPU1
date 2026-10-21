@@ -13,11 +13,11 @@ No game data is included: you need your own copy of the disc. See
 [FM2-native-scope.md](FM2-native-scope.md) for the plan and [TESTING.md](TESTING.md)
 for playing it.
 
-## Install (0.1.0)
+## Install
 
 The installer contains no game files. You need your own copy of the European disc image and the title update.
 
-1. Download `FM2-Setup-0.1.0.exe` from the [releases page](https://github.com/zer0ducksgiven/Forza-Motorsport-2-ReGPU/releases) and run it. No admin rights are needed.
+1. Download `FM2-Setup-0.3.0.exe` from the [releases page](https://github.com/zer0ducksgiven/Forza-Motorsport-2-ReGPU/releases) and run it. No admin rights are needed.
 2. Choose an install folder (default `%LOCALAPPDATA%\FM2`).
 3. Choose your European disc image (`.iso`). It is checked against this build.
 4. Choose the title update file (named like `TU_16L61VA_...`). It is checked against this build.
@@ -34,7 +34,7 @@ Needs Inno Setup 6 and a Python 3.12 embeddable package unpacked into `out\pyemb
 powershell -ExecutionPolicy Bypass -File installer\build-installer.ps1 -Version 0.1.0
 ```
 
-It stages `installer\payload` from `build\tu` and the scripts, and writes `installer\dist\FM2-Setup-0.1.0.exe`.
+It stages `installer\payload` from `build\tu` and the scripts, and writes `installer\dist\FM2-Setup-0.3.0.exe`.
 
 ## Shaders compiled before you drive, smooth frame times while you do
 
