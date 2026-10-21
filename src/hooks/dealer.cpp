@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <mutex>
 #include <string>
@@ -37,7 +38,7 @@ namespace fs = std::filesystem;
 namespace
 {
 constexpr char kCode[] = "whysthisdealer";
-constexpr double kSquash = 0.4;  // each beat flattens the body to 60% of its height
+constexpr double kSquash = 0.3;  // flattest 70% of the height on the beat, tallest 130% between
 constexpr uint32_t kHopHz = 200; // bounce curve resolution (5 ms)
 
 std::atomic<bool> g_on{ false };
@@ -292,9 +293,9 @@ void DealerOnChar(wchar_t c)
     }
 }
 
-// The car bodies' scale this frame (x width, y height, z length), 1, 1, 1 when the egg is off. Each beat
-// flattens the body hard: down to 1 - kSquash of its height in 15 ms (wider and longer, keeping its volume),
-// then eased back up over most of the beat, ready for the next.
+// The car bodies' scale this frame (x width, y height, z length), 1, 1, 1 when the egg is off. A cycle per
+// beat: flattest (low and wide) on the beat, squeezed in (tall and thin) halfway to the next, keeping the
+// body's volume.
 void DealerSquash(float scale[3])
 {
     scale[0] = scale[1] = scale[2] = 1;
@@ -307,21 +308,87 @@ void DealerSquash(float scale[3])
     if (it == g_beats.begin())
         return;
     const auto beat = it - 1;
-    const double dt = t - beat->time;
     const double length = it != g_beats.end() ? it->time - beat->time : 0.45;
-    constexpr double kAttack = 0.015;
-    double flat;
-    if (dt < kAttack)
-        flat = dt / kAttack;
-    else
-    {
-        const double back = std::min(1.0, (dt - kAttack) / (0.7 * length)); // back to normal by 70% of the beat
-        flat = 0.5 + 0.5 * std::cos(3.14159265358979 * back);
-    }
-    const double y = 1.0 - kSquash * flat;
+    const double phase = std::clamp((t - beat->time) / length, 0.0, 1.0);
+    const double y = 1.0 - kSquash * std::cos(2.0 * 3.14159265358979 * phase);
     scale[1] = float(y);
-    scale[0] = scale[2] = float(1.0 / std::sqrt(y)); // keeps the volume: flatter means wider and longer
+    scale[0] = scale[2] = float(1.0 / std::sqrt(y)); // flatter means wider and longer, taller means thinner
 }
 
 // The game's music is silent from the moment the song starts until the game closes (xma.cpp).
 bool DealerMutesMusic() { return g_on.load(std::memory_order_relaxed); }
+
+// One car-body-shader draw (renderer.cpp): what its vertex shader does with vpoint. Its clip position is
+// p.x c1 + p.y c0 + p.z c2 + c3 (an ordinary matrix: c3 is the model origin on screen, c0-c2 the model
+// axes). Body draws set the car of reference and are squashed in model space (vpoint.xyz: width, height,
+// length; vpoint.w 0). A wheel (a draw of another shader, following its car's body) keeps its shape and
+// moves with the body: its hub (its own c3), in the car's axes, is h = A^-1 (hub - origin); squashing
+// moves it by A (S - 1) h, added to its clip position (vpoint.xyz = clip x, y, w; vpoint.w 1).
+void DealerCarDraw(uint64_t vs, const float c[256][4], float point[4])
+{
+    float s[3];
+    DealerSquash(s);
+    point[0] = s[0], point[1] = s[1], point[2] = s[2], point[3] = 0;
+    static uint64_t bodyVs = 0;
+    static float origin[4], axes[3][4];
+    static int up = 1;
+    auto setBody = [&] {
+        bodyVs = vs;
+        memcpy(origin, c[3], sizeof(origin));
+        for (int j = 0; j < 3; j++)
+            memcpy(axes[j], c[j], sizeof(axes[j]));
+        // Up: the axis that points most vertically on screen (cars are seen roughly upright).
+        float best = -1;
+        for (int j = 0; j < 3; j++)
+        {
+            const float len = std::sqrt(axes[j][0] * axes[j][0] + axes[j][1] * axes[j][1]) + 1e-6f;
+            if (std::abs(axes[j][1]) / len > best)
+                best = std::abs(axes[j][1]) / len, up = j;
+        }
+    };
+    if (!bodyVs || vs == bodyVs)
+    {
+        setBody();
+        return;
+    }
+    point[0] = point[1] = point[2] = 0;
+    point[3] = 1;
+    // h from the x, y and w rows (z only carries depth): a 3x3 solve.
+    const int rows[3] = { 0, 1, 3 };
+    double m[3][3], d[3];
+    for (int r = 0; r < 3; r++)
+    {
+        for (int j = 0; j < 3; j++)
+            m[r][j] = axes[j][rows[r]];
+        d[r] = c[3][rows[r]] - origin[rows[r]];
+    }
+    const double det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+        m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    if (std::abs(det) < 1e-9)
+        return;
+    double h[3];
+    for (int j = 0; j < 3; j++)
+    {
+        double t[3][3];
+        memcpy(t, m, sizeof(t));
+        for (int r = 0; r < 3; r++)
+            t[r][j] = d[r];
+        h[j] = (t[0][0] * (t[1][1] * t[2][2] - t[1][2] * t[2][1]) - t[0][1] * (t[1][0] * t[2][2] - t[1][2] * t[2][0]) +
+                   t[0][2] * (t[1][0] * t[2][1] - t[1][1] * t[2][0])) / det;
+    }
+    // Far from the car of reference: another car's body (drawn with another shader), now the reference.
+    if (std::abs(h[0]) > 4 || std::abs(h[1]) > 4 || std::abs(h[2]) > 4)
+    {
+        setBody();
+        point[0] = s[0], point[1] = s[1], point[2] = s[2], point[3] = 0;
+        return;
+    }
+    double move[4] = {};
+    for (int j = 0; j < 3; j++)
+    {
+        const double k = (j == up ? s[1] : s[0]) - 1.0;
+        for (int r = 0; r < 4; r++)
+            move[r] += axes[j][r] * k * h[j];
+    }
+    point[0] = float(move[0]), point[1] = float(move[1]), point[2] = float(move[3]);
+}

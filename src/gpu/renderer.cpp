@@ -61,7 +61,7 @@ using Microsoft::WRL::ComPtr;
 
 void LogAllHostThreadStacks(const char* why); // hang.cpp
 extern std::atomic<bool> g_cameraAspectWidened; // hooks/camera_aspect.cpp
-void DealerSquash(float scale[3]); // hooks/dealer.cpp: the car bodies' squash (1, 1, 1 when off)
+void DealerCarDraw(uint64_t vs, const float c[256][4], float point[4]); // hooks/dealer.cpp: the easter egg, per car draw
 
 namespace
 {
@@ -2017,6 +2017,10 @@ std::unordered_map<uint64_t, uint64_t> g_psEditAlias; // shader -> alias
 std::unordered_map<uint64_t, std::string> g_psEditExpr; // alias -> the expression it returns
 std::atomic<bool> g_psEdits{ false };
 std::unordered_set<uint64_t> g_psEditEver; // every alias made (kept out of the pipeline manifest)
+// The debug server's drawstats: draws per (vs, ps) over one frame.
+std::atomic<int> g_drawStats{ 0 }; // 1 armed for the next frame, 2 counting, 0 off
+std::mutex g_drawStatsMutex;
+std::map<std::pair<uint64_t, uint64_t>, uint32_t> g_drawStatsCounts;
 bool IsPsEditAlias(uint64_t hash)
 {
     std::lock_guard lock(g_psEditMutex);
@@ -2060,9 +2064,14 @@ bool ApplyDirtSeamFix(std::string& hlsl, bool pixel)
             const size_t from = f + fetch.size();
             const std::string n = hlsl.substr(from, hlsl.find(']', from) - from);
             const std::string r = "r[" + n + "]";
-            hlsl.insert(hlsl.find('\n', f) + 1, "    if (" + r + ".w != 0) { float3 m = " + r + ".xyz * " + r + ".w + vc[191].xyz; " + r +
+            // vpoint.w 0: a body, scaled by vpoint.xyz; 1: a wheel, moved on screen by vpoint.xyz (clip x, y,
+            // w: its hub follows the body's squash, dealer.cpp DealerCarDraw).
+            hlsl.insert(hlsl.find('\n', f) + 1, "    if (" + r + ".w != 0 && vpoint.w == 0) { float3 m = " + r + ".xyz * " + r + ".w + vc[191].xyz; " + r +
                 ".xyz = (m * vpoint.xyz - vc[191].xyz) / " + r + ".w; }\n");
         }
+        static const std::string end = "}\nvoid GuestVS(uint vindex, out float4 opos, out float4 o[16])\n";
+        if (size_t e = hlsl.find(end); e != std::string::npos)
+            hlsl.insert(e, "            if (vpoint.w > 0) opos.xyw += vpoint.xyz;\n");
         return true;
     }
     if (off)
@@ -5993,6 +6002,11 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         ~PsAlias() { C().psHash = real; C().vsHash = realVs; }
     } psAlias;
     const CompiledShader& vs = GetShader(C().vsHash, C().vsCode, false);
+    if (g_drawStats.load(std::memory_order_relaxed) == 2) // the debug server's drawstats: every draw of a frame
+    {
+        std::lock_guard lock(g_drawStatsMutex);
+        g_drawStatsCounts[{ psAlias.realVs, psAlias.real }]++;
+    }
     const CompiledShader& ps = GetShader(C().psHash, C().psCode, true);
     Section(1);
     static LiveSwitch asyncShaders("FM2_ASYNC_SHADERS");
@@ -6370,8 +6384,11 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // Car bodies read vpoint.xyz as their squash (the "whysthisdealer" easter egg, dealer.cpp).
     if (vs.carBody)
     {
-        DealerSquash(vc->point);
-        vc->point[3] = 0;
+        DealerCarDraw(C().vsHash, vc->c, vc->point);
+        static LiveSwitch traceCar("FM2_TRACE_CAR_DRAWS");
+        if (traceCar)
+            Log("car draw: vs %016llx ps %016llx origin %.3f %.3f %.3f %.3f x %.3f %.3f %.3f", (unsigned long long)C().vsHash, (unsigned long long)C().psHash,
+                vc->c[3][0], vc->c[3][1], vc->c[3][2], vc->c[3][3], vc->c[0][0], vc->c[0][1], vc->c[0][2]);
     }
     pc->info[1] = (gpureg::Get(SQ_PROGRAM_CNTL) >> 18) & 1 ? (gpureg::Get(SQ_CONTEXT_MISC) >> 8) & 0xFF : 0xFF;
 
@@ -7244,6 +7261,8 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     }
     ++g_r.frame;
     DebugOnSwap(g_r.frame);
+    if (int st = g_drawStats.load(); st) // drawstats: arm at one swap, stop at the next
+        g_drawStats = st == 1 ? 2 : 0;
     // The debug server's "shot": this frame (when it has a picture), to the file it names.
     std::string shotPath;
     const bool shot = fromResolve && DebugShotPending(shotPath);
@@ -7560,4 +7579,26 @@ bool RendererPsEditReady(uint64_t alias)
         if ((key.ps == alias || key.vs == alias) && entry->state.load(std::memory_order_acquire) == 1)
             return true;
     return false;
+}
+
+// drawstats: counts the next whole frame's draws by shader pair (blocks until it's done).
+std::string RendererDrawStats()
+{
+    {
+        std::lock_guard lock(g_drawStatsMutex);
+        g_drawStatsCounts.clear();
+    }
+    g_drawStats = 1;
+    for (int i = 0; i < 400 && g_drawStats.load() != 0; i++)
+        Sleep(5);
+    std::lock_guard lock(g_drawStatsMutex);
+    std::string out;
+    char buf[96];
+    for (const auto& [k, n] : g_drawStatsCounts)
+    {
+        snprintf(buf, sizeof(buf), "%s{\"vs\":\"%016llx\",\"ps\":\"%016llx\",\"draws\":%u}", out.empty() ? "" : ",", (unsigned long long)k.first,
+            (unsigned long long)k.second, n);
+        out += buf;
+    }
+    return out;
 }

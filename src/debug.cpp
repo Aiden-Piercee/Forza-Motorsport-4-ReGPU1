@@ -32,6 +32,7 @@ void RendererRequestCapture(); // renderer.cpp: F12
 uint64_t RendererEditPixelShader(uint64_t hash, const std::string& expr);
 std::string RendererShaderHlsl(uint64_t hash);
 bool RendererPsEditReady(uint64_t alias);
+std::string RendererDrawStats();
 
 namespace
 {
@@ -345,6 +346,9 @@ std::string Handle(const std::string& line)
         return Ok(std::string("\"name\":\"") + Escape(name) + "\",\"on\":" + (on ? "true" : "false") +
                   ",\"reached\":" + (known ? "true" : "false"));
     }
+    // drawstats: the next frame's draws per shader pair
+    if (cmd == "drawstats")
+        return Ok("\"pairs\":[" + RendererDrawStats() + "]");
     // type TEXT: as if typed in the game window (WM_CHAR: easter-egg codes)
     if (cmd == "type")
     {
