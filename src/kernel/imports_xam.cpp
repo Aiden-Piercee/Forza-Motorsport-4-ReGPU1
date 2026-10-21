@@ -165,7 +165,7 @@ GUEST_EXPORT(XamUserCreateStatsEnumerator)
 
 GUEST_EXPORT(XGetAVPack) { Return(ctx, 6); }        // HDMI
 GUEST_EXPORT(XGetGameRegion) { Return(ctx, 0xFFFF); }
-GUEST_EXPORT(XGetLanguage) { Return(ctx, 1); }      // English
+GUEST_EXPORT(XGetLanguage) { Return(ctx, GetSettings().language); } // settings.ini language
 GUEST_EXPORT(XamGetSystemVersion) { Return(ctx, 0x20004B07); }
 GUEST_EXPORT(XNetLogonGetTitleID) { Return(ctx, g_title.titleId); }
 

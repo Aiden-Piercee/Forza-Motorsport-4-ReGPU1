@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include "kernel/imports.h"
+#include "settings.h"
 #include "kernel/thread.h"
 
 namespace
@@ -809,7 +810,7 @@ GUEST_EXPORT(ExGetXConfigSetting)
     uint32_t value = 0, valueSize = 4;
     switch ((category << 16) | setting)
     {
-    case 0x00030009: value = 1; break;          // user: language (English)
+    case 0x00030009: value = GetSettings().language; break; // user: language (settings.ini)
     case 0x0003000A: value = 0x00040000; break; // user: video flags (widescreen)
     case 0x00020002: value = 0x00800000; break; // console: AV region
     case 0x00030007: value = 0; break;          // user: retail flags

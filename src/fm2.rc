@@ -1,3 +1,25 @@
 // The application icon (assets/fm2.ico, built by tools/makeico.py from assets/icon.png):
 // the exe's icon in Explorer and the class icon of the launcher and game windows (id 1).
 1 ICON "../assets/fm2.ico"
+
+// The version (src/version.h): the launcher's updater reads ProductVersion from it.
+#include "version.h"
+1 VERSIONINFO
+FILEVERSION 0,0,0,0
+PRODUCTVERSION 0,0,0,0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "ProductName", "Forza Motorsport 2 ReGPU"
+            VALUE "FileDescription", "Forza Motorsport 2 ReGPU"
+            VALUE "ProductVersion", FM2_VERSION
+            VALUE "FileVersion", FM2_VERSION
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
