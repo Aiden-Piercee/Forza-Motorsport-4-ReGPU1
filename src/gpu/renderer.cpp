@@ -1300,6 +1300,8 @@ void BeginFrameIfNeeded()
         g_gpuWaitSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
     }
     f.garbage.clear();
+    void FinishDepthWriteback(UINT frameIndex);
+    FinishDepthWriteback(UINT(&f - g_r.frames)); // this slot's previous frame has completed
     static const bool perf = getenv("FM2_PERF") != nullptr;
     const UINT frameIndex = UINT(&f - g_r.frames);
     if (!g_occlusionPending[frameIndex].empty())
@@ -4270,6 +4272,7 @@ void UpscaleScene(uint32_t base)
 
 // Copies the render target resolved to `base` into guest memory, tiled, for the title to read.
 void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t info);
+void WriteDepthToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t info, const D3D12_RECT& rect);
 
 void Resolve()
 {
@@ -4374,6 +4377,12 @@ void Resolve()
             }
             return v;
         }();
+        // Depth of the 4x scene copied out as 8888 (Photo Mode only, every frame; races copy smaller
+        // depth images the same way and must not pay for a readback): the title reads the depth under the
+        // reticle on the CPU for its focus point, so these rows also go to memory.
+        static const bool noDepthWriteback = getenv("FM2_NO_DEPTH_WRITEBACK") != nullptr;
+        if (depth && destFormat == 6 && !noDepthWriteback && width >= kWidth && ((gpureg::Get(RB_SURFACE_INFO) >> 16) & 3) == 2) // 4x scene tiles only
+            WriteDepthToGuest(base, width, height, info, rect);
         if (!depth && destFormat == 6 && rect.left == 0 && rect.top == 0 &&
             std::find(writeback.begin(), writeback.end(), std::pair<uint32_t, uint32_t>(width, height)) != writeback.end())
             WriteResolveToGuest(base, width, height, info);
@@ -5187,6 +5196,107 @@ void EndOcclusionQuery()
     C().list->EndQuery(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex);
     C().list->ResolveQueryData(g_occlusionHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, g_occlusionIndex, 1, g_occlusionReadback.Get(), UINT64(g_occlusionIndex) * 8);
     g_occlusionPending[g_r.frameIndex].push_back({ g_occlusionOrder, g_occlusionIndex });
+}
+
+// The depth around the screen centre (Photo Mode's focus reticle), written to guest memory as the
+// console stores a D24FS8 copy: tiled 32-bit words, the 20e4 float depth in the top 24 bits. The
+// box is copied to a readback buffer with the frame and written when that frame slot comes round
+// again (a frame or two late, no stall: the full image with a wait per tile ran Photo Mode at 20 fps).
+constexpr uint32_t kFocusX0 = 512, kFocusX1 = 768, kFocusY0 = 296, kFocusY1 = 424; // game pixels
+struct DepthWriteback
+{
+    ComPtr<ID3D12Resource> buffer;
+    UINT pitch = 0, hostX0 = 0, hostY0 = 0, hostW = 0, hostH = 0;
+    uint32_t base = 0, width = 0, height = 0, info = 0, y0 = 0, y1 = 0;
+    bool pending = false;
+};
+DepthWriteback g_depthWriteback[kFrames];
+
+void FinishDepthWriteback(UINT frameIndex)
+{
+    DepthWriteback& w = g_depthWriteback[frameIndex];
+    if (!w.pending)
+        return;
+    w.pending = false;
+    const uint8_t* pixels = nullptr;
+    if (FAILED(w.buffer->Map(0, nullptr, reinterpret_cast<void**>(const_cast<uint8_t**>(&pixels)))) || !pixels)
+        return;
+    auto encode = [](float v) -> uint32_t {
+        v = std::clamp(v, 0.0f, 1.0f);
+        if (v < std::ldexp(1.0f, -14))
+            return std::min<uint32_t>(uint32_t(std::lround(std::ldexp(double(v), 34))), 0xFFFFF); // denormal: m / 2^20 * 2^-14
+        int e = 0;
+        (void)std::frexp(double(v), &e); // v = f * 2^e, f in [0.5, 1)
+        const int exponent = std::clamp(e - 1 + 15, 1, 15);
+        const double mantissa = std::ldexp(double(v), 15 - exponent) - 1.0;
+        return uint32_t(exponent) << 20 | std::min<uint32_t>(uint32_t(std::lround(mantissa * 1048576.0)), 0xFFFFF);
+    };
+    const uint32_t endian = w.info & 7, pitchTexels = (w.width + 31) & ~31u;
+    uint8_t* guest = GuestPtr<uint8_t>(GpuPhysToGuest(w.base));
+    const double sx = double(w.hostW) / double(kFocusX1 - kFocusX0), sy = double(w.hostH) / double(w.y1 - w.y0);
+    for (uint32_t y = w.y0; y < w.y1; y++)
+    {
+        const float* line = reinterpret_cast<const float*>(pixels + size_t(std::min<double>((y - w.y0) * sy, w.hostH - 1)) * w.pitch);
+        for (uint32_t x = kFocusX0; x < kFocusX1; x++)
+        {
+            const uint32_t word = encode(line[std::min<size_t>(size_t((x - kFocusX0) * sx), w.hostW - 1)]) << 8;
+            const uint32_t stored = endian == 0 ? word : __builtin_bswap32(word);
+            memcpy(guest + TextureTiledOffset(x, y, pitchTexels, 2), &stored, 4);
+        }
+    }
+    const D3D12_RANGE none{ 0, 0 };
+    w.buffer->Unmap(0, &none);
+}
+
+void WriteDepthToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t info, const D3D12_RECT& rect)
+{
+    const auto it = g_r.resolved.find(base);
+    if (it == g_r.resolved.end() || !it->second.resource || it->second.format != DXGI_FORMAT_R32_FLOAT || width < kFocusX1 || height < kFocusY1)
+        return;
+    // Only the tile that holds the box (rows of this resolve).
+    const uint32_t y0 = std::max<uint32_t>(kFocusY0, uint32_t(std::max<LONG>(rect.top, 0)));
+    const uint32_t y1 = std::min<uint32_t>(kFocusY1, uint32_t(std::max<LONG>(rect.bottom, 0)));
+    if (y1 <= y0)
+        return;
+    ResolvedTexture& r = it->second;
+    DepthWriteback& w = g_depthWriteback[g_r.frameIndex];
+    w.hostX0 = UINT(uint64_t(kFocusX0) * r.hostWidth / width);
+    w.hostW = std::max<UINT>(1, UINT(uint64_t(kFocusX1) * r.hostWidth / width) - w.hostX0);
+    w.hostY0 = UINT(uint64_t(y0) * r.hostHeight / height);
+    w.hostH = std::max<UINT>(1, std::min<UINT>(UINT(uint64_t(y1) * r.hostHeight / height), r.hostHeight) - w.hostY0);
+    w.pitch = (w.hostW * 4 + 255) & ~255u;
+    const UINT64 bytes = UINT64(w.pitch) * w.hostH;
+    if (!w.buffer || w.buffer->GetDesc().Width < bytes)
+        w.buffer = CreateBuffer(std::max<UINT64>(bytes, 1u << 20), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_RESOURCE_BARRIER bar{};
+    bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bar.Transition.pResource = r.resource.Get();
+    bar.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    C().list->ResourceBarrier(1, &bar);
+    D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+    dst.pResource = w.buffer.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R32_FLOAT, w.hostW, w.hostH, 1, w.pitch };
+    src.pResource = r.resource.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    const D3D12_BOX box{ w.hostX0, w.hostY0, 0, w.hostX0 + w.hostW, w.hostY0 + w.hostH, 1 };
+    C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    std::swap(bar.Transition.StateBefore, bar.Transition.StateAfter);
+    C().list->ResourceBarrier(1, &bar);
+    w.base = base;
+    w.width = width;
+    w.height = height;
+    w.info = info;
+    w.y0 = y0;
+    w.y1 = y1;
+    w.pending = true;
+    static bool logged = false;
+    if (!logged)
+    {
+        logged = true;
+        Log("resolve: Photo Mode focus: depth around the centre written back to guest memory at %08X", base);
+    }
 }
 
 void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t info)
