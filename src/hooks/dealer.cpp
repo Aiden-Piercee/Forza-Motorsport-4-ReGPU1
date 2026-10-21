@@ -4,8 +4,8 @@
 // The song isn't ours to ship: put your own copy in Documents\fm2\easter\ (any format Windows decodes: mp3,
 // m4a, wav, ...; the first file there), or point FM2_DEALER_SONG at one. It's decoded once with Media
 // Foundation, played on a voice of its own, and its beats are found (Analyse: tempo and phase from the kick
-// drum, each beat snapped to its kick, quiet passages skipped). On every beat the car bodies squash low and
-// wide and spring back (DealerSquash), timed from the voice's playback position each frame
+// drum, each beat snapped to its kick). On every beat the car bodies flatten hard and ease back up
+// (DealerSquash), timed from the voice's playback position each frame
 // (FM2_DEALER_OFFSET_MS shifts it for audio/display latency, default 0). The car-body vertex shaders scale
 // their model-space position by it (renderer.cpp: ApplyDirtSeamFix, vpoint.xyz).
 #include <windows.h>
@@ -37,7 +37,7 @@ namespace fs = std::filesystem;
 namespace
 {
 constexpr char kCode[] = "whysthisdealer";
-constexpr double kSquash = 0.3;  // the strongest hit squashes the body to 70% of its height
+constexpr double kSquash = 0.4;  // each beat flattens the body to 60% of its height
 constexpr uint32_t kHopHz = 200; // bounce curve resolution (5 ms)
 
 std::atomic<bool> g_on{ false };
@@ -212,14 +212,14 @@ std::vector<Beat> Analyse(const std::vector<float>& pcm, uint32_t rate)
     }
     std::sort(peaks.begin(), peaks.end());
     const float top = std::max(peaks[peaks.size() * 9 / 10], 1e-6f);
+    // Every beat of the tracked grid squashes (a constant pulse, quiet passages included).
     std::vector<Beat> kept;
     for (const Beat& b : beats)
-        if (b.strength > 0.3f * top)
-            kept.push_back({ b.time, std::clamp(b.strength / top, 0.6f, 1.0f) });
+        kept.push_back({ b.time, 1.0f });
     if (getenv("FM2_DEALER_TRACE"))
         for (const Beat& b : beats)
             Log("dealer: beat %.3f strength %.2f%s", b.time, b.strength / top, b.strength > 0.3f * top ? "" : " (skipped)");
-    Log("dealer: %.1f BPM, %zu beats with a kick (of %zu)", 60.0 * kHopHz / lag, kept.size(), beats.size());
+    Log("dealer: %.1f BPM, %zu beats", 60.0 * kHopHz / lag, kept.size());
     return kept;
 }
 
@@ -293,7 +293,8 @@ void DealerOnChar(wchar_t c)
 }
 
 // The car bodies' scale this frame (x width, y height, z length), 1, 1, 1 when the egg is off. Each beat
-// is a damped spring: squashed low and wide on the hit, a small stretch back up, settled by ~0.4 s.
+// flattens the body hard: down to 1 - kSquash of its height in 15 ms (wider and longer, keeping its volume),
+// then eased back up over most of the beat, ready for the next.
 void DealerSquash(float scale[3])
 {
     scale[0] = scale[1] = scale[2] = 1;
@@ -305,14 +306,21 @@ void DealerSquash(float scale[3])
     auto it = std::upper_bound(g_beats.begin(), g_beats.end(), t, [](double v, const Beat& b) { return v < b.time; });
     if (it == g_beats.begin())
         return;
-    --it;
-    const double dt = t - it->time;
-    if (dt > 0.6)
-        return;
-    const double hit = 1.0 - std::exp(-dt / 0.012); // a 12 ms attack, not a jump
-    const double y = 1.0 - kSquash * it->strength * hit * std::exp(-dt / 0.11) * std::cos(2.0 * 3.14159265358979 * 3.0 * dt);
+    const auto beat = it - 1;
+    const double dt = t - beat->time;
+    const double length = it != g_beats.end() ? it->time - beat->time : 0.45;
+    constexpr double kAttack = 0.015;
+    double flat;
+    if (dt < kAttack)
+        flat = dt / kAttack;
+    else
+    {
+        const double back = std::min(1.0, (dt - kAttack) / (0.7 * length)); // back to normal by 70% of the beat
+        flat = 0.5 + 0.5 * std::cos(3.14159265358979 * back);
+    }
+    const double y = 1.0 - kSquash * flat;
     scale[1] = float(y);
-    scale[0] = scale[2] = float(1.0 / std::sqrt(y)); // keeps the volume: squashed means wider and longer
+    scale[0] = scale[2] = float(1.0 / std::sqrt(y)); // keeps the volume: flatter means wider and longer
 }
 
 // The game's music is silent from the moment the song starts until the game closes (xma.cpp).
