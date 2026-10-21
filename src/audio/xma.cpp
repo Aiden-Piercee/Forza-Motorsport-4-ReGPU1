@@ -16,7 +16,9 @@
 //   5: in0 address  6: in1 address  7: output address  8: work buffer
 //   9: output read offset 0-4
 #include <algorithm>
+#include <filesystem>
 #include <chrono>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <set>
@@ -35,6 +37,8 @@ extern "C"
 #include "kernel/imports.h"
 #include "live_switch.h"
 #include "log.h"
+
+bool DealerMutesMusic(); // hooks/dealer.cpp: the easter egg is playing
 
 namespace
 {
@@ -58,6 +62,24 @@ void SetField(uint32_t ctx, int dword, int lo, int bits, uint32_t value)
 }
 
 std::mutex g_mutex;
+
+// Music packets, by a hash of their first 64 bytes: the title reads its music files (Media/Audio/Music/*.xma)
+// into a file buffer and copies packets on to the decoder's input, so a packet is recognised by
+// its contents (AudioNoteMusicRead). The "whysthisdealer" easter egg silences music while it plays.
+std::mutex g_musicMutex;
+std::set<uint64_t> g_musicPackets;
+uint64_t PacketHash(const uint8_t* p)
+{
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (int i = 0; i < 64; i++)
+        h = (h ^ p[i]) * 0x100000001B3ull;
+    return h;
+}
+bool MusicPacket(const uint8_t* p)
+{
+    std::lock_guard lock(g_musicMutex);
+    return g_musicPackets.count(PacketHash(p)) != 0;
+}
 std::set<uint32_t> g_enabled;
 std::once_flag g_started;
 
@@ -78,6 +100,7 @@ struct Decoder
     bool consumed[2] = {};
     bool holdsTail = false; // packets were decoded since the codec was last drained or reset
     bool seeked = false; // the title set the read offset since the last packet was decoded
+    bool music = false;  // its last packet came from a music file (MusicPacket)
 
     void Close()
     {
@@ -202,8 +225,9 @@ bool WriteBlock(uint32_t ctx, Decoder& d)
         return false;
     const uint32_t blocks = Field(ctx, 0, 22, 5), write = Field(ctx, 0, 27, 5);
     uint16_t* out = GuestPtr<uint16_t>(LoadBE32(ctx + 7 * 4) + write * kBlockBytes);
+    const bool mute = d.music && DealerMutesMusic();
     for (size_t i = 0; i < perBlock; i++)
-        out[i] = __builtin_bswap16(uint16_t(d.pcm[d.pcmRead + i]));
+        out[i] = mute ? 0 : __builtin_bswap16(uint16_t(d.pcm[d.pcmRead + i]));
     d.pcmRead += perBlock;
     d.framesWritten += perBlock / std::max<uint32_t>(d.channels, 1);
     if (d.pcmRead > (1u << 16))
@@ -282,6 +306,9 @@ bool Step(uint32_t ctx)
                     32 + ((header >> 11) & 0x7FFF));
         }
         d.seeked = false;
+        d.music = MusicPacket(GuestPtr<uint8_t>(buffer + packet * kPacketBytes));
+        if (d.music)
+            LOG_ONCE("xma: %08X is music (the first stream recognised)", ctx);
         d.Decode(GuestPtr<uint8_t>(buffer + packet * kPacketBytes));
     }
 
@@ -478,3 +505,33 @@ GUEST_EXPORT(XMAGetOutputBufferWriteOffset)
 XMA_FLAG_EXPORTS(InputBuffer0, 0, 20)
 XMA_FLAG_EXPORTS(InputBuffer1, 0, 21)
 XMA_FLAG_EXPORTS(OutputBuffer, 1, 31)
+
+// A read from a music file (imports_io.cpp): its packets' hashes, located from the file's RIFF data chunk.
+void AudioNoteMusicRead(const std::filesystem::path& file, uint64_t offset, const uint8_t* data, uint32_t bytes)
+{
+    static std::map<std::filesystem::path, uint64_t> dataStart;
+    std::lock_guard lock(g_musicMutex);
+    auto it = dataStart.find(file);
+    if (it == dataStart.end())
+    {
+        uint64_t start = 0;
+        if (FILE* f = _wfopen(file.c_str(), L"rb"))
+        {
+            uint8_t head[4096] = {};
+            const size_t n = fread(head, 1, sizeof(head), f);
+            fclose(f);
+            for (size_t i = 12; i + 8 <= n; i++)
+                if (!memcmp(head + i, "data", 4))
+                {
+                    start = i + 8;
+                    break;
+                }
+        }
+        it = dataStart.emplace(file, start).first;
+    }
+    if (!it->second)
+        return;
+    const uint64_t first = it->second + (offset > it->second ? (offset - it->second + kPacketBytes - 1) / kPacketBytes * kPacketBytes : 0);
+    for (uint64_t p = first; p + 64 <= offset + bytes; p += kPacketBytes)
+        g_musicPackets.insert(PacketHash(data + (p - offset)));
+}

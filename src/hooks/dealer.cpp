@@ -240,3 +240,6 @@ float DealerBounce()
     const size_t i = size_t(std::max(0.0, t) * kHopHz);
     return i < g_curve.size() ? kLift * g_curve[i] : 0.0f;
 }
+
+// The game's music is silent from the moment the song starts until the game closes (xma.cpp).
+bool DealerMutesMusic() { return g_on.load(std::memory_order_relaxed); }

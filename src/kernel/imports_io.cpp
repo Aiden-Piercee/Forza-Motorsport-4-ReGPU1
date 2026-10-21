@@ -15,6 +15,8 @@
 
 namespace fs = std::filesystem;
 
+void AudioNoteMusicRead(const std::filesystem::path& file, uint64_t offset, const uint8_t* data, uint32_t bytes); // audio/xma.cpp
+
 namespace
 {
 struct FileObject : KernelObject
@@ -398,6 +400,14 @@ GUEST_EXPORT(NtReadFile)
     const BOOL ok = ReadFile(file->host, GuestPtr(buffer), length, &read, &ov);
     file->position = offset + read;
     g_readBytes += read;
+    // Music files: their packets are noted, so the audio can tell music from effects (xma.cpp).
+    if (read && file->guestPath.size() > 4)
+    {
+        std::string guest = Lower(file->guestPath);
+        std::replace(guest.begin(), guest.end(), '\\', '/');
+        if (guest.find("/audio/music/") != std::string::npos && guest.compare(guest.size() - 4, 4, ".xma") == 0)
+            AudioNoteMusicRead(file->path, offset, GuestPtr<uint8_t>(buffer), read);
+    }
 
     uint32_t status = X_STATUS_SUCCESS;
     if (!ok && GetLastError() != ERROR_HANDLE_EOF)
