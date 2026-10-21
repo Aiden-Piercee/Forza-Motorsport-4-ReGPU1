@@ -1,0 +1,415 @@
+// The live debug server: one client at a time on 127.0.0.1, a line per command, a line of JSON back.
+// See tools/fm2ctl.py for the commands. Input is merged into player 1's pad, screenshots are taken by the
+// renderer at its next swap, and the waits block this thread only.
+#include "debug.h"
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <deque>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "log.h"
+#include "memory.h"
+#include "settings.h"
+
+#pragma comment(lib, "ws2_32.lib")
+
+void RendererRequestCapture(); // renderer.cpp: F12
+
+namespace
+{
+using Clock = std::chrono::steady_clock;
+
+std::mutex g_mutex;
+std::condition_variable g_swapped;
+uint64_t g_frame = 0;
+std::deque<Clock::time_point> g_swapTimes; // the last second's swaps (fps)
+
+// Input: buttons held until released, and timed presses/sticks/triggers.
+struct Timed
+{
+    Clock::time_point until;
+    DebugPad pad;
+};
+DebugPad g_held;
+std::vector<Timed> g_timed;
+std::atomic<bool> g_inputActive{ false };
+
+std::string g_shotPath;
+uint64_t g_shotsDone = 0;
+
+const struct { const char* name; uint16_t bit; } kButtons[] = {
+    { "UP", 0x0001 }, { "DOWN", 0x0002 }, { "LEFT", 0x0004 }, { "RIGHT", 0x0008 }, { "START", 0x0010 }, { "BACK", 0x0020 },
+    { "LS", 0x0040 }, { "RS", 0x0080 }, { "LB", 0x0100 }, { "RB", 0x0200 }, { "A", 0x1000 }, { "B", 0x2000 }, { "X", 0x4000 },
+    { "Y", 0x8000 },
+};
+
+uint16_t ButtonBits(const std::string& names)
+{
+    uint16_t bits = 0;
+    std::stringstream ss(names);
+    for (std::string n; std::getline(ss, n, '+');)
+    {
+        for (char& c : n)
+            c = char(toupper(uint8_t(c)));
+        for (auto& b : kButtons)
+            if (n == b.name)
+                bits |= b.bit;
+    }
+    return bits;
+}
+
+std::string Escape(const std::string& s)
+{
+    std::string out;
+    for (char c : s)
+    {
+        if (c == '"' || c == '\\')
+            out += '\\', out += c;
+        else if (c == '\n')
+            out += "\\n";
+        else if (uint8_t(c) < 32)
+            out += ' ';
+        else
+            out += c;
+    }
+    return out;
+}
+
+std::string Ok(const std::string& fields = "") { return "{\"ok\":true" + (fields.empty() ? "" : "," + fields) + "}"; }
+std::string Error(const std::string& why) { return "{\"ok\":false,\"error\":\"" + Escape(why) + "\"}"; }
+
+// Waits for n more swaps (or the timeout); the frame reached.
+uint64_t WaitFrames(uint64_t n, double timeoutSeconds)
+{
+    std::unique_lock lock(g_mutex);
+    const uint64_t target = g_frame + n;
+    g_swapped.wait_for(lock, std::chrono::duration<double>(timeoutSeconds), [&] { return g_frame >= target; });
+    return g_frame;
+}
+
+bool Readable(uint32_t address, uint32_t size)
+{
+    MEMORY_BASIC_INFORMATION mi{};
+    if (!VirtualQuery(g_base + address, &mi, sizeof(mi)) || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+        return false;
+    return uint64_t(address) + size <= uint64_t(static_cast<uint8_t*>(mi.BaseAddress) - g_base) + mi.RegionSize;
+}
+
+std::string Handle(const std::string& line)
+{
+    std::stringstream in(line);
+    std::string cmd;
+    in >> cmd;
+    for (char& c : cmd)
+        c = char(tolower(uint8_t(c)));
+
+    if (cmd == "ping")
+        return Ok();
+    if (cmd == "status")
+    {
+        std::lock_guard lock(g_mutex);
+        const auto now = Clock::now();
+        while (!g_swapTimes.empty() && now - g_swapTimes.front() > std::chrono::seconds(1))
+            g_swapTimes.pop_front();
+        char buf[256];
+        snprintf(buf, sizeof(buf), "\"frame\":%llu,\"fps\":%zu,\"profile\":\"%s\"", (unsigned long long)g_frame, g_swapTimes.size(),
+            Escape(GetSettings().profile).c_str());
+        return Ok(buf);
+    }
+    // press A [ms]   press A+B 200   (held for ms, default 120, then released)
+    if (cmd == "press" || cmd == "hold" || cmd == "release")
+    {
+        std::string names;
+        in >> names;
+        const uint16_t bits = names.empty() || names == "all" ? 0xFFFF : ButtonBits(names);
+        if (!bits)
+            return Error("unknown button: " + names);
+        std::lock_guard lock(g_mutex);
+        if (cmd == "hold")
+            g_held.buttons |= bits;
+        else if (cmd == "release")
+        {
+            g_held.buttons &= ~bits;
+            if (names.empty() || names == "all")
+                g_held = {}, g_timed.clear();
+        }
+        else
+        {
+            int ms = 120;
+            in >> ms;
+            Timed t{ Clock::now() + std::chrono::milliseconds(ms), {} };
+            t.pad.buttons = bits;
+            g_timed.push_back(t);
+        }
+        g_inputActive = true;
+        return Ok();
+    }
+    // stick L x y [ms]  (-1..1; without ms it stays until "stick L 0 0")
+    // trigger L|R v [ms] (0..1)
+    if (cmd == "stick" || cmd == "trigger")
+    {
+        std::string side;
+        double x = 0, y = 0;
+        int ms = -1;
+        in >> side;
+        if (cmd == "stick")
+            in >> x >> y >> ms;
+        else
+            in >> x >> ms;
+        const bool left = !side.empty() && toupper(uint8_t(side[0])) == 'L';
+        DebugPad p;
+        if (cmd == "stick")
+        {
+            p.sticks = true;
+            const int16_t sx = int16_t(std::clamp(x, -1.0, 1.0) * 32767), sy = int16_t(std::clamp(y, -1.0, 1.0) * 32767);
+            (left ? p.lx : p.rx) = sx;
+            (left ? p.ly : p.ry) = sy;
+        }
+        else
+        {
+            p.triggers = true;
+            (left ? p.leftTrigger : p.rightTrigger) = uint8_t(std::clamp(x, 0.0, 1.0) * 255);
+        }
+        std::lock_guard lock(g_mutex);
+        if (ms >= 0)
+            g_timed.push_back({ Clock::now() + std::chrono::milliseconds(ms), p });
+        else if (cmd == "stick")
+        {
+            g_held.sticks = true;
+            (left ? g_held.lx : g_held.rx) = p.lx | p.rx;
+            (left ? g_held.ly : g_held.ry) = p.ly | p.ry;
+        }
+        else
+        {
+            g_held.triggers = true;
+            (left ? g_held.leftTrigger : g_held.rightTrigger) = p.leftTrigger | p.rightTrigger;
+        }
+        g_inputActive = true;
+        return Ok();
+    }
+    // wait <frames> | wait <seconds>s
+    if (cmd == "wait")
+    {
+        std::string arg;
+        in >> arg;
+        if (!arg.empty() && arg.back() == 's')
+        {
+            std::this_thread::sleep_for(std::chrono::duration<double>(atof(arg.c_str())));
+            std::lock_guard lock(g_mutex);
+            return Ok("\"frame\":" + std::to_string(g_frame));
+        }
+        const uint64_t n = arg.empty() ? 1 : strtoull(arg.c_str(), nullptr, 10);
+        return Ok("\"frame\":" + std::to_string(WaitFrames(n, 60)));
+    }
+    // shot [path]: the next frame as a PNG (default out/live.png)
+    if (cmd == "shot")
+    {
+        std::string path;
+        std::getline(in, path);
+        path.erase(0, path.find_first_not_of(' '));
+        if (path.empty())
+            path = "out/live.png";
+        std::unique_lock lock(g_mutex);
+        const uint64_t before = g_shotsDone;
+        g_shotPath = path;
+        if (!g_swapped.wait_for(lock, std::chrono::seconds(15), [&] { return g_shotsDone != before; }))
+        {
+            g_shotPath.clear();
+            return Error("no frame came (the game may be loading or paused)");
+        }
+        return Ok("\"path\":\"" + Escape(path) + "\",\"frame\":" + std::to_string(g_frame));
+    }
+    if (cmd == "capture")
+    {
+        RendererRequestCapture();
+        return Ok("\"note\":\"traced into out\\\\capture and play log at the next frame\"");
+    }
+    // log [n]: the last n log lines
+    if (cmd == "log")
+    {
+        int n = 40;
+        in >> n;
+        std::string out;
+        for (const auto& l : LogTail(size_t(std::clamp(n, 1, 2000))))
+            out += (out.empty() ? "\"" : ",\"") + Escape(l) + "\"";
+        return Ok("\"lines\":[" + out + "]");
+    }
+    // peek <hex address> <bytes>   poke <hex address> <hex bytes>   (guest addresses, raw big-endian memory)
+    if (cmd == "peek" || cmd == "poke")
+    {
+        std::string a, data;
+        in >> a >> data;
+        const uint32_t address = uint32_t(strtoul(a.c_str(), nullptr, 16));
+        if (cmd == "peek")
+        {
+            const uint32_t n = std::min<uint32_t>(data.empty() ? 64 : uint32_t(strtoul(data.c_str(), nullptr, 0)), 4096);
+            if (!Readable(address, n))
+                return Error("not mapped");
+            std::string hex;
+            char b[3];
+            for (uint32_t i = 0; i < n; i++)
+                snprintf(b, sizeof(b), "%02X", GuestPtr<uint8_t>(address)[i]), hex += b;
+            return Ok("\"hex\":\"" + hex + "\"");
+        }
+        if (data.size() % 2 || !Readable(address, uint32_t(data.size() / 2)))
+            return Error("bad data or not mapped");
+        for (size_t i = 0; i < data.size(); i += 2)
+            GuestPtr<uint8_t>(address)[i / 2] = uint8_t(strtoul(data.substr(i, 2).c_str(), nullptr, 16));
+        return Ok();
+    }
+    // env NAME [value]: set (or clear) an environment variable. Only switches read each time see it; most
+    // FM2_* switches are read once at their first use.
+    if (cmd == "env")
+    {
+        std::string name, value;
+        in >> name;
+        std::getline(in, value);
+        value.erase(0, value.find_first_not_of(' '));
+        _putenv_s(name.c_str(), value.c_str());
+        SetEnvironmentVariableA(name.c_str(), value.empty() ? nullptr : value.c_str());
+        return Ok();
+    }
+    if (cmd == "quit")
+    {
+        Log("debug: quit requested");
+        fflush(nullptr);
+        std::thread([] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            ExitProcess(0);
+        }).detach();
+        return Ok();
+    }
+    return Error("unknown command: " + cmd);
+}
+
+void Serve(SOCKET client)
+{
+    std::string pending;
+    char buf[4096];
+    for (;;)
+    {
+        const int n = recv(client, buf, sizeof(buf), 0);
+        if (n <= 0)
+            break;
+        pending.append(buf, size_t(n));
+        for (size_t nl; (nl = pending.find('\n')) != std::string::npos;)
+        {
+            std::string line = pending.substr(0, nl);
+            pending.erase(0, nl + 1);
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+            if (line.empty())
+                continue;
+            const std::string reply = Handle(line) + "\n";
+            send(client, reply.data(), int(reply.size()), 0);
+        }
+    }
+    closesocket(client);
+}
+}
+
+void DebugServerStart()
+{
+    const char* on = getenv("FM2_DEBUG");
+    if (!on || !*on || *on == '0')
+        return;
+    const int port = getenv("FM2_DEBUG_PORT") ? atoi(getenv("FM2_DEBUG_PORT")) : 7341;
+    std::thread([port] {
+        SetThreadDescription(GetCurrentThread(), L"debug server");
+        WSADATA wsa;
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+        SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(uint16_t(port));
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) || listen(listener, 4))
+        {
+            Log("debug: can't listen on 127.0.0.1:%d", port);
+            return;
+        }
+        Log("debug: listening on 127.0.0.1:%d (tools/fm2ctl.py)", port);
+        for (;;)
+        {
+            SOCKET client = accept(listener, nullptr, nullptr);
+            if (client == INVALID_SOCKET)
+                break;
+            std::thread(Serve, client).detach();
+        }
+    }).detach();
+}
+
+bool DebugPadState(DebugPad& pad)
+{
+    if (!g_inputActive.load(std::memory_order_relaxed))
+        return false;
+    std::lock_guard lock(g_mutex);
+    const auto now = Clock::now();
+    std::erase_if(g_timed, [&](const Timed& t) { return now >= t.until; });
+    pad = g_held;
+    for (const auto& t : g_timed)
+    {
+        pad.buttons |= t.pad.buttons;
+        if (t.pad.sticks)
+        {
+            pad.sticks = true;
+            if (t.pad.lx || t.pad.ly) pad.lx = t.pad.lx, pad.ly = t.pad.ly;
+            if (t.pad.rx || t.pad.ry) pad.rx = t.pad.rx, pad.ry = t.pad.ry;
+        }
+        if (t.pad.triggers)
+        {
+            pad.triggers = true;
+            pad.leftTrigger = std::max(pad.leftTrigger, t.pad.leftTrigger);
+            pad.rightTrigger = std::max(pad.rightTrigger, t.pad.rightTrigger);
+        }
+    }
+    const bool any = pad.buttons || pad.sticks || pad.triggers;
+    if (!any && g_timed.empty())
+        g_inputActive = g_held.buttons || g_held.sticks || g_held.triggers;
+    return any;
+}
+
+void DebugOnSwap(uint64_t frame)
+{
+    {
+        std::lock_guard lock(g_mutex);
+        g_frame = frame;
+        g_swapTimes.push_back(Clock::now());
+        if (g_swapTimes.size() > 2000)
+            g_swapTimes.pop_front();
+    }
+    g_swapped.notify_all();
+}
+
+bool DebugShotPending(std::string& path)
+{
+    std::lock_guard lock(g_mutex);
+    if (g_shotPath.empty())
+        return false;
+    path = g_shotPath;
+    return true;
+}
+
+void DebugShotDone(const std::string& path)
+{
+    {
+        std::lock_guard lock(g_mutex);
+        if (g_shotPath == path)
+            g_shotPath.clear();
+        g_shotsDone++;
+    }
+    g_swapped.notify_all();
+}

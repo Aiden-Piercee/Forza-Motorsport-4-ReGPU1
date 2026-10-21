@@ -46,6 +46,7 @@
 #include "gpu/ucode.h"
 #include "kernel/runtime.h"
 #include "kernel/thread.h"
+#include "debug.h"
 #include "log.h"
 #include "png.h"
 #include "render/presenter.h"
@@ -7061,6 +7062,12 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         }
     }
     ++g_r.frame;
+    DebugOnSwap(g_r.frame);
+    // The debug server's "shot": this frame (when it has a picture), to the file it names.
+    std::string shotPath;
+    const bool shot = fromResolve && DebugShotPending(shotPath);
+    if (shot)
+        dumpFrame = g_r.frame;
     // FM2_DUMP_AT=<seconds>: dump the first resolved frame after that long (comparable
     // screenshots whatever the frame rate).
     {
@@ -7283,6 +7290,14 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
             snprintf(name, sizeof(name), "out/sweep/%03llu.png", (unsigned long long)(g_r.frame - dumpFrame));
             WritePng(name, dw, dh, full);
         }
+        else if (shot && g_r.frame == dumpFrame)
+        {
+            std::error_code ec;
+            if (const auto dir = std::filesystem::path(shotPath).parent_path(); !dir.empty())
+                std::filesystem::create_directories(dir, ec);
+            WritePng(shotPath.c_str(), dw, dh, full);
+            DebugShotDone(shotPath);
+        }
         else
             WritePng(g_r.frame == dumpFrame ? "frame.png" : "frame2.png", dw, dh, full);
         Log("renderer: wrote frame.png (frame %llu: %u draws, %u skipped)", (unsigned long long)frameNumber, g_r.drawsThisFrame.load(),
@@ -7316,3 +7331,6 @@ void RendererSetGammaEntry(uint32_t index, uint32_t rgb10)
         g_gammaSet.store(true, std::memory_order_relaxed);
     }
 }
+
+// The debug server's "capture": what F12 does.
+void RendererRequestCapture() { g_hotkeyFrame = g_r.frame + 1; }

@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "gpu/renderer.h"
+#include "debug.h"
 #include "kernel/imports.h"
 #include "kernel/runtime.h"
 #include "kernel/thread.h"
@@ -645,6 +646,16 @@ bool ReadPad(uint32_t user, PadState& s)
                 }
             }
         }
+    }
+    // The debug server's input (debug.cpp) on top of everything else.
+    if (DebugPad d; user == 0 && DebugPadState(d))
+    {
+        connected = true;
+        s.buttons |= d.buttons;
+        if (d.triggers)
+            s.leftTrigger = d.leftTrigger, s.rightTrigger = d.rightTrigger;
+        if (d.sticks)
+            s.lx = d.lx, s.ly = d.ly, s.rx = d.rx, s.ry = d.ry;
     }
     return connected;
 }

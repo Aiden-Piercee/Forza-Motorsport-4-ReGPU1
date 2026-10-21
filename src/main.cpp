@@ -6,6 +6,7 @@
 #include "kernel/runtime.h"
 #include "kernel/thread.h"
 #include "loader.h"
+#include "debug.h"
 #include "log.h"
 #include "memory.h"
 
@@ -31,6 +32,7 @@ int main(int argc, char** argv)
         }
     }
     RuntimeInit(gameDir);
+    DebugServerStart(); // FM2_DEBUG=1: tools/fm2ctl.py drives the running game
     if (getenv("FM2_BOOTSCREEN_PREVIEW"))
     {
         void BootScreenPreview();

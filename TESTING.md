@@ -91,6 +91,15 @@ The keyboard only works while the game window has focus.
   soft glow sits above bright car roofs (the bloom). Use F12 on each. The "not translated"
   shaders in out/play.log are never drawn (no "draw dropped" lines), so they are not a lead.
 
+## Driving the running game (debug server)
+
+`py -3 tools/fm2ctl.py start FM2_PROFILE=Fresh1 FM2_SKIP_INTRO=1` starts the game with its debug server
+(FM2_DEBUG=1, 127.0.0.1:7341) and waits until it answers; the log goes to out\live.log. Then each
+command talks to the same running game: `press A`, `hold RT`, `stick L 0 -1 500`, `trigger R 1 3000`,
+`wait 2s`, `shot out/x.png`, `capture` (F12), `status`, `log 50`, `peek 8200082C 32`, `quit`.
+`fm2ctl.py run file.txt` (or `run -` with a heredoc) plays a list of commands and stops at the first
+error. Input is added on top of the real pad and the keyboard, so you can still play along.
+
 ## Capturing a rendering bug (F12)
 
 With the game window focused, press F12 when the wrong picture is on screen (it pauses for a
