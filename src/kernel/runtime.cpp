@@ -13,6 +13,7 @@
 #include "loader.h"
 #include "render/presenter.h"
 #include "settings.h"
+#include "user_dir.h"
 
 namespace
 {
@@ -67,11 +68,7 @@ void AudioInit();
 void RuntimeInit(const std::filesystem::path& gameDir)
 {
     g_gameDir = std::filesystem::absolute(gameDir);
-    char buffer[MAX_PATH];
-    if (GetEnvironmentVariableA("USERPROFILE", buffer, MAX_PATH))
-        g_userDir = std::filesystem::path(buffer) / "Documents" / "fm2";
-    else
-        g_userDir = g_gameDir.parent_path() / "user";
+    g_userDir = DocumentsUserDir();
     std::filesystem::create_directories(g_userDir / "cache");
 
     g_tscHz = MeasureTsc();

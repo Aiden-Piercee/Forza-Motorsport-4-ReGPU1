@@ -14,6 +14,7 @@
 
 #include "log.h"
 #include "memory.h"
+#include "user_dir.h"
 
 LoadedTitle g_title;
 
@@ -205,9 +206,7 @@ const std::filesystem::path& TitleUpdateDir()
         char buffer[MAX_PATH];
         if (GetEnvironmentVariableA("FM2_TITLE_UPDATE_DIR", buffer, MAX_PATH))
             return std::filesystem::path(buffer);
-        if (GetEnvironmentVariableA("USERPROFILE", buffer, MAX_PATH))
-            return std::filesystem::path(buffer) / "Documents" / "fm2" / "update";
-        return std::filesystem::path("update");
+        return DocumentsUserDir() / "update";
     }();
     return dir;
 }

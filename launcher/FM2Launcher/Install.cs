@@ -11,11 +11,20 @@ public static class Paths
     public static readonly string Root = FindRoot();
     public static string Exe => Path.Combine(Root, "build", "tu", "fm2.exe");
     public static string GameDir => Path.Combine(Root, "game");
-    public static readonly string User = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "fm2");
+    public static readonly string User = FindUser();
     public static string SettingsFile => Path.Combine(User, "settings.ini");
     public static string Dlc => Path.Combine(User, "dlc");
     public static string DlcDisabled => Path.Combine(User, "dlc-disabled");
     public static string Update => Path.Combine(User, "update");
+
+    /// <summary>Documents\fm2 in the Documents folder Windows reports (it may be moved off C:), as fm2.exe picks it
+    /// (src/user_dir.cpp): if only the old %USERPROFILE%\Documents\fm2 exists, that one.</summary>
+    static string FindUser()
+    {
+        var current = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "fm2");
+        var old = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Documents", "fm2");
+        return !Directory.Exists(current) && Directory.Exists(old) ? old : current;
+    }
 
     static string FindRoot()
     {
