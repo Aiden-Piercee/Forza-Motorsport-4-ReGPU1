@@ -99,6 +99,9 @@ command talks to the same running game: `press A`, `hold B`, `stick L 0 -1 500`,
 `wait 2s`, `shot out/x.png`, `capture` (F12), `status`, `log 50`, `peek 8200082C 32`, `quit`.
 `fm2ctl.py run file.txt` (or `run -` with a heredoc) plays a list of commands and stops at the first
 error. Input is added on top of the real pad and the keyboard, so you can still play along.
+A/B tests without a restart: `switches` lists the on/off FM2_* switches the game has reached and
+`switch FM2_NO_HEIGHT_KEEP 1` flips one live (`0` flips it back). Switches that take a value are still
+read once.
 
 ## Capturing a rendering bug (F12)
 
