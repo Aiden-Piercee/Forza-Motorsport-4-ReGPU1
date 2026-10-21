@@ -5461,10 +5461,10 @@ void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_
     // exchanged when the copy has the swap bit; the title's fetch swizzle expects that), in the
     // byte order the copy's endian field names (2: big-endian words, 0: little-endian).
     const uint32_t endian = info & 7;
-    // The race livery is compressed on the CPU, which reads the words as they are (like the photo
-    // saver): there red stays in bits 16-23 when the copy swaps (written swapped, blue came out orange).
-    const bool cpuRead = width == 1024 && height == 1024;
-    const bool swapRB = (((info >> 24) & 1) != 0) != cpuRead;
+    // Everything written back here is read on the CPU (the garage thumbnail, the race livery), which
+    // takes the words as they are, like the photo saver: red stays in bits 16-23 when the copy swaps
+    // (written swapped, the livery's blue came out orange and red thumbnails blue).
+    const bool swapRB = ((info >> 24) & 1) == 0;
     const uint32_t pitchTexels = (width + 31) & ~31u, rows = (height + 31) & ~31u;
     uint8_t* guest = GuestPtr<uint8_t>(GpuPhysToGuest(base));
     for (uint32_t y = 0; y < height; y++)
