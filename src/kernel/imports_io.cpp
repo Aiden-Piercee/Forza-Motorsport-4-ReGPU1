@@ -203,14 +203,14 @@ bool VfsResolve(std::string guest, fs::path& host, bool* readOnly)
     while (!rest.empty() && rest.front() == '\\')
         rest.erase(rest.begin());
     host = rest.empty() ? root : root / fs::path(rest);
-#ifdef FM2_TITLE_UPDATE
-    // The update's media with the main menu's X button relabelled "Quit" (update_media.cpp).
-    if (lower.rfind("update:", 0) == 0 && Lower(rest) == "media.zip")
+    // The game's and the update's zips, with built-in changes and mods (zip_overlay.cpp).
+    if (ro && rest.size() > 4 && Lower(rest.substr(rest.size() - 4)) == ".zip" && root != DlcDir())
     {
-        fs::path UpdateMediaZip(const fs::path& original);
-        host = UpdateMediaZip(host);
+        fs::path ZipOverlay(const std::string& zip, const fs::path& host);
+        std::string zip = Lower(rest);
+        std::replace(zip.begin(), zip.end(), '\\', '/');
+        host = ZipOverlay(zip, host);
     }
-#endif
     if (readOnly)
         *readOnly = ro;
     return true;
