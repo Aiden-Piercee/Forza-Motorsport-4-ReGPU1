@@ -110,8 +110,9 @@ $("tabs").onclick = (e) => {
   const b = e.target.closest("button")
   if (!b) return
   for (const t of $("tabs").children) t.classList.toggle("on", t === b)
-  for (const p of ["play", "settings", "updates"]) $("page-" + p).hidden = p !== b.dataset.tab
-  if (b.dataset.tab !== "play") refresh()
+  for (const p of ["play", "photos", "settings", "updates"]) $("page-" + p).hidden = p !== b.dataset.tab
+  if (b.dataset.tab === "photos") loadPhotos()
+  else if (b.dataset.tab !== "play") refresh()
 }
 
 // ---- drawing
@@ -346,6 +347,65 @@ function onProgress(d) {
   $("progress").querySelector(".bar").style.width = Math.round(d.p * 100) + "%"
   $("update-status").textContent = d.text
 }
+
+// ---- photos (Photo Mode saves, read straight from the profiles folder)
+
+let photos = []
+let photoId = null
+async function loadPhotos() {
+  await guarded(async () => {
+    photos = await call("photos.list")
+    if (!photos.some((p) => p.id === photoId)) photoId = photos.length ? photos[0].id : null
+    renderPhotos()
+  })
+}
+function renderPhotos() {
+  $("photo-count").textContent = photos.length ? String(photos.length) : ""
+  const t = $("thumbs")
+  t.replaceChildren()
+  if (!photos.length) t.append(el("div", "empty", "Nothing saved yet."))
+  for (const p of photos) {
+    const b = el("button", "thumb" + (p.id === photoId ? " on" : ""))
+    const img = el("img")
+    img.src = p.url
+    img.loading = "lazy"
+    img.alt = p.name
+    b.append(img, el("span", "", p.name))
+    b.onclick = () => { photoId = p.id; renderPhotos() }
+    t.append(b)
+  }
+  const p = photos.find((x) => x.id === photoId)
+  const v = $("viewer")
+  if (p) {
+    let img = v.querySelector("img")
+    if (!img) { img = el("img"); v.replaceChildren(img) }
+    if (img.src !== p.url) img.src = p.url
+    img.alt = p.name
+    $("photo-title").textContent = p.name
+    $("photo-meta").textContent = `${p.profile} · ${new Date(p.taken).toLocaleString()} · ${size(p.bytes)}`
+  } else {
+    v.replaceChildren(el("div", "empty", "No photos yet. In a race, pause and pick Photo Mode, take a shot and save it."))
+    $("photo-title").textContent = "Photos"
+    $("photo-meta").textContent = ""
+  }
+  for (const k of ["photo-copy", "photo-save", "photo-reveal"]) $(k).disabled = !p
+}
+function stepPhoto(d) {
+  const i = photos.findIndex((p) => p.id === photoId)
+  if (i < 0) return
+  const n = photos[Math.max(0, Math.min(photos.length - 1, i + d))]
+  if (n && n.id !== photoId) { photoId = n.id; renderPhotos(); document.querySelector(".thumb.on")?.scrollIntoView({ block: "nearest" }) }
+}
+document.addEventListener("keydown", (e) => {
+  if ($("page-photos").hidden || !$("confirm").hidden) return
+  if (e.key === "ArrowLeft" || e.key === "ArrowUp") { stepPhoto(-1); e.preventDefault() }
+  if (e.key === "ArrowRight" || e.key === "ArrowDown") { stepPhoto(1); e.preventDefault() }
+  if (e.key === "c" && e.ctrlKey && photoId) $("photo-copy").click()
+})
+$("photo-copy").onclick = () => guarded(async () => { await call("photos.copy", photoId); toast("Photo copied to the clipboard.", true) })
+$("photo-save").onclick = () => guarded(async () => { if (await call("photos.save", photoId)) toast("Photo saved.", true) })
+$("photo-reveal").onclick = () => guarded(() => call("photos.reveal", photoId))
+$("photos-folder").onclick = () => guarded(() => call("photos.reveal", null))
 
 async function refresh() {
   await guarded(async () => { state = await call("state"); render(); renderUpdate() })

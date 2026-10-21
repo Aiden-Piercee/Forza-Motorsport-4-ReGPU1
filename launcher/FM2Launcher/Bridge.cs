@@ -83,6 +83,14 @@ public sealed class Bridge(CoreWebView2 web, Form owner)
                     System.Diagnostics.Process.Start("explorer.exe", $"\"{path}\"");
                     return null;
                 }
+            case "photos.list": return Photos.List();
+            case "photos.copy":
+                Photos.Copy(a!.GetValue<string>());
+                return null;
+            case "photos.save": return Photos.SaveAs(a!.GetValue<string>(), owner);
+            case "photos.reveal":
+                Photos.Reveal(a?.GetValue<string>());
+                return null;
             case "url":
                 {
                     var url = a?.GetValue<string>() ?? "";
