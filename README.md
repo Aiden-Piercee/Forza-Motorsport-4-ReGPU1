@@ -213,3 +213,13 @@ code (`out/ppc`, ~131 MB) is generated from your own copy and never committed.
 | `src/` | Runtime: guest memory, loader, kernel/XAM imports, threads, renderer, audio output and XMA decoding |
 | `src/hooks/` | Overrides of recompiled functions (`sub_X`): XAPI fibers on host fibers, D3D instrumentation |
 | `tools/` | Disc extraction, XEX dump/disassembler, analysis scripts |
+
+## Acknowledgements
+
+The Xbox 360 GPU (Xenos) is undocumented. Our understanding of its hardware comes from the
+[Xenia](https://github.com/xenia-project/xenia) project's research, used under its BSD licence:
+the GPU register map, command packet layouts, texture formats and tiling, and the shader
+microcode format. The renderer itself is our own code, written for this port; Xenia's
+documentation of the hardware made that possible.
+
+The game code is recompiled with [XenonRecomp](https://github.com/hedge-dev/XenonRecomp).
