@@ -95,7 +95,7 @@ The keyboard only works while the game window has focus.
 
 `py -3 tools/fm2ctl.py start FM2_PROFILE=Fresh1 FM2_SKIP_INTRO=1` starts the game with its debug server
 (FM2_DEBUG=1, 127.0.0.1:7341) and waits until it answers; the log goes to out\live.log. Then each
-command talks to the same running game: `press A`, `hold RT`, `stick L 0 -1 500`, `trigger R 1 3000`,
+command talks to the same running game: `press A`, `hold B`, `stick L 0 -1 500`, `trigger R 1 3000`,
 `wait 2s`, `shot out/x.png`, `capture` (F12), `status`, `log 50`, `peek 8200082C 32`, `quit`.
 `fm2ctl.py run file.txt` (or `run -` with a heredoc) plays a list of commands and stops at the first
 error. Input is added on top of the real pad and the keyboard, so you can still play along.
