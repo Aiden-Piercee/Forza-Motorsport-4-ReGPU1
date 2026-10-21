@@ -20,6 +20,7 @@
 #include "gpu/regs.h"
 #include "render/presenter.h"
 #include "gpu/renderer.h"
+#include "precise_sleep.h"
 
 namespace
 {
@@ -1219,7 +1220,11 @@ void VblankLoop()
             return int64_t(1000000 / hz);
         }();
         next += std::chrono::microseconds(periodUs);
-        std::this_thread::sleep_until(next);
+        static const bool coarse = getenv("FM2_COARSE_SLEEP") != nullptr; // A/B: the old 1 ms sleeps
+        if (coarse)
+            std::this_thread::sleep_until(next);
+        else
+            PreciseSleepUntil(next, 200);
         RaiseInterrupt(0, 2);
     }
 }
@@ -1429,8 +1434,14 @@ GUEST_EXPORT(VdSwap)
     {
         static auto next = Clock::now();
         const auto now = Clock::now();
+        static const bool coarse = getenv("FM2_COARSE_SLEEP") != nullptr;
         if (next > now)
-            std::this_thread::sleep_until(next);
+        {
+            if (coarse)
+                std::this_thread::sleep_until(next);
+            else
+                PreciseSleepUntil(next, 300);
+        }
         next = std::max(next, now) + std::chrono::microseconds(minFrameUs);
     }
     Return(ctx, 0);

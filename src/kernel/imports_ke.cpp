@@ -10,6 +10,7 @@
 
 #include "kernel/imports.h"
 #include "settings.h"
+#include "precise_sleep.h"
 #include "kernel/thread.h"
 
 namespace
@@ -85,7 +86,11 @@ void SleepUntil(std::optional<Clock::time_point> deadline)
         SwitchToThread();
         return;
     }
-    std::this_thread::sleep_until(*deadline);
+    static const bool coarse = getenv("FM2_COARSE_SLEEP") != nullptr;
+    if (coarse)
+        std::this_thread::sleep_until(*deadline);
+    else
+        PreciseSleepUntil(*deadline);
 }
 }
 

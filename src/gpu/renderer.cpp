@@ -2707,8 +2707,17 @@ ID3D12Resource* GetCubeTexture(const TextureFetch& fetch, DXGI_FORMAT& format)
             want = faces[i]->format;
             break;
         }
-    // Faces the title rendered are at the render scale; the cube matches them.
-    const uint32_t cw = resolved ? uint32_t(std::lround(w * ScaleY())) : w, ch = resolved ? uint32_t(std::lround(h * ScaleY())) : h;
+    // Faces the title rendered are at the render scale; the cube matches them (their own host
+    // size: the current pass's scale differs when the cube is first fetched in another pass,
+    // which rebuilt the cube mid-race, a 4-5 ms draw).
+    uint32_t cw = w, ch = h;
+    for (uint32_t i = 0; i < 6 && resolved; i++)
+        if (faces[i] && faces[i]->format == want && faces[i]->hostWidth && faces[i]->width)
+        {
+            cw = uint32_t(std::lround(double(w) * faces[i]->hostWidth / faces[i]->width));
+            ch = uint32_t(std::lround(double(h) * faces[i]->hostHeight / faces[i]->height));
+            break;
+        }
     if (!cached.resource || cached.width != cw || cached.height != ch || cached.format != want)
     {
         D3D12_HEAP_PROPERTIES hp{};
@@ -6371,6 +6380,12 @@ void BenchmarkWriteReport(const char* path)
     fprintf(out, "1%% low:     %.1f fps\n", low(0.01));
     fprintf(out, "0.1%% low:   %.1f fps\n", low(0.001));
     fprintf(out, "Slowest:    %.1f ms\n", double(sorted.back()));
+    // Pacing: how much consecutive frames differ (0 for perfectly even frames).
+    double jitter = 0;
+    for (size_t i = 1; i < frames.size(); i++)
+        jitter += std::fabs(double(frames[i]) - double(frames[i - 1]));
+    fprintf(out, "Pacing:     %.2f ms average change between frames, median frame %.2f ms\n", jitter / double(frames.size() - 1),
+        double(sorted[sorted.size() / 2]));
     fclose(out);
     Log("benchmark: report written to %s", path);
 }
