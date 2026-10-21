@@ -181,7 +181,17 @@ uint32_t PassHeight()
         return big;
     return g_tallHeight && gpureg::Get(0x2000 /* RB_SURFACE_INFO */) == g_tallInfo ? g_tallHeight : kHeight;
 }
-float PassScale() { return std::min(float(kWidth) / float(PassWidth()), float(kHeight) / float(PassHeight())); }
+float PassScale()
+{
+    // (Asked for every scaled coordinate: memoised on what it depends on.)
+    struct Memo { uint32_t surface = ~0u, color = ~0u, generation = ~0u, tallInfo = ~0u, tallHeight = ~0u; float result = 1; };
+    thread_local Memo memo;
+    const uint32_t surface = gpureg::Get(0x2000), color = gpureg::Get(0x2001) & 0xFFF, generation = g_nativeMsaaGeneration.load(std::memory_order_relaxed);
+    if (surface != memo.surface || color != memo.color || generation != memo.generation || g_tallInfo != memo.tallInfo || g_tallHeight != memo.tallHeight)
+        memo = { surface, color, generation, g_tallInfo, g_tallHeight,
+            std::min(float(kWidth) / float(PassWidth()), float(kHeight) / float(PassHeight())) };
+    return memo.result;
+}
 float ScaleY() { return float(OutputHeight()) / float(kHeight) * g_sceneScale * PassScale(); }
 float ScaleWide() { return float(OutputWidth()) / float(kWidth) * g_sceneScale * PassScale(); }
 bool WidePass() { return (gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF) == kWidth; }
@@ -681,7 +691,10 @@ struct FrameMap
 
 // Bindings by fetch constant: a texture bound by many draws (in any slot) is looked up once
 // per frame and resolve epoch (textures are still checked once per frame for changes).
-thread_local std::unordered_map<uint64_t, SlotBinding> g_bindings;
+// (A direct-mapped table: an entry holds the fetch words it was made for, so a collision only
+// recomputes. The hash map it replaced was 2-3% of the command processor.)
+constexpr uint32_t kBindingSlots = 8192;
+thread_local std::unique_ptr<SlotBinding[]> g_bindings;
 thread_local uint64_t g_bindingsFrame = ~0ull, g_bindingsEpoch = ~0ull;
 
 // The frame to trace (draws and resolves logged, the image and resolves written out):
@@ -2651,7 +2664,11 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
         return r->second;
     std::shared_ptr<PipelineEntry> entry;
     {
+        const auto lockStart = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::lock_guard shaderLock(g_shaderMutex);
+        if (g_perfTiming)
+            if (const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lockStart).count(); ms > 2.0)
+                Log("perf: GetPipeline waited %.1f ms for the shader lock", ms);
         auto it = g_r.pipelines.find(key);
         if (it != g_r.pipelines.end() && it->second->state.load(std::memory_order_acquire) == 1)
         {
@@ -2667,7 +2684,12 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     }
     g_waitWhat = depthOnly ? "pipeline (depth only)" : "pipeline";
     g_waitBlend = key.blend;
-    return WaitForPipeline(entry);
+    const auto waitStart = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    ID3D12PipelineState* pso = WaitForPipeline(entry);
+    if (g_perfTiming)
+        if (const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count(); ms > 2.0)
+            Log("perf: GetPipeline waited %.1f ms for pipeline %016llx/%016llx (state was %d)", ms, (unsigned long long)key.vs, (unsigned long long)key.ps, 0);
+    return pso;
 }
 
 // Cube textures: six faces, each a padded 2D slice. Faces the title rendered
@@ -5931,8 +5953,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     const uint32_t usedSlots = ps.info.usedTextureSlots | vs.info.usedTextureSlots;
     if (g_bindingsFrame != g_r.frame || g_bindingsEpoch != g_resolveEpoch)
     {
-        if (g_bindings.size() > (1u << 15)) // (entries carry their frame and epoch)
-            g_bindings.clear();
+        if (!g_bindings)
+            g_bindings = std::make_unique<SlotBinding[]>(kBindingSlots); // (entries carry their frame and epoch)
         g_bindingsFrame = g_r.frame;
         g_bindingsEpoch = g_resolveEpoch;
     }
@@ -5943,7 +5965,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         uint64_t bindingKey = 0xCBF29CE484222325ull;
         for (uint32_t d : fetch.dwords)
             bindingKey = (bindingKey ^ d) * 0x100000001B3ull;
-        SlotBinding& memo = g_bindings[bindingKey];
+        SlotBinding& memo = g_bindings[(bindingKey ^ bindingKey >> 29) & (kBindingSlots - 1)];
         static const bool noSlotMemo = getenv("FM2_NO_SLOT_MEMO") != nullptr || getenv("FM2_DUMP_PS_TEXTURES") != nullptr;
         if (!noSlotMemo && memo.frame == g_r.frame && memo.epoch == g_resolveEpoch && memcmp(memo.fetch, fetch.dwords, sizeof(memo.fetch)) == 0)
         {
@@ -6386,6 +6408,23 @@ void BenchmarkWriteReport(const char* path)
         jitter += std::fabs(double(frames[i]) - double(frames[i - 1]));
     fprintf(out, "Pacing:     %.2f ms average change between frames, median frame %.2f ms\n", jitter / double(frames.size() - 1),
         double(sorted[sorted.size() / 2]));
+    // Timeline: average and slowest frame per 5 s (does the first stretch run slower?).
+    fprintf(out, "Timeline:  ");
+    double windowMs = 0, windowMax = 0;
+    size_t windowFrames = 0;
+    for (float f : frames)
+    {
+        windowMs += f;
+        windowMax = std::max(windowMax, double(f));
+        windowFrames++;
+        if (windowMs >= 5000.0)
+        {
+            fprintf(out, " %.0f fps (max %.1f ms) |", 1000.0 * double(windowFrames) / windowMs, windowMax);
+            windowMs = windowMax = 0;
+            windowFrames = 0;
+        }
+    }
+    fprintf(out, "\n");
     fclose(out);
     Log("benchmark: report written to %s", path);
 }
