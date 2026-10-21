@@ -313,6 +313,10 @@ struct ResolvedTexture
     uint64_t frame = ~0ull;                  // renderer frame of the last resolve into it
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM; // R32_FLOAT for depth resolves
     bool swapped = false; // resolved with the copy swap bit: guest memory has red and blue exchanged
+    // Guest memory under the image when it was resolved (our resolves don't write it): if the title
+    // later puts something else there (a CPU-made texture), the resolve is stale (see ResolvedFor).
+    uint64_t memHash = 0, memChecked = 0;
+    bool stale = false;
     // The title resolves differently sized images (bloom chain) to one address within a
     // frame: keep earlier sizes here and swap them in rather than recreating them.
     std::vector<ResolvedTexture> spares;
@@ -3072,6 +3076,21 @@ ID3D12Resource* ResolvedMipChain(const TextureFetch& fetch, const ResolvedTextur
 // The resolved texture a fetch reads, if any. Resolves are never block compressed,
 // so a compressed fetch at an address we resolved to earlier is a different image the
 // title has since loaded there (menu thumbnails reusing a shadow blob's memory).
+// A hash of the guest memory a resolved image covers (sampled: it only has to notice new contents).
+uint64_t GuestImageHash(uint32_t base, uint32_t width, uint32_t height)
+{
+    const size_t bytes = std::min<size_t>(size_t(width) * height * 4, 4u << 20);
+    return ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(base)), std::max<size_t>(bytes, 64), 256);
+}
+
+// Records what guest memory holds under a resolved image (after a resolve, or after we write it back).
+void NoteResolvedMemory(uint32_t base, ResolvedTexture& r)
+{
+    r.memHash = GuestImageHash(base, r.width, r.height);
+    r.memChecked = g_r.frame;
+    r.stale = false;
+}
+
 const ResolvedTexture* ResolvedFor(const TextureFetch& fetch)
 {
     const char* name = TextureFormatName(fetch.Format());
@@ -3080,7 +3099,26 @@ const ResolvedTexture* ResolvedFor(const TextureFetch& fetch)
     auto it = g_r.resolved.find(fetch.Address() & 0x1FFFFFFF);
     if (it == g_r.resolved.end())
         return nullptr;
-    return &it->second;
+    // A resolve not repeated lately whose memory has changed since: the title reused the address for a
+    // texture of its own (the event screens' eligibility icons sat on an old menu resolve: white boxes).
+    // Checked every 32 frames; a new resolve there makes it current again.
+    static LiveSwitch noStaleCheck("FM2_NO_STALE_RESOLVES"); // A/B
+    ResolvedTexture& r = it->second;
+    if (!noStaleCheck && r.frame + 8 < g_r.frame && r.frame != ~0ull)
+    {
+        if (!r.stale && g_r.frame - r.memChecked >= 32)
+        {
+            r.memChecked = g_r.frame;
+            if (GuestImageHash(it->first, r.width, r.height) != r.memHash)
+            {
+                r.stale = true;
+                Log("renderer: resolve at %08X (%ux%u) is stale: the memory was reused", it->first, r.width, r.height);
+            }
+        }
+        if (r.stale)
+            return nullptr;
+    }
+    return &r;
 }
 
 // Decodes (if changed) and uploads a texture; returns its resource.
@@ -3748,6 +3786,8 @@ void BlitResolve(bool depth, uint32_t base, uint32_t width, uint32_t height, DXG
     ResolvedTexture& dest = g_r.resolved[base];
     const uint32_t hostWidth = uint32_t(HostX(LONG(width))), hostHeight = uint32_t(HostY(LONG(height)));
     EnsureResolved(dest, width, height, hostWidth, hostHeight, format);
+    if (dest.frame != g_r.frame) // (once per frame: tiles land in the same image)
+        NoteResolvedMemory(base, dest);
     dest.frame = g_r.frame;
     const D3D12_RECT sr{ rect.left, rect.top, std::min<LONG>(rect.right, width), std::min<LONG>(rect.bottom, height) };
     FrameResources& f = Frame();
@@ -5383,6 +5423,8 @@ void FinishDepthWriteback(UINT frameIndex)
     }
     const D3D12_RANGE none{ 0, 0 };
     w.buffer->Unmap(0, &none);
+    if (auto it = g_r.resolved.find(w.base); it != g_r.resolved.end())
+        NoteResolvedMemory(w.base, it->second); // our own write: not a reuse of the memory
 }
 
 void WriteDepthToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t info, const D3D12_RECT& rect)
@@ -5478,6 +5520,8 @@ void FinishPhotoWriteback(UINT frameIndex)
     }
     const D3D12_RANGE none{ 0, 0 };
     w.buffer->Unmap(0, &none);
+    if (auto it = g_r.resolved.find(w.base); it != g_r.resolved.end())
+        NoteResolvedMemory(w.base, it->second); // our own write: not a reuse of the memory
 }
 
 void WritePhotoToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t info)
@@ -5588,6 +5632,7 @@ void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_
     }
     (void)rows;
     buffer->Unmap(0, nullptr);
+    NoteResolvedMemory(base, r); // our own write: not a reuse of the memory
     Log("resolve: wrote %ux%u back to guest memory at %08X (endian %u, swap %d)", width, height, base, endian, int(swapRB));
 }
 
