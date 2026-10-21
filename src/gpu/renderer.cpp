@@ -122,7 +122,7 @@ struct Upscale
 // A pass taller than the screen (the paint editor's 1024x1024 livery target) is scaled as a whole
 // by kHeight / its height so it fits the surface, and the vertex shader divides by its height.
 // It is found by its window scissor (WindowScissor) and recognised by its surface info.
-uint32_t g_tallInfo = 0, g_tallHeight = 0;
+uint32_t g_tallInfo = 0, g_tallHeight = 0, g_tallKey = ~0u;
 std::atomic<bool> g_tallSeen{ false }; // FM2_CAPTURE_TALL: a tall pass was drawn
 // A surface wider than the screen (the paint editor's 2048x2048 livery composite, drawn in 256-row
 // tiles) is a square pass of its pitch less the tile padding (2080 -> 2048, 1040 -> 1024).
@@ -175,11 +175,20 @@ uint32_t BigPassSize()
     return memo.result;
 }
 uint32_t PassWidth() { const uint32_t big = BigPassSize(); return big ? big : kWidth; }
+// Another MSAA view of the tall pass's EDRAM: the livery editor clears the stencil of its 1x
+// 1024x1024 target through a 4x view (480x512, pitch 520) while a layer is being moved.
+bool TallView()
+{
+    static const bool off = getenv("FM2_NO_TALL_VIEW") != nullptr; // A/B
+    const uint32_t surface = gpureg::Get(0x2000 /* RB_SURFACE_INFO */);
+    return !off && g_tallHeight && surface != g_tallInfo && ((surface ^ g_tallInfo) >> 16 & 3) && LayoutKey(surface) == g_tallKey;
+}
 uint32_t PassHeight()
 {
     if (const uint32_t big = BigPassSize())
         return big;
-    return g_tallHeight && gpureg::Get(0x2000 /* RB_SURFACE_INFO */) == g_tallInfo ? g_tallHeight : kHeight;
+    const uint32_t surface = gpureg::Get(0x2000 /* RB_SURFACE_INFO */);
+    return g_tallHeight && (surface == g_tallInfo || TallView()) ? g_tallHeight : kHeight;
 }
 float PassScale()
 {
@@ -3533,6 +3542,7 @@ D3D12_RECT WindowScissor()
             Log("tall pass: scissor y %d..%d x %d..%d window offset %d,%d vertexOffset %d surface %08X", y0, y1, x0, x1, wx, wy, int(vertexOffset), surfaceInfo);
         g_tallInfo = surfaceInfo;
         g_tallHeight = uint32_t(y1);
+        g_tallKey = LayoutKey(surfaceInfo);
         // FM2_CAPTURE_TALL=1: trace this very frame from here on (its dump is taken at the swap).
         static const bool captureTall = getenv("FM2_CAPTURE_TALL") != nullptr;
         static bool traced = false;
@@ -4328,6 +4338,18 @@ void Resolve()
         Log("resolve: control %08X dest %08X pitch %08X info %08X rect %ld,%ld-%ld,%ld clear %08X depth clear %08X (color info %08X depth info %08X surface %08X)", control,
             gpureg::Get(RB_COPY_DEST_BASE), gpureg::Get(RB_COPY_DEST_PITCH), gpureg::Get(RB_COPY_DEST_INFO), rect.left, rect.top, rect.right, rect.bottom,
             gpureg::Get(RB_COLOR_CLEAR), gpureg::Get(RB_DEPTH_CLEAR), gpureg::Get(RB_COLOR_INFO), gpureg::Get(RB_DEPTH_INFO), gpureg::Get(RB_SURFACE_INFO));
+    // FM2_CAPTURE_ON_RESOLVE=<dest hex>[,<skip>]: trace the frame after the skip-th resolve to that address
+    // (passes that run only now and then, like the livery editor's moving-layer preview).
+    if (static const char* onResolve = getenv("FM2_CAPTURE_ON_RESOLVE"); onResolve)
+    {
+        static const uint32_t dest = uint32_t(strtoul(onResolve, nullptr, 16));
+        static int skip = strchr(onResolve, ',') ? atoi(strchr(onResolve, ',') + 1) : 0;
+        if ((gpureg::Get(RB_COPY_DEST_BASE) & 0x1FFFFFFF) == dest && skip-- == 0)
+        {
+            g_hotkeyFrame = g_r.frame + 2;
+            Log("capture: resolve to %08X seen, tracing frame %llu", dest, (unsigned long long)(g_r.frame + 2));
+        }
+    }
     if (command != 3 && sourceSelect <= 4)
     {
         // Each tile resolves to the destination row it starts at; key the
@@ -6114,6 +6136,12 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         if ((initiator & 0x3F) != 8 || ps.info.usedTextureSlots || vs.info.usedTextureSlots)
         {
             SetNativeMsaa(LayoutKey(surface), msaa);
+        }
+        else if (TallView())
+        {
+            const uint32_t native = (g_tallInfo >> 16) & 3;
+            vc->vscale[3] = float(MsaaAcross(msaa)) / float(MsaaAcross(native));
+            vc->voffset[3] = float(MsaaDown(msaa)) / float(MsaaDown(native));
         }
         else if (const int native = ForeignNativeMsaa(); native >= 0)
         {
