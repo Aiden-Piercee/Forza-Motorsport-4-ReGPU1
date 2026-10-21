@@ -140,6 +140,9 @@ std::atomic<uint32_t>& NativeSlot(uint32_t key) { return g_nativeMsaa[(key ^ key
 // The surface's MSAA layout when the current view is another one of an MSAA surface, else -1.
 int ForeignNativeMsaa()
 {
+    static const bool off = getenv("FM2_NO_FOREIGN_MSAA") != nullptr; // A/B
+    if (off)
+        return -1;
     const uint32_t surface = gpureg::Get(0x2000 /* RB_SURFACE_INFO */), key = LayoutKey(surface);
     const uint32_t native = NativeSlot(key).load(std::memory_order_relaxed);
     return native >> 2 == key && (native & 3) != ((surface >> 16) & 3) && (native & 3) != 0 ? int(native & 3) : -1;
@@ -5844,6 +5847,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         vc->vte[2] = dmaBase & 0x1FFFFFFF & ~(is32 ? 3u : 1u);
         vc->vte[3] = gpureg::Get(VGT_INDX_OFFSET);
     }
+    // The window scissor marks a tall pass (PassHeight); this draw may be its first, so check before the
+    // target size is taken (else the vertices are placed for 720 rows in a taller viewport: the career
+    // menu's one-off livery downsample came out stretched 1.42x).
+    (void)WindowScissor();
     vc->info[2] = PassWidth();
     vc->info[3] = PassHeight();
     // Point sizes are 12.4 fixed-point radii.
@@ -5945,10 +5952,11 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // 19-20 (mag): 0 point. With only one axis clamped (kerbs: clamped across, repeating
         // along) the wrapping sampler is used and the shader clamps that axis (bits 18, 19).
         const uint32_t clampX = (fetch.dwords[0] >> 10) & 7, clampY = (fetch.dwords[0] >> 13) & 7;
-        const bool clamp = clampX != 0 && clampY != 0;
+        static const bool oldClamp = getenv("FM2_OLD_CLAMP") != nullptr; // A/B: X's mode for both axes (before the kerb fix)
+        const bool clamp = oldClamp ? clampX != 0 : clampX != 0 && clampY != 0;
         const bool point = ((fetch.dwords[3] >> 19) & 3) == 0;
         pc->tinfo[slot][0] = (point ? (clamp ? 2 : 3) : (clamp ? 1 : 0)) | ((uint32_t(fetch.ExpAdjust()) & 0x3F) << 8);
-        if (!clamp)
+        if (!clamp && !oldClamp)
             pc->tinfo[slot][0] |= (clampX ? 1u << 18 : 0u) | (clampY ? 1u << 19 : 0u);
         // Clamp to border on both axes (modes 6, 7): the shader returns the border colour
         // outside the image (dword 5 bits 0-1: 1 white, else black).
