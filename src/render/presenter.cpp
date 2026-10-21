@@ -19,6 +19,8 @@
 
 using Microsoft::WRL::ComPtr;
 
+void DealerOnChar(wchar_t c); // hooks/dealer.cpp: a typed easter-egg code
+
 namespace
 {
 constexpr UINT kBuffers = 3;
@@ -67,6 +69,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         Log("presenter: window closed, exiting");
         std::_Exit(0);
+    }
+    if (msg == WM_CHAR)
+    {
+        DealerOnChar(wchar_t(wp));
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }

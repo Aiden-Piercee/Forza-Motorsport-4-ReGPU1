@@ -61,6 +61,8 @@ using Microsoft::WRL::ComPtr;
 
 void LogAllHostThreadStacks(const char* why); // hang.cpp
 extern std::atomic<bool> g_cameraAspectWidened; // hooks/camera_aspect.cpp
+float DealerBounce(); // hooks/dealer.cpp: the car bodies' bounce
+
 namespace
 {
 constexpr UINT kWidth = 1280, kHeight = 720;
@@ -289,6 +291,7 @@ struct CompiledShader
     TranslatedShader info;
     const CompiledShader* hlslSource = nullptr; // canonical variants: the shader whose code (and HLSL) this reuses
     mutable const CompiledShader* motion = nullptr; // its motion-vector variant, once looked up
+    bool carBody = false; // a car-body vertex shader (ApplyDirtSeamFix): takes the easter egg's bounce
     bool IsReady() const { return state.load(std::memory_order_acquire) == Ready; }
 };
 
@@ -2035,29 +2038,39 @@ uint64_t PsEditAlias(uint64_t hash)
 // along the bonnet (the AE86 at Tsukuba from lap 2). Seam-safe sampling: those vertex shaders also output
 // frac(u + 0.5) (o[9], with a flag in .y), and pixel shaders that sample at that u take whichever of the
 // two changes less across the pixel. Elsewhere both give the same texel. FM2_NO_SEAM_FIX=1 turns it off.
-void ApplyDirtSeamFix(std::string& hlsl, bool pixel)
+// Returns true for a car-body vertex shader (it also gets the easter egg's bounce: see dealer.cpp).
+bool ApplyDirtSeamFix(std::string& hlsl, bool pixel)
 {
     static LiveSwitch off("FM2_NO_SEAM_FIX");
-    if (off)
-        return;
     if (!pixel)
     {
         // o[0].z = u (from the angle), o[0].w = v; o[9] is free in these shaders.
         static const std::string uv = "(r[0].wwww) + (vc[189].xxxx); s = (vc[190].x) + (r[0].y); ps = s; o[0].z = v.z; o[0].w = s.xxxx.w; }";
-        if (size_t at = hlsl.find(uv); at != std::string::npos && hlsl.find("o[9]") == std::string::npos)
+        const size_t at = hlsl.find(uv);
+        if (at == std::string::npos)
+            return false;
+        if (!off && hlsl.find("o[9]") == std::string::npos)
             hlsl.insert(at + uv.size(), " o[9] = float4(frac(o[0].z + 0.5), 1, 0, 0);");
-        return;
+        // The bounce: a lift in clip space, from vpoint.w (point sprites only use vpoint, and these
+        // draws are never point sprites; the renderer sets it to the bounce, 0 normally).
+        static const std::string end = "}\nvoid GuestVS(uint vindex, out float4 opos, out float4 o[16])\n";
+        if (size_t e = hlsl.find(end); e != std::string::npos)
+            hlsl.insert(e, "            opos.y += vpoint.w * opos.w;\n");
+        return true;
     }
+    if (off)
+        return false;
     static const std::string coord = "float3(r[0].z, r[0].w, r[0].x)";
     static const std::string init = "for (int j = 0; j < 16; j++) r[j] = input.o[j];";
     const size_t start = hlsl.find(init);
     if (start == std::string::npos || hlsl.find(coord) == std::string::npos)
-        return;
+        return false;
     // Chosen before the shader's control-flow loop (derivatives there would be per-branch).
     hlsl.insert(start + init.size(),
         "\n    float seamU = input.o[9].y > 0.5 && fwidth(input.o[9].x) < fwidth(input.o[0].z) ? input.o[9].x - 0.5 : input.o[0].z;");
     for (size_t at; (at = hlsl.find(coord)) != std::string::npos;)
         hlsl.replace(at, coord.size(), "float3(input.o[9].y > 0.5 ? seamU : r[0].z, r[0].w, r[0].x)");
+    return false;
 }
 
 const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel, bool background);
@@ -2128,6 +2141,7 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
                 cs.cacheKey = base.cacheKey;
                 cs.code = base.code;
                 cs.hlslSource = &base;
+                cs.carBody = base.carBody;
                 cs.state = CompiledShader::Ready;
                 g_stats.shadersCached++;
                 path = "variant";
@@ -2146,7 +2160,7 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
         cs.state = CompiledShader::Failed;
         return cs;
     }
-    ApplyDirtSeamFix(cs.info.hlsl, pixel);
+    cs.carBody = ApplyDirtSeamFix(cs.info.hlsl, pixel);
     if (g_dumpHlsl)
     {
         std::filesystem::create_directories("out/hlsl");
@@ -6344,6 +6358,11 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     vc->point[1] = float(pointSize & 0xFFFF) / 8.0f;
     vc->point[2] = float(pointMinMax & 0xFFFF) / 8.0f;
     vc->point[3] = float(pointMinMax >> 16) / 8.0f;
+    // Car bodies read vpoint.w as their bounce (the "whysthisdealer" easter egg, dealer.cpp).
+    if (vs.carBody)
+    {
+        vc->point[3] = DealerBounce();
+    }
     pc->info[1] = (gpureg::Get(SQ_PROGRAM_CNTL) >> 18) & 1 ? (gpureg::Get(SQ_CONTEXT_MISC) >> 8) & 0xFF : 0xFF;
 
     const uint32_t colorControl = gpureg::Get(RB_COLORCONTROL);

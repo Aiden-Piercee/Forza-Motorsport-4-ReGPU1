@@ -345,6 +345,17 @@ std::string Handle(const std::string& line)
         return Ok(std::string("\"name\":\"") + Escape(name) + "\",\"on\":" + (on ? "true" : "false") +
                   ",\"reached\":" + (known ? "true" : "false"));
     }
+    // type TEXT: as if typed in the game window (WM_CHAR: easter-egg codes)
+    if (cmd == "type")
+    {
+        std::string text;
+        std::getline(in, text);
+        text.erase(0, text.find_first_not_of(' '));
+        if (HWND w = FindWindowW(L"fm2", nullptr))
+            for (char c : text)
+                PostMessageW(w, WM_CHAR, WPARAM(uint8_t(c)), 0);
+        return Ok();
+    }
     // find TEXT: guest addresses holding TEXT as ASCII, UTF-16 big- or little-endian (the first 64)
     if (cmd == "find")
     {
