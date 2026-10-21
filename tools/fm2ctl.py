@@ -16,6 +16,11 @@ Commands (sent as typed):
   capture                            what F12 does (trace the next frame into out/capture)
   log [n]                            the last n lines of the log
   peek ADDR [bytes] | poke ADDR HEX  guest memory (hex addresses, big-endian bytes)
+  ps HASH EXPR | ps HASH tint R,G,B  that pixel shader returns EXPR (HLSL over r[], input.o[], ...) or a flat
+                                     colour, live; "ps HASH" alone goes back to the original
+  vs HASH STATEMENT                  that vertex shader also runs STATEMENT at its end (e.g. o[0].zw = r[4].xy;),
+                                     to read values with a ps edit; "vs HASH" alone goes back
+  hlsl HASH [path]                   save a shader's translated HLSL (default out/hlsl/HASH.hlsl)
   switches                           the on/off FM2_* switches reached so far, and their state
   switch FM2_NAME 0|1                flip one live (A/B tests without a restart; one not reached yet is
                                      kept for when it is)

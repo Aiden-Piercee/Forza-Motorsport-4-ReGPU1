@@ -2002,6 +2002,60 @@ uint64_t CanonicalKey(const ucode::Shader& parsed)
 }
 
 // background: queued behind everything a draw needs (the static shader set).
+// Live pixel shader edits (the debug server's "ps HASH EXPR"): draws with that shader use an alias hash
+// instead, translated afresh with its output replaced, so they get their own pipelines and the original
+// shader is untouched (shaders are never removed). A new edit gets a new alias; clearing it goes back.
+std::mutex g_psEditMutex;
+std::unordered_map<uint64_t, uint64_t> g_psEditAlias; // shader -> alias
+std::unordered_map<uint64_t, std::string> g_psEditExpr; // alias -> the expression it returns
+std::atomic<bool> g_psEdits{ false };
+std::unordered_set<uint64_t> g_psEditEver; // every alias made (kept out of the pipeline manifest)
+bool IsPsEditAlias(uint64_t hash)
+{
+    std::lock_guard lock(g_psEditMutex);
+    return g_psEditEver.count(hash) != 0;
+}
+uint64_t PsEditAlias(uint64_t hash)
+{
+    if (!g_psEdits.load(std::memory_order_relaxed))
+        return hash;
+    std::lock_guard lock(g_psEditMutex);
+    auto it = g_psEditAlias.find(hash);
+    return it == g_psEditAlias.end() ? hash : it->second;
+}
+
+// The car body's dirt map (a DXT1 1024x128 the game updates as dirt builds up) is wrapped round the car:
+// the body vertex shader takes u from an atan2 of the normal, whose branch cut runs along the top centre
+// line, so u is ~1 on one side of the bonnet and ~0 on the other. The triangles across that line
+// interpolate the long way round and squeeze the whole map into a strip: once there is dirt, dark streaks
+// along the bonnet (the AE86 at Tsukuba from lap 2). Seam-safe sampling: those vertex shaders also output
+// frac(u + 0.5) (o[9], with a flag in .y), and pixel shaders that sample at that u take whichever of the
+// two changes less across the pixel. Elsewhere both give the same texel. FM2_NO_SEAM_FIX=1 turns it off.
+void ApplyDirtSeamFix(std::string& hlsl, bool pixel)
+{
+    static LiveSwitch off("FM2_NO_SEAM_FIX");
+    if (off)
+        return;
+    if (!pixel)
+    {
+        // o[0].z = u (from the angle), o[0].w = v; o[9] is free in these shaders.
+        static const std::string uv = "(r[0].wwww) + (vc[189].xxxx); s = (vc[190].x) + (r[0].y); ps = s; o[0].z = v.z; o[0].w = s.xxxx.w; }";
+        if (size_t at = hlsl.find(uv); at != std::string::npos && hlsl.find("o[9]") == std::string::npos)
+            hlsl.insert(at + uv.size(), " o[9] = float4(frac(o[0].z + 0.5), 1, 0, 0);");
+        return;
+    }
+    static const std::string coord = "float3(r[0].z, r[0].w, r[0].x)";
+    static const std::string init = "for (int j = 0; j < 16; j++) r[j] = input.o[j];";
+    const size_t start = hlsl.find(init);
+    if (start == std::string::npos || hlsl.find(coord) == std::string::npos)
+        return;
+    // Chosen before the shader's control-flow loop (derivatives there would be per-branch).
+    hlsl.insert(start + init.size(),
+        "\n    float seamU = input.o[9].y > 0.5 && fwidth(input.o[9].x) < fwidth(input.o[0].z) ? input.o[9].x - 0.5 : input.o[0].z;");
+    for (size_t at; (at = hlsl.find(coord)) != std::string::npos;)
+        hlsl.replace(at, coord.size(), "float3(input.o[9].y > 0.5 ? seamU : r[0].z, r[0].w, r[0].x)");
+}
+
 const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel, bool background);
 // Shaders are never removed: each thread remembers the ones it looked up (no lock per draw).
 const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel, bool background = false)
@@ -2052,7 +2106,7 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
     } logSlow{ getStart, cs, path };
     const ucode::Shader parsed = ucode::Parse(codeBE.data(), uint32_t(codeBE.size()), pixel);
     static LiveSwitch noCanonical("FM2_NO_CANONICAL");
-    const uint64_t canonical = pixel || noCanonical ? 0 : CanonicalKey(parsed);
+    const uint64_t canonical = pixel || noCanonical || IsPsEditAlias(hash) ? 0 : CanonicalKey(parsed);
     if (canonical)
         path = g_canonical.count(canonical) ? (g_canonical[canonical]->IsReady() ? "full, layout fallback" : "full, base not ready") : "full, new canonical";
     if (canonical)
@@ -2088,6 +2142,7 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
         cs.state = CompiledShader::Failed;
         return cs;
     }
+    ApplyDirtSeamFix(cs.info.hlsl, pixel);
     if (g_dumpHlsl)
     {
         std::filesystem::create_directories("out/hlsl");
@@ -2144,6 +2199,50 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
         if (const char* expr = strchr(dbg, ':'))
             if (size_t at = cs.info.hlsl.rfind("return oC[0];"); at != std::string::npos)
                 cs.info.hlsl.replace(at, 13, std::string("return ") + (expr + 1) + ";");
+    if (!pixel && g_psEdits.load(std::memory_order_relaxed))
+    {
+        std::string stmt;
+        {
+            std::lock_guard lock(g_psEditMutex);
+            if (auto e = g_psEditExpr.find(hash); e != g_psEditExpr.end())
+                stmt = e->second;
+        }
+        const std::string marker = "}\nvoid GuestVS(uint vindex, out float4 opos, out float4 o[16])\n";
+        // "@TEXT|STATEMENT" runs it after the first line holding TEXT instead of at the end.
+        size_t at = std::string::npos;
+        if (!stmt.empty() && stmt[0] == '@')
+        {
+            const size_t bar = stmt.find('|');
+            if (bar != std::string::npos)
+                if (size_t hit = cs.info.hlsl.find(stmt.substr(1, bar - 1)); hit != std::string::npos)
+                    at = cs.info.hlsl.find('\n', hit) + 1;
+            stmt = bar == std::string::npos ? "" : stmt.substr(bar + 1);
+        }
+        else if (!stmt.empty())
+            at = cs.info.hlsl.find(marker);
+        if (!stmt.empty() && at != std::string::npos && at != 0)
+        {
+            cs.info.hlsl.insert(at, "            " + stmt + "\n");
+            Log("debug: vs alias %016llx runs %s", (unsigned long long)hash, stmt.c_str());
+        }
+        else if (!stmt.empty())
+            Log("debug: vs alias %016llx: the anchor wasn't found", (unsigned long long)hash);
+    }
+    if (pixel && g_psEdits.load(std::memory_order_relaxed))
+    {
+        std::string expr;
+        {
+            std::lock_guard lock(g_psEditMutex);
+            if (auto e = g_psEditExpr.find(hash); e != g_psEditExpr.end())
+                expr = e->second;
+        }
+        if (!expr.empty())
+        {
+            if (size_t at = cs.info.hlsl.rfind("return oC[0];"); at != std::string::npos)
+                cs.info.hlsl.replace(at, 13, "return " + expr + ";");
+            Log("debug: ps alias %016llx returns %s", (unsigned long long)hash, expr.c_str());
+        }
+    }
     cs.cacheKey = Fnv(cs.info.hlsl.data(), cs.info.hlsl.size(), pixel ? 1 : 2);
     if (auto b = g_bytecode.find(cs.cacheKey); b != g_bytecode.end())
     {
@@ -2598,7 +2697,7 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     }
     auto entry = std::make_shared<PipelineEntry>();
     g_r.pipelines[key] = entry;
-    if (!motion) // the manifest rebuilds pipelines from the base shaders
+    if (!motion && !IsPsEditAlias(key.ps) && !IsPsEditAlias(key.vs)) // the manifest rebuilds pipelines from the base shaders (not live edits)
     {
         g_manifest.RecordShader(false, key.vs, vs.ucodeBE);
         g_manifest.RecordShader(true, key.ps, ps.ucodeBE);
@@ -5818,6 +5917,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             }
         }
     }
+    // A live edit of this pixel shader (PsEditAlias): this draw uses the alias, the context keeps the real hash.
+    struct PsAlias
+    {
+        uint64_t real, realVs;
+        PsAlias() : real(C().psHash), realVs(C().vsHash) { C().psHash = PsEditAlias(real); C().vsHash = PsEditAlias(realVs); }
+        ~PsAlias() { C().psHash = real; C().vsHash = realVs; }
+    } psAlias;
     const CompiledShader& vs = GetShader(C().vsHash, C().vsCode, false);
     const CompiledShader& ps = GetShader(C().psHash, C().psCode, true);
     Section(1);
@@ -7335,3 +7441,49 @@ void RendererSetGammaEntry(uint32_t index, uint32_t rgb10)
 
 // The debug server's "capture": what F12 does.
 void RendererRequestCapture() { g_hotkeyFrame = g_r.frame + 1; }
+
+// The debug server's "ps HASH [EXPR]": an empty expression drops the edit. Returns the alias (0 if dropped).
+uint64_t RendererEditPixelShader(uint64_t hash, const std::string& expr)
+{
+    static std::atomic<uint64_t> serial{ 0 };
+    std::lock_guard lock(g_psEditMutex);
+    if (auto it = g_psEditAlias.find(hash); it != g_psEditAlias.end())
+    {
+        g_psEditExpr.erase(it->second);
+        g_psEditAlias.erase(it);
+    }
+    uint64_t alias = 0;
+    if (!expr.empty())
+    {
+        alias = hash ^ (0x9E3779B97F4A7C15ull * ++serial) ^ 0xD3B6000000000000ull;
+        g_psEditAlias[hash] = alias;
+        g_psEditExpr[alias] = expr;
+        g_psEditEver.insert(alias);
+    }
+    g_psEdits = !g_psEditAlias.empty();
+    return alias;
+}
+
+// The debug server's "hlsl HASH": the shader's translated source ("" if it hasn't been seen).
+std::string RendererShaderHlsl(uint64_t hash)
+{
+    std::lock_guard lock(g_shaderMutex);
+    auto it = g_r.shaders.find(hash);
+    if (it == g_r.shaders.end())
+        return {};
+    const CompiledShader* cs = it->second.get();
+    return cs->hlslSource ? cs->hlslSource->info.hlsl : cs->info.hlsl;
+}
+
+// Whether a live edit's alias is drawing: its shader compiled and a pipeline with it built.
+bool RendererPsEditReady(uint64_t alias)
+{
+    std::lock_guard lock(g_shaderMutex);
+    auto it = g_r.shaders.find(alias);
+    if (it == g_r.shaders.end() || !it->second->IsReady())
+        return false;
+    for (const auto& [key, entry] : g_r.pipelines)
+        if ((key.ps == alias || key.vs == alias) && entry->state.load(std::memory_order_acquire) == 1)
+            return true;
+    return false;
+}

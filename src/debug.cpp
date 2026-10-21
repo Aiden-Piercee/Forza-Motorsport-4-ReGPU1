@@ -28,6 +28,9 @@
 #pragma comment(lib, "ws2_32.lib")
 
 void RendererRequestCapture(); // renderer.cpp: F12
+uint64_t RendererEditPixelShader(uint64_t hash, const std::string& expr);
+std::string RendererShaderHlsl(uint64_t hash);
+bool RendererPsEditReady(uint64_t alias);
 
 namespace
 {
@@ -271,6 +274,56 @@ std::string Handle(const std::string& line)
         for (size_t i = 0; i < data.size(); i += 2)
             GuestPtr<uint8_t>(address)[i / 2] = uint8_t(strtoul(data.substr(i, 2).c_str(), nullptr, 16));
         return Ok();
+    }
+    // ps HASH EXPR: that pixel shader returns EXPR (HLSL over its registers, e.g. float4(r[4].xyz, 1))
+    // ps HASH tint R,G,B: a flat colour   ps HASH: back to the original
+    // vs HASH STATEMENT: that vertex shader also runs STATEMENT at its end (HLSL over r[], o[], vc[]), e.g.
+    // o[0].zw = r[4].xy; (and read it back with a ps edit)   vs HASH: back to the original
+    if (cmd == "ps" || cmd == "vs")
+    {
+        std::string h, rest;
+        in >> h;
+        std::getline(in, rest);
+        rest.erase(0, rest.find_first_not_of(' '));
+        const uint64_t hash = strtoull(h.c_str(), nullptr, 16);
+        if (!hash)
+            return Error("ps HASH [EXPR | tint R,G,B]");
+        if (cmd == "ps" && rest.rfind("tint ", 0) == 0)
+            rest = "float4(" + rest.substr(5) + ", 1)";
+        const uint64_t alias = RendererEditPixelShader(hash, rest);
+        // Its compile takes a second or so and its draws are skipped meanwhile: answer once it draws
+        // (and a few frames later, so the next shot has it everywhere).
+        bool ready = !alias;
+        const auto deadline = Clock::now() + std::chrono::seconds(30); // vertex shaders take ~5 s
+        while (!ready && Clock::now() < deadline)
+        {
+            WaitFrames(1, 0.1);
+            ready = RendererPsEditReady(alias);
+        }
+        if (ready)
+            WaitFrames(3, 2);
+        char buf[96];
+        snprintf(buf, sizeof(buf), "\"alias\":\"%016llx\",\"ready\":%s", (unsigned long long)alias, ready ? "true" : "false");
+        return Ok(buf);
+    }
+    // hlsl HASH [path]: the shader's translated HLSL, written to path (default out/hlsl/<hash>.hlsl)
+    if (cmd == "hlsl")
+    {
+        std::string h, path;
+        in >> h >> path;
+        const std::string src = RendererShaderHlsl(strtoull(h.c_str(), nullptr, 16));
+        if (src.empty())
+            return Error("no such shader (not drawn yet?)");
+        if (path.empty())
+            path = "out/hlsl/" + h + ".hlsl";
+        CreateDirectoryA("out", nullptr);
+        CreateDirectoryA("out/hlsl", nullptr);
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f)
+            return Error("can't write " + path);
+        fwrite(src.data(), 1, src.size(), f);
+        fclose(f);
+        return Ok("\"path\":\"" + Escape(path) + "\",\"bytes\":" + std::to_string(src.size()));
     }
     // switches: the on/off FM2_* switches reached so far   switch NAME 0|1: flip one (live_switch.h)
     if (cmd == "switches")
