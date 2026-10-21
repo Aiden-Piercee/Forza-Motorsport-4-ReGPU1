@@ -217,7 +217,12 @@ float ViewExtent()
     return 1.0f + (std::max(OutputWide(), 1.0f) - 1.0f) * widePercent / 100.0f;
 }
 constexpr UINT kFrames = 3;
-constexpr UINT64 kRingSize = 64ull << 20;
+// The per-frame upload ring. Without guest memory mapped for the GPU (drivers without
+// ID3D12Device13, e.g. older Windows 10 builds) every vertex buffer is copied into it: the
+// menus alone then need well over 64 MB a frame, and draws past the end were dropped (black
+// bands and missing letters). FM2_RING_MB overrides.
+UINT64 kRingSize = 64ull << 20;
+UINT64 g_ringPeak = 0;
 constexpr UINT kDescriptorsPerFrame = 8192; // per frame: ring + guest memory views, then resolve-blit views
 constexpr UINT kBindless = 1u << 16;      // permanent texture descriptors (0 null 2D, 1 null cube)
 constexpr UINT kBindlessBase = kDescriptorsPerFrame * 3;
@@ -1080,6 +1085,8 @@ void Init()
     InitDepthBlit();
     g_r.readback = CreateBuffer(UINT64((OutputWidth() * 4 + 255) & ~255u) * OutputHeight(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
 
+    kRingSize = (getenv("FM2_RING_MB") ? std::clamp<UINT64>(UINT64(atoi(getenv("FM2_RING_MB"))), 16, 2048) : g_r.physical && !getenv("FM2_NO_DIRECT_FETCH") ? 64 : 384) << 20;
+    Log("renderer: upload ring %llu MB per frame", (unsigned long long)(kRingSize >> 20));
     for (UINT i = 0; i < kFrames; i++)
     {
         FrameResources& f = g_r.frames[i];
@@ -1413,6 +1420,12 @@ void BeginFrameIfNeeded()
     PassMark("frame start %u%u", 0, 0);
     if (perf && g_timestamps)
         C().list->EndQuery(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frameIndex * 2);
+    if (const UINT64 used = f.ringUsed.load(); used > g_ringPeak)
+    {
+        g_ringPeak = used;
+        if (used > kRingSize / 2)
+            Log("renderer: upload ring peak %llu MB of %llu", (unsigned long long)(used >> 20), (unsigned long long)(kRingSize >> 20));
+    }
     f.ringUsed = 0;
     f.uploads.clear();
     // Per-frame table: t0 this frame's ring, t1 guest physical memory.
@@ -1458,7 +1471,8 @@ UINT64 RingAlloc(UINT64 bytes, UINT64 alignment = 256)
     if (offset + bytes > kRingSize)
     {
         static UINT64 lastFull = 0;
-        if (RendererTracing() && lastFull != g_r.frame)
+        static int fullLogs = 0;
+        if ((RendererTracing() || fullLogs < 20) && lastFull != g_r.frame && ++fullLogs)
         {
             lastFull = g_r.frame;
             Log("ring full: %llu bytes requested, %llu used, %llu uploads cached", (unsigned long long)bytes, (unsigned long long)f.ringUsed.load(), (unsigned long long)f.uploads.size());
@@ -1477,7 +1491,8 @@ UINT64 UploadGuest(uint32_t guest, uint32_t bytes)
     // Small buffers are often rewritten between draws (UI quads), so hash all
     // of them; large ones (static geometry) are sampled.
     uint64_t sample = bytes;
-    if (bytes <= 16384)
+    static const uint32_t fullHashBytes = getenv("FM2_UPLOAD_FULL_HASH_KB") ? uint32_t(atoi(getenv("FM2_UPLOAD_FULL_HASH_KB"))) * 1024u : 16384u;
+    if (bytes <= fullHashBytes)
         sample = ContentHash(src, bytes);
     else
         for (uint32_t i = 0; i < 16 && bytes >= 8; i++)
