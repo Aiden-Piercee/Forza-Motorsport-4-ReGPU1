@@ -1301,7 +1301,9 @@ void BeginFrameIfNeeded()
     }
     f.garbage.clear();
     void FinishDepthWriteback(UINT frameIndex);
+    void FinishPhotoWriteback(UINT frameIndex);
     FinishDepthWriteback(UINT(&f - g_r.frames)); // this slot's previous frame has completed
+    FinishPhotoWriteback(UINT(&f - g_r.frames));
     static const bool perf = getenv("FM2_PERF") != nullptr;
     const UINT frameIndex = UINT(&f - g_r.frames);
     if (!g_occlusionPending[frameIndex].empty())
@@ -4273,6 +4275,8 @@ void UpscaleScene(uint32_t base)
 // Copies the render target resolved to `base` into guest memory, tiled, for the title to read.
 void WriteResolveToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t info);
 void WriteDepthToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t info, const D3D12_RECT& rect);
+void WritePhotoToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t info);
+extern uint64_t g_lastFocusFrame;
 
 void Resolve()
 {
@@ -4317,7 +4321,9 @@ void Resolve()
     const uint64_t traceFrame = TraceFrame();
     // FM2_TRACE_RESOLVES=1: every resolve (not just those of the traced frame), with its time.
     static const bool traceAllResolves = getenv("FM2_TRACE_RESOLVES") != nullptr;
-    if (traceAllResolves || (traceFrame && g_r.frame + 1 == traceFrame))
+    // FM2_TRACE_RESOLVES_MIN=<width>: only resolves at least that wide (less slowdown).
+    static const long traceMinWidth = getenv("FM2_TRACE_RESOLVES_MIN") ? atol(getenv("FM2_TRACE_RESOLVES_MIN")) : 0;
+    if ((traceAllResolves && rect.right - rect.left >= traceMinWidth) || (traceFrame && g_r.frame + 1 == traceFrame))
         Log("resolve: control %08X dest %08X pitch %08X info %08X rect %ld,%ld-%ld,%ld clear %08X depth clear %08X (color info %08X depth info %08X surface %08X)", control,
             gpureg::Get(RB_COPY_DEST_BASE), gpureg::Get(RB_COPY_DEST_PITCH), gpureg::Get(RB_COPY_DEST_INFO), rect.left, rect.top, rect.right, rect.bottom,
             gpureg::Get(RB_COLOR_CLEAR), gpureg::Get(RB_DEPTH_CLEAR), gpureg::Get(RB_COLOR_INFO), gpureg::Get(RB_DEPTH_INFO), gpureg::Get(RB_SURFACE_INFO));
@@ -4383,6 +4389,11 @@ void Resolve()
         static const bool noDepthWriteback = getenv("FM2_NO_DEPTH_WRITEBACK") != nullptr;
         if (depth && destFormat == 6 && !noDepthWriteback && width >= kWidth && ((gpureg::Get(RB_SURFACE_INFO) >> 16) & 3) == 2) // 4x scene tiles only
             WriteDepthToGuest(base, width, height, info, rect);
+        // Photo Mode's picture (the 4x 8888 image, its last tile): saving locks it and compresses it
+        // on the CPU (sub_82293E28), so while the focus readback says Photo Mode is up it goes to memory too.
+        if (!depth && destFormat == 6 && !noDepthWriteback && width >= kWidth && rect.left == 0 && rect.bottom >= LONG(kHeight) &&
+            ((gpureg::Get(RB_SURFACE_INFO) >> 16) & 3) == 2 && g_r.frame - g_lastFocusFrame <= 2)
+            WritePhotoToGuest(base, width, height, info);
         if (!depth && destFormat == 6 && rect.left == 0 && rect.top == 0 &&
             std::find(writeback.begin(), writeback.end(), std::pair<uint32_t, uint32_t>(width, height)) != writeback.end())
             WriteResolveToGuest(base, width, height, info);
@@ -5291,11 +5302,96 @@ void WriteDepthToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t 
     w.y0 = y0;
     w.y1 = y1;
     w.pending = true;
+    g_lastFocusFrame = g_r.frame;
     static bool logged = false;
     if (!logged)
     {
         logged = true;
         Log("resolve: Photo Mode focus: depth around the centre written back to guest memory at %08X", base);
+    }
+}
+
+uint64_t g_lastFocusFrame = ~0ull >> 1;
+
+// Photo Mode's picture, copied with its frame and written to memory (tiled A8R8G8B8) when the
+// frame slot comes round again: no stall (a wait every frame ran Photo Mode at 20 fps).
+struct PhotoWriteback
+{
+    ComPtr<ID3D12Resource> buffer;
+    UINT pitch = 0, hostW = 0, hostH = 0;
+    uint32_t base = 0, width = 0, height = 0, info = 0;
+    bool pending = false;
+};
+PhotoWriteback g_photoWriteback[kFrames];
+
+void FinishPhotoWriteback(UINT frameIndex)
+{
+    PhotoWriteback& w = g_photoWriteback[frameIndex];
+    if (!w.pending)
+        return;
+    w.pending = false;
+    uint8_t* pixels = nullptr;
+    if (FAILED(w.buffer->Map(0, nullptr, reinterpret_cast<void**>(&pixels))) || !pixels)
+        return;
+    const uint32_t endian = w.info & 7, pitchTexels = (w.width + 31) & ~31u;
+    // The saver byte-swaps the words itself and reads them with no fetch swizzle: with the copy
+    // swap bit set, red stays in bits 16-23 (the other way round, photos had red and blue exchanged).
+    const bool swapRB = ((w.info >> 24) & 1) == 0;
+    uint8_t* guest = GuestPtr<uint8_t>(GpuPhysToGuest(w.base));
+    for (uint32_t y = 0; y < w.height; y++)
+    {
+        const uint8_t* line = pixels + size_t(y * w.hostH / w.height) * w.pitch;
+        for (uint32_t x = 0; x < w.width; x++)
+        {
+            const uint8_t* px = line + size_t(x * w.hostW / w.width) * 4;
+            const uint32_t red = swapRB ? px[2] : px[0], green = px[1], blue = swapRB ? px[0] : px[2];
+            const uint32_t word = uint32_t(px[3]) << 24 | red << 16 | green << 8 | blue;
+            const uint32_t stored = endian == 0 ? word : __builtin_bswap32(word);
+            memcpy(guest + TextureTiledOffset(x, y, pitchTexels, 2), &stored, 4);
+        }
+    }
+    const D3D12_RANGE none{ 0, 0 };
+    w.buffer->Unmap(0, &none);
+}
+
+void WritePhotoToGuest(uint32_t base, uint32_t width, uint32_t height, uint32_t info)
+{
+    const auto it = g_r.resolved.find(base);
+    if (it == g_r.resolved.end() || !it->second.resource || it->second.format != DXGI_FORMAT_R8G8B8A8_UNORM)
+        return;
+    ResolvedTexture& r = it->second;
+    PhotoWriteback& w = g_photoWriteback[g_r.frameIndex];
+    w.hostW = r.hostWidth;
+    w.hostH = r.hostHeight;
+    w.pitch = (w.hostW * 4 + 255) & ~255u;
+    const UINT64 bytes = UINT64(w.pitch) * w.hostH;
+    if (!w.buffer || w.buffer->GetDesc().Width < bytes)
+        w.buffer = CreateBuffer(bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_RESOURCE_BARRIER bar{};
+    bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bar.Transition.pResource = r.resource.Get();
+    bar.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    C().list->ResourceBarrier(1, &bar);
+    D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+    dst.pResource = w.buffer.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, w.hostW, w.hostH, 1, w.pitch };
+    src.pResource = r.resource.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    C().list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    std::swap(bar.Transition.StateBefore, bar.Transition.StateAfter);
+    C().list->ResourceBarrier(1, &bar);
+    w.base = base;
+    w.width = width;
+    w.height = std::min(height, kHeight);
+    w.info = info;
+    w.pending = true;
+    static bool logged = false;
+    if (!logged)
+    {
+        logged = true;
+        Log("resolve: Photo Mode picture written back to guest memory at %08X", base);
     }
 }
 

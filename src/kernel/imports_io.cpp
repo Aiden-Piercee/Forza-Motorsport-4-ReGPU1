@@ -525,6 +525,56 @@ GUEST_EXPORT(NtSetInformationFile)
     }
     case 4:  // FileBasicInformation: times/attributes, ignored
         break;
+    case 10: // FileRenameInformation: { u32 ReplaceIfExists, u32 RootDirectory, ANSI_STRING FileName }
+    {
+        // Saved photos are written to SavedPhotos:\temp\photo and then renamed into place.
+        const bool replace = LoadBE32(info) != 0;
+        std::string guest = GuestAnsiString(info + 8);
+        if (const uint32_t root = LoadBE32(info + 4))
+        {
+            if (auto parent = GetFile(root))
+                guest = parent->guestPath + "\\" + guest;
+        }
+        else if (guest.find(':') == std::string::npos && (guest.empty() || guest[0] != '\\'))
+        {
+            const size_t slash = file->guestPath.find_last_of('\\');
+            guest = (slash == std::string::npos ? std::string() : file->guestPath.substr(0, slash + 1)) + guest;
+        }
+        fs::path target;
+        bool readOnly = false;
+        static const bool trace = getenv("FM2_TRACE_FILES") != nullptr;
+        if (!VfsResolve(guest, target, &readOnly) || readOnly)
+        {
+            status = X_STATUS_ACCESS_DENIED;
+            break;
+        }
+        std::error_code ec;
+        if (fs::exists(target, ec) && !replace)
+        {
+            status = X_STATUS_OBJECT_NAME_COLLISION;
+            break;
+        }
+        // The open handle would block the move: close it, move, reopen at the new name.
+        const bool wasOpen = file->host != INVALID_HANDLE_VALUE;
+        if (wasOpen)
+            ::CloseHandle(file->host);
+        file->host = INVALID_HANDLE_VALUE;
+        fs::create_directories(target.parent_path(), ec);
+        fs::rename(file->path, target, ec);
+        if (ec)
+            status = X_STATUS_ACCESS_DENIED;
+        else
+        {
+            file->path = target;
+            file->guestPath = guest;
+        }
+        if (wasOpen && !file->directory)
+            file->host = CreateFileW(file->path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                     nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (trace)
+            Log("vfs: rename -> %s (%s)", guest.c_str(), ec ? ec.message().c_str() : "ok");
+        break;
+    }
     case 13: // FileDispositionInformation
         if (*GuestPtr<uint8_t>(info))
         {
