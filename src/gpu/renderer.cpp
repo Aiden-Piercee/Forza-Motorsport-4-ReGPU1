@@ -137,6 +137,12 @@ uint32_t LayoutKey(uint32_t surface)
     return (gpureg::Get(0x2001 /* RB_COLOR_INFO */) & 0xFFF) | (surface & 0x3FFF) * MsaaAcross((surface >> 16) & 3) << 12;
 }
 std::atomic<uint32_t>& NativeSlot(uint32_t key) { return g_nativeMsaa[(key ^ key >> 12) & 0xFFF]; }
+std::atomic<uint32_t> g_nativeMsaaGeneration{ 0 }; // bumped when an entry changes (BigPassSize's memo)
+void SetNativeMsaa(uint32_t key, uint32_t msaa)
+{
+    if (NativeSlot(key).exchange(key << 2 | msaa, std::memory_order_relaxed) != (key << 2 | msaa))
+        g_nativeMsaaGeneration.fetch_add(1, std::memory_order_relaxed);
+}
 // The surface's MSAA layout when the current view is another one of an MSAA surface, else -1.
 int ForeignNativeMsaa()
 {
@@ -148,7 +154,7 @@ int ForeignNativeMsaa()
     return native >> 2 == key && (native & 3) != ((surface >> 16) & 3) && (native & 3) != 0 ? int(native & 3) : -1;
 }
 
-uint32_t BigPassSize()
+uint32_t BigPassSizeUncached()
 {
     uint32_t pitch = gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF;
     // A view of a big MSAA surface in another MSAA mode belongs to the same pass.
@@ -156,6 +162,17 @@ uint32_t BigPassSize()
         pitch = pitch * MsaaAcross((gpureg::Get(0x2000) >> 16) & 3) / MsaaAcross(uint32_t(native));
     static const bool off = getenv("FM2_NO_BIG_PASS") != nullptr;
     return !off && pitch > kWidth ? std::min<uint32_t>(2048, pitch * 64 / 65) : 0;
+}
+// Asked several times per draw (PassWidth, PassHeight, ScaleX, ScaleY): the answer only changes
+// with the surface registers or the layout table.
+uint32_t BigPassSize()
+{
+    struct Memo { uint32_t surface = ~0u, color = ~0u, generation = ~0u, result = 0; };
+    thread_local Memo memo;
+    const uint32_t surface = gpureg::Get(0x2000), color = gpureg::Get(0x2001) & 0xFFF, generation = g_nativeMsaaGeneration.load(std::memory_order_relaxed);
+    if (surface != memo.surface || color != memo.color || generation != memo.generation)
+        memo = { surface, color, generation, BigPassSizeUncached() };
+    return memo.result;
 }
 uint32_t PassWidth() { const uint32_t big = BigPassSize(); return big ? big : kWidth; }
 uint32_t PassHeight()
@@ -201,7 +218,7 @@ constexpr UINT kMaxSurfaces = 64; // EDRAM bases with host surfaces
 // read them use multisampled shaders when this is above 1.
 uint32_t g_msaa = 1;
 constexpr uint32_t RB_SURFACE_INFO = 0x2000, RB_COLOR_INFO = 0x2001, RB_DEPTH_INFO = 0x2002;
-constexpr uint32_t kDirectFetchBytes = 64 * 1024;
+constexpr uint32_t kDirectFetchBytes = 16 * 1024; // buffers that change (UI quads, particles) are all under 3 KB (FM2_TRACE_MIDSIZE); FM2_DIRECT_FETCH_KB overrides
 
 // Registers.
 constexpr uint32_t RB_STENCILREFMASK = 0x210D;
@@ -2975,7 +2992,11 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
     // Ones that change (video, render-to-texture on the CPU) never get here.
     static const bool checkAlways = getenv("FM2_CHECK_TEXTURES_ALWAYS") != nullptr; // A/B
     const uint64_t textureKey = TextureKey(fetch.Address(), fetch.Format(), w, h);
-    if (cached.resource && !checkAlways && !forceDecode && cached.unchanged >= 30 && ((g_r.frame + (textureKey >> 32)) & 3) != 0)
+    // Unchanged for 300 checks (a few seconds): every 16th frame (a CPU-side update shows up at most
+    // ~0.1 s late). FM2_TEXTURE_CHECK_EVERY4=1 keeps every 4th (A/B).
+    static const bool every4 = getenv("FM2_TEXTURE_CHECK_EVERY4") != nullptr;
+    const uint64_t checkMask = !every4 && cached.unchanged >= 300 ? 15 : 3;
+    if (cached.resource && !checkAlways && !forceDecode && cached.unchanged >= 30 && ((g_r.frame + (textureKey >> 32)) & checkMask) != 0)
     {
         cached.checkedFrame = g_r.frame;
         format = cached.format;
@@ -5745,12 +5766,30 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // Large buffers (static geometry) are read in place; small ones may be
         // rewritten before the GPU runs this frame, so they are copied.
         static const bool noDirect = getenv("FM2_NO_DIRECT_FETCH") != nullptr;
-        if (g_r.physical && !noDirect && bytes >= kDirectFetchBytes)
+        static const uint32_t directBytes = getenv("FM2_DIRECT_FETCH_KB") ? uint32_t(atoi(getenv("FM2_DIRECT_FETCH_KB"))) * 1024u : kDirectFetchBytes;
+        if (g_r.physical && !noDirect && bytes >= directBytes)
         {
             vc->vf[k][0] = address & 0x1FFFFFFF;
             vc->vf[k][1] = d1 & 3;
             vc->vf[k][2] = 1;
             continue;
+        }
+        // FM2_TRACE_MIDSIZE=1: log copied buffers of 16-64 KB that change within a frame (they must stay copied)
+        static const bool traceMid = getenv("FM2_TRACE_MIDSIZE") != nullptr;
+        static const uint32_t traceMinBytes = traceMid ? uint32_t(atoi(getenv("FM2_TRACE_MIDSIZE"))) * 1024u : 0;
+        if (traceMid && bytes >= traceMinBytes)
+        {
+            static std::unordered_map<uint32_t, std::pair<uint64_t, uint64_t>> seen; // address -> frame, hash
+            static uint32_t changed = 0, total = 0;
+            const uint64_t h = ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(address)), bytes);
+            auto& e = seen[address];
+            total++;
+            if (e.first == g_r.frame && e.second != h && changed++ < 40)
+                Log("midsize: %08X %u bytes changed within frame %llu (vs %016llx)", address, bytes, (unsigned long long)g_r.frame, (unsigned long long)C().vsHash);
+            static uint32_t across = 0;
+            if (e.first != g_r.frame && e.first + 4 > g_r.frame && e.second != h && across++ < 60)
+                Log("midsize: %08X %u bytes changed since frame %llu (vs %016llx ps %016llx)", address, bytes, (unsigned long long)e.first, (unsigned long long)C().vsHash, (unsigned long long)C().psHash);
+            e = { g_r.frame, h };
         }
         const UINT64 dataOffset = UploadGuest(GpuPhysToGuest(address), bytes);
         if (dataOffset == ~0ull)
@@ -5808,8 +5847,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         const uint32_t surface = gpureg::Get(RB_SURFACE_INFO), msaa = (surface >> 16) & 3;
         if ((initiator & 0x3F) != 8 || ps.info.usedTextureSlots || vs.info.usedTextureSlots)
         {
-            const uint32_t key = LayoutKey(surface);
-            NativeSlot(key).store(key << 2 | msaa, std::memory_order_relaxed);
+            SetNativeMsaa(LayoutKey(surface), msaa);
         }
         else if (const int native = ForeignNativeMsaa(); native >= 0)
         {

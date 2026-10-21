@@ -525,12 +525,12 @@ void SpikeDump(double ms)
     }
 }
 
-// Sampling profiler (FM2_PROFILE=<guest thread id>): every millisecond, read the
+// Sampling profiler (FM2_SAMPLE_THREAD=<guest thread id>; FM2_PROFILE is the profile name): every millisecond, read the
 // thread's instruction pointer and count it per function; the top of the table
 // is logged every 5 seconds. Needs the symbols crash.cpp loads.
 void StartThreadProfiler()
 {
-    static const char* env = getenv("FM2_PROFILE");
+    static const char* env = getenv("FM2_SAMPLE_THREAD");
     if (!env)
         return;
     const uint32_t target = uint32_t(atoi(env)); // 0 with "w": the first draw piece worker
@@ -557,8 +557,34 @@ void StartThreadProfiler()
             if (SuspendThread(handle) == DWORD(-1))
                 continue;
             CONTEXT c{};
-            c.ContextFlags = CONTEXT_CONTROL;
+            c.ContextFlags = CONTEXT_FULL;
             const bool ok = GetThreadContext(handle, &c);
+            // FM2_SAMPLE_CALLERS=1: also the two callers (unwound while the thread is stopped)
+            static const bool callers = getenv("FM2_SAMPLE_CALLERS") != nullptr;
+            DWORD64 up[2] = {};
+            if (ok && callers)
+            {
+                CONTEXT u = c;
+                for (int k = 0; k < 2; k++)
+                {
+                    DWORD64 imageBase = 0;
+                    auto* fn = RtlLookupFunctionEntry(u.Rip, &imageBase, nullptr);
+                    if (!fn)
+                    {
+                        u.Rip = *reinterpret_cast<DWORD64*>(u.Rsp); // leaf
+                        u.Rsp += 8;
+                    }
+                    else
+                    {
+                        void* handlerData = nullptr;
+                        DWORD64 establisher = 0;
+                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, u.Rip, fn, &u, &handlerData, &establisher, nullptr);
+                    }
+                    up[k] = u.Rip;
+                    if (!u.Rip)
+                        break;
+                }
+            }
             // Symbols are looked up after the thread runs again: the lookups take locks
             // (heap, loader) that the suspended thread may hold.
             ResumeThread(handle);
@@ -572,12 +598,33 @@ void StartThreadProfiler()
                 symbol->MaxNameLen = 255;
                 DWORD64 displacement = 0;
                 name = SymFromAddr(GetCurrentProcess(), c.Rip, &displacement, symbol) ? symbol->Name : "?";
+                // FM2_SAMPLE_LINES=1: by source line, not by function
+                static const bool byLine = getenv("FM2_SAMPLE_LINES") != nullptr;
+                IMAGEHLP_LINE64 line{};
+                line.SizeOfStruct = sizeof(line);
+                DWORD lineDisplacement = 0;
+                if (byLine && name != "?" && SymGetLineFromAddr64(GetCurrentProcess(), c.Rip, &lineDisplacement, &line))
+                {
+                    const char* file = strrchr(line.FileName, 92);
+                    name += std::string(" (") + (file ? file + 1 : line.FileName) + ":" + std::to_string(line.LineNumber) + ")";
+                }
                 // No symbol: name the module (a driver, for example).
                 HMODULE module = nullptr;
                 char path[MAX_PATH];
                 if (name == "?" && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                          reinterpret_cast<LPCSTR>(c.Rip), &module) && GetModuleFileNameA(module, path, MAX_PATH))
                     name = std::string("? ") + (strrchr(path, 92) ? strrchr(path, 92) + 1 : path);
+            }
+            for (DWORD64 addr : up)
+            {
+                if (!addr)
+                    break;
+                alignas(SYMBOL_INFO) char buffer2[sizeof(SYMBOL_INFO) + 256];
+                auto* symbol2 = reinterpret_cast<SYMBOL_INFO*>(buffer2);
+                symbol2->SizeOfStruct = sizeof(SYMBOL_INFO);
+                symbol2->MaxNameLen = 255;
+                DWORD64 displacement2 = 0;
+                name += std::string(" < ") + (SymFromAddr(GetCurrentProcess(), addr, &displacement2, symbol2) ? symbol2->Name : "?");
             }
             counts[name]++;
             samples++;
