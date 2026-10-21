@@ -86,7 +86,7 @@ The keyboard only works while the game window has focus.
   "XBOX 360 (Vertical Format)" are in Media/DB/gamedb.slt. Changing the length needs the LSB2
   offsets rebuilt. The car name "#5 XBOX 360 911 GT3-RSR" is a livery name, so decide whether
   it changes.
-- Not traced yet: dark streaks along car bonnets during races (AE86 at Tsukuba from lap 2; traced but not fixed: not the reflection, the vertex dirt or the grime mask), the Hire
+- Not traced yet: the Hire
   Driver text overflows after a few selections, a blue stripe appears on tyres at random, and a
   soft glow sits above bright car roofs (the bloom). Use F12 on each. The "not translated"
   shaders in out/play.log are never drawn (no "draw dropped" lines), so they are not a lead.
