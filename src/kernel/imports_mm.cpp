@@ -1,5 +1,6 @@
 // Memory management and module (XEX) queries.
 #include "kernel/imports.h"
+#include "live_switch.h"
 #include "loader.h"
 
 namespace
@@ -103,7 +104,7 @@ GUEST_EXPORT(MmSetAddressProtect) {}
 
 GUEST_EXPORT(MmQueryAllocationSize)
 {
-    static const bool trace = getenv("FM2_TRACE_PHYS") != nullptr;
+    static LiveSwitch trace("FM2_TRACE_PHYS");
     if (trace)
     {
         uint32_t start = 0;

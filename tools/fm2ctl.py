@@ -16,7 +16,11 @@ Commands (sent as typed):
   capture                            what F12 does (trace the next frame into out/capture)
   log [n]                            the last n lines of the log
   peek ADDR [bytes] | poke ADDR HEX  guest memory (hex addresses, big-endian bytes)
-  env NAME [value]                   set an environment variable inside the game (only switches read each time)
+  switches                           the on/off FM2_* switches reached so far, and their state
+  switch FM2_NAME 0|1                flip one live (A/B tests without a restart; one not reached yet is
+                                     kept for when it is)
+  env NAME [value]                   set an environment variable inside the game (switches with a value,
+                                     which are mostly read once at their first use)
   quit                               close the game
 Port: FM2_DEBUG_PORT (default 7341).
 """

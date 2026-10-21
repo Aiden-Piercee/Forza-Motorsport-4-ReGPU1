@@ -11,6 +11,7 @@
 
 #include "kernel/imports.h"
 #include "kernel/objects.h"
+#include "live_switch.h"
 #include "log.h"
 #include "memory.h"
 
@@ -157,7 +158,7 @@ PPC_FUNC_IMPL(__imp__sub_829560A0);
 
 PPC_FUNC(sub_829560A0)
 {
-    static const bool check = getenv("FM2_CHECK_RUNS") != nullptr;
+    static LiveSwitch check("FM2_CHECK_RUNS");
     if (!check)
     {
         __imp__sub_829560A0(ctx, base);

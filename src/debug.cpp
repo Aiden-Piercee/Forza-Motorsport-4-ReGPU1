@@ -20,6 +20,7 @@
 #include <thread>
 #include <vector>
 
+#include "live_switch.h"
 #include "log.h"
 #include "memory.h"
 #include "settings.h"
@@ -34,7 +35,8 @@ using Clock = std::chrono::steady_clock;
 
 std::mutex g_mutex;
 std::condition_variable g_swapped;
-uint64_t g_frame = 0;
+uint64_t g_frame = 0; // the renderer's frame number (it can start again from 0)
+uint64_t g_swaps = 0; // swaps seen, for the waits
 std::deque<Clock::time_point> g_swapTimes; // the last second's swaps (fps)
 
 // Input: buttons held until released, and timed presses/sticks/triggers.
@@ -95,8 +97,8 @@ std::string Error(const std::string& why) { return "{\"ok\":false,\"error\":\"" 
 uint64_t WaitFrames(uint64_t n, double timeoutSeconds)
 {
     std::unique_lock lock(g_mutex);
-    const uint64_t target = g_frame + n;
-    g_swapped.wait_for(lock, std::chrono::duration<double>(timeoutSeconds), [&] { return g_frame >= target; });
+    const uint64_t target = g_swaps + n;
+    g_swapped.wait_for(lock, std::chrono::duration<double>(timeoutSeconds), [&] { return g_swaps >= target; });
     return g_frame;
 }
 
@@ -270,8 +272,27 @@ std::string Handle(const std::string& line)
             GuestPtr<uint8_t>(address)[i / 2] = uint8_t(strtoul(data.substr(i, 2).c_str(), nullptr, 16));
         return Ok();
     }
-    // env NAME [value]: set (or clear) an environment variable. Only switches read each time see it; most
-    // FM2_* switches are read once at their first use.
+    // switches: the on/off FM2_* switches reached so far   switch NAME 0|1: flip one (live_switch.h)
+    if (cmd == "switches")
+    {
+        std::string out;
+        for (const auto& [name, on] : LiveSwitch::List())
+            out += (out.empty() ? "\"" : ",\"") + Escape(name) + "\":" + (on ? "true" : "false");
+        return Ok("\"switches\":{" + out + "}");
+    }
+    if (cmd == "switch")
+    {
+        std::string name, value;
+        in >> name >> value;
+        if (name.rfind("FM2_", 0) != 0 || (value != "0" && value != "1" && value != "on" && value != "off"))
+            return Error("switch FM2_NAME 0|1");
+        const bool on = value == "1" || value == "on";
+        const bool known = LiveSwitch::Set(name, on);
+        return Ok(std::string("\"name\":\"") + Escape(name) + "\",\"on\":" + (on ? "true" : "false") +
+                  ",\"reached\":" + (known ? "true" : "false"));
+    }
+    // env NAME [value]: set (or clear) an environment variable, for the switches that take a value (read once
+    // at their first use, so mostly before that happens).
     if (cmd == "env")
     {
         std::string name, value;
@@ -387,6 +408,7 @@ void DebugOnSwap(uint64_t frame)
     {
         std::lock_guard lock(g_mutex);
         g_frame = frame;
+        g_swaps++;
         g_swapTimes.push_back(Clock::now());
         if (g_swapTimes.size() > 2000)
             g_swapTimes.pop_front();

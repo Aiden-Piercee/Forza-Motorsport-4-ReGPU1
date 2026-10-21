@@ -33,6 +33,7 @@ extern "C"
 }
 
 #include "kernel/imports.h"
+#include "live_switch.h"
 #include "log.h"
 
 namespace
@@ -444,7 +445,7 @@ GUEST_EXPORT(XMASetInputBufferReadOffset)
     // The title restarts the decoder at the first frame of each next pair of packets (a seek
     // within a stream it reads in order). The codec keeps its overlap and its unfinished frame
     // across that, as the hardware does; resetting it dropped most of every pair's audio.
-    static const bool flushOnSeek = getenv("FM2_XMA_SEEK_FLUSH") != nullptr;
+    static LiveSwitch flushOnSeek("FM2_XMA_SEEK_FLUSH");
     if (auto it = g_decoders.find(ctx.r3.u32); it != g_decoders.end())
     {
         it->second.seeked = true;

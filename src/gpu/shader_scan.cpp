@@ -18,6 +18,7 @@
 #include <windows.h>
 
 #include "gpu/ucode.h"
+#include "live_switch.h"
 #include "log.h"
 #include "memory.h"
 
@@ -97,7 +98,7 @@ void ShaderScanNow(unsigned threads)
 
 void ShaderScanStart()
 {
-    static const bool off = getenv("FM2_NO_SHADER_SCAN") != nullptr;
+    static LiveSwitch off("FM2_NO_SHADER_SCAN");
     if (off)
         return;
     std::thread([] {

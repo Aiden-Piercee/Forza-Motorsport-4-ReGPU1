@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include "kernel/imports.h"
+#include "live_switch.h"
 #include "settings.h"
 #include "precise_sleep.h"
 #include "kernel/thread.h"
@@ -86,7 +87,7 @@ void SleepUntil(std::optional<Clock::time_point> deadline)
         SwitchToThread();
         return;
     }
-    static const bool coarse = getenv("FM2_COARSE_SLEEP") != nullptr;
+    static LiveSwitch coarse("FM2_COARSE_SLEEP");
     if (coarse)
         std::this_thread::sleep_until(*deadline);
     else
@@ -187,7 +188,7 @@ GUEST_EXPORT(KeSetBasePriorityThread)
 GUEST_EXPORT(KeDelayExecutionThread)
 {
     // (mode, alertable, interval*)
-    static const bool spikes = getenv("FM2_SPIKES") != nullptr;
+    static LiveSwitch spikes("FM2_SPIKES");
     const auto start = spikes ? Clock::now() : Clock::time_point{};
     SleepUntil(TimeoutFromGuest(ctx.r5.u32));
     if (spikes)
@@ -215,7 +216,7 @@ GUEST_EXPORT(KeDelayExecutionThread)
 
 GUEST_EXPORT(NtYieldExecution)
 {
-    static const bool spikes = getenv("FM2_SPIKES") != nullptr;
+    static LiveSwitch spikes("FM2_SPIKES");
     if (spikes)
     {
         // A run of yields longer than 3 ms (a thread polling for something): log where.
@@ -412,7 +413,7 @@ namespace
 {
 void NoteTimeCall(const char* what, uint64_t lr)
 {
-    static const bool trace = getenv("FM2_TRACE_TIME") != nullptr;
+    static LiveSwitch trace("FM2_TRACE_TIME");
     if (!trace)
         return;
     static std::mutex mutex;

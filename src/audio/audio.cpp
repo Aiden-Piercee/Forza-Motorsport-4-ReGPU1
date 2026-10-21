@@ -17,6 +17,7 @@
 
 #include "kernel/imports.h"
 #include "kernel/thread.h"
+#include "live_switch.h"
 #include "log.h"
 
 namespace
@@ -132,7 +133,7 @@ void AudioLoop(PPCContext& ctx)
     timeBeginPeriod(1);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     auto next = Clock::now();
-    static const bool trace = getenv("FM2_TRACE_AUDIO") != nullptr;
+    static LiveSwitch trace("FM2_TRACE_AUDIO");
     auto lastStat = Clock::now();
     for (;;)
     {

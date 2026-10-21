@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <dbghelp.h>
 
+#include "live_switch.h"
 #include "log.h"
 
 namespace
@@ -560,7 +561,7 @@ void StartThreadProfiler()
             c.ContextFlags = CONTEXT_FULL;
             const bool ok = GetThreadContext(handle, &c);
             // FM2_SAMPLE_CALLERS=1: also the two callers (unwound while the thread is stopped)
-            static const bool callers = getenv("FM2_SAMPLE_CALLERS") != nullptr;
+            static LiveSwitch callers("FM2_SAMPLE_CALLERS");
             DWORD64 up[2] = {};
             if (ok && callers)
             {
@@ -599,7 +600,7 @@ void StartThreadProfiler()
                 DWORD64 displacement = 0;
                 name = SymFromAddr(GetCurrentProcess(), c.Rip, &displacement, symbol) ? symbol->Name : "?";
                 // FM2_SAMPLE_LINES=1: by source line, not by function
-                static const bool byLine = getenv("FM2_SAMPLE_LINES") != nullptr;
+                static LiveSwitch byLine("FM2_SAMPLE_LINES");
                 IMAGEHLP_LINE64 line{};
                 line.SizeOfStruct = sizeof(line);
                 DWORD lineDisplacement = 0;

@@ -11,6 +11,7 @@
 
 #include "kernel/imports.h"
 #include "kernel/objects.h"
+#include "live_switch.h"
 #include "log.h"
 #include "memory.h"
 
@@ -18,7 +19,7 @@ PPC_FUNC_IMPL(__imp__sub_82369340);
 
 PPC_FUNC(sub_82369340)
 {
-    static const bool probe = getenv("FM2_PROBE_WAIT") != nullptr;
+    static LiveSwitch probe("FM2_PROBE_WAIT");
     if (probe)
     {
         static std::set<uint32_t> seen;
@@ -37,7 +38,7 @@ PPC_FUNC_IMPL(__imp__sub_82373E38);
 // The wait loop's timeout path: count how often it fires.
 PPC_FUNC(sub_82373E38)
 {
-    static const bool probe = getenv("FM2_PROBE_WAIT") != nullptr;
+    static LiveSwitch probe("FM2_PROBE_WAIT");
     static std::atomic<uint64_t> calls{ 0 };
     if (probe && (++calls % 200) == 1)
         Log("probe: wait-loop timeout path taken %llu times", (unsigned long long)calls.load());
@@ -51,7 +52,7 @@ uint32_t GuestAllocationSize(uint32_t address, uint32_t* start);
 // before the title calls through them (FM2_PROBE_LIST=1).
 PPC_FUNC(sub_82953E38)
 {
-    static const bool probe = getenv("FM2_PROBE_LIST") != nullptr;
+    static LiveSwitch probe("FM2_PROBE_LIST");
     if (probe)
     {
         static std::set<uint32_t> known;
@@ -93,7 +94,7 @@ PPC_FUNC_IMPL(__imp__sub_82957260);
 // Video plane writer: log its arguments (FM2_PROBE_VIDEO=1).
 PPC_FUNC(sub_82957260)
 {
-    static const bool probe = getenv("FM2_PROBE_VIDEO") != nullptr;
+    static LiveSwitch probe("FM2_PROBE_VIDEO");
     if (probe)
     {
         static std::atomic<int> n{ 0 };
@@ -105,7 +106,7 @@ PPC_FUNC(sub_82957260)
     {
         extern uint32_t g_binkPlane[3];
         g_binkPlane[0] = dest, g_binkPlane[1] = pitch, g_binkPlane[2] = width;
-        static const bool logStarts = getenv("FM2_LOG_PLANES") != nullptr;
+        static LiveSwitch logStarts("FM2_LOG_PLANES");
         static uint32_t lumaStart = 0;
         if (logStarts && video == ctx.r10.u32)
         {
@@ -116,7 +117,7 @@ PPC_FUNC(sub_82957260)
     }
     // FM2_CHECK_FRAMEBUF=1: hash each video's bitstream buffer (r8 at the luma
     // call) and report when it changes before that frame's chroma planes decode.
-    static const bool checkBuf = getenv("FM2_CHECK_FRAMEBUF") != nullptr;
+    static LiveSwitch checkBuf("FM2_CHECK_FRAMEBUF");
     if (checkBuf)
     {
         struct Seen
@@ -225,7 +226,7 @@ PPC_FUNC(sub_82957260)
     }
     __imp__sub_82957260(ctx, base);
     // FM2_DUMP_LAST_CHROMA=1: keep the most recent finished 376-wide plane in out/chroma_last.bin.
-    static const bool dumpLast = getenv("FM2_DUMP_LAST_CHROMA") != nullptr;
+    static LiveSwitch dumpLast("FM2_DUMP_LAST_CHROMA");
     if (dumpLast && width == 376)
         if (FILE* f = fopen("out/chroma_last.bin", "wb"))
         {
@@ -292,7 +293,7 @@ static uint64_t PatchConfigHash(PPCContext& ctx)
 
 PPC_FUNC(sub_8272F650)
 {
-    static const bool record = getenv("FM2_RECORD_CONFIGS") != nullptr;
+    static LiveSwitch record("FM2_RECORD_CONFIGS");
     if (record)
     {
         // The configuration is the inputs on entry; the registers change during the call.
@@ -339,13 +340,13 @@ PPC_FUNC(sub_8272F650)
         }
         return;
     }
-    static const bool trace = getenv("FM2_TRACE_PATCH") != nullptr;
+    static LiveSwitch trace("FM2_TRACE_PATCH");
     static std::atomic<uint64_t> calls{ 0 };
     if (trace && calls++ < 400000)
         Log("patch %llu: lr %08llX r3 %08X r4 %08X r5 %08X r6 %08X r7 %08X r8 %08X r9 %08X r10 %08X r22 %08X r24 %08X r25 %08X r26 %08X r27 %08X r28 %08X r29 %08X r30 %08X r31 %08X",
             (unsigned long long)calls.load(), (unsigned long long)ctx.lr, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32,
             ctx.r9.u32, ctx.r10.u32, ctx.r22.u32, ctx.r24.u32, ctx.r25.u32, ctx.r26.u32, ctx.r27.u32, ctx.r28.u32, ctx.r29.u32, ctx.r30.u32, ctx.r31.u32);
-    static const bool mem = getenv("FM2_TRACE_PATCH_MEM") != nullptr;
+    static LiveSwitch mem("FM2_TRACE_PATCH_MEM");
     static std::atomic<int> dumps{ 0 };
     if (mem && dumps++ < 40)
     {

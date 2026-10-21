@@ -20,6 +20,7 @@
 #include "gpu/renderer.h"
 #include "gpu/texture.h"
 #include "kernel/runtime.h"
+#include "live_switch.h"
 #include "log.h"
 #include "png.h"
 #include "render/presenter.h"
@@ -185,7 +186,7 @@ void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dw
 {
     if (!dwords || dwords > 0x10000)
         return;
-    static const bool record = getenv("FM2_RECORD_CONFIGS") != nullptr;
+    static LiveSwitch record("FM2_RECORD_CONFIGS");
     const uint64_t at = uint64_t(guestAddress) << 32 ^ uint64_t(dwords) << 2 ^ uint32_t(type);
     if (g_uploads.bucket_count() < kUploadGeneration * 2)
         g_uploads.reserve(kUploadGeneration * 2);
@@ -231,8 +232,8 @@ void FrameOnShaderLoad(ShaderType type, const uint32_t* microcodeBE, uint32_t dw
         return;
     if (g_shaders.size() % 50 == 1)
         Log("gpu: %zu distinct shaders seen", g_shaders.size());
-    static const bool traceAddr = getenv("FM2_TRACE_SHADER_ADDR") != nullptr;
-    static const bool hexAddr = getenv("FM2_HEXDUMP_SHADERS") != nullptr;
+    static LiveSwitch traceAddr("FM2_TRACE_SHADER_ADDR");
+    static LiveSwitch hexAddr("FM2_HEXDUMP_SHADERS");
     if (hexAddr && guestAddress >= 0x80000000u)
     {
         static int dumped = 0;

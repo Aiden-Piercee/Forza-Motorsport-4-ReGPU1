@@ -8,6 +8,7 @@
 #include <cstdlib>
 
 #include "kernel/imports.h"
+#include "live_switch.h"
 
 float GameAspect();                          // renderer.cpp: the aspect to give the game (16/9 when not wider)
 std::atomic<bool> g_cameraAspectWidened{ false };
@@ -16,7 +17,7 @@ PPC_FUNC_IMPL(__imp__sub_8257E0D0);
 PPC_FUNC(sub_8257E0D0)
 {
     const double sixteenNine = 16.0 / 9.0;
-    static const bool off = getenv("FM2_NO_CAMERA_ASPECT") != nullptr; // A/B: the renderer alone widens the view
+    static LiveSwitch off("FM2_NO_CAMERA_ASPECT"); // A/B: the renderer alone widens the view
     if (!off && std::fabs(ctx.f1.f64 - sixteenNine) < 1e-3)
     {
         const float wide = GameAspect();

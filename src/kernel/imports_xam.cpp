@@ -14,6 +14,7 @@
 #include "kernel/runtime.h"
 #include "kernel/thread.h"
 #include "kernel/vfs.h"
+#include "live_switch.h"
 #include "loader.h"
 #include "render/presenter.h"
 #include "settings.h"
@@ -448,7 +449,7 @@ bool ReadPad(uint32_t user, PadState& s)
     {
         connected = true;
         AddKeyboard(s);
-        static const bool autoStart = getenv("FM2_AUTOSTART") != nullptr;
+        static LiveSwitch autoStart("FM2_AUTOSTART");
         static const auto start = Clock::now();
         // FM2_INPUT_SCRIPT="7:START,10:A,14:RIGHT,...": press each button for
         // 150 ms at that many seconds after boot (repro runs).

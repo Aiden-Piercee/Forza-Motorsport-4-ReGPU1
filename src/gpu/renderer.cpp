@@ -40,6 +40,7 @@
 #include "gpu/recorded_list.h"
 #include "fsr1_cs.h"
 #include <DirectXPackedVector.h>
+#include "live_switch.h"
 #include "settings.h"
 #include "gpu/regs.h"
 #include "gpu/texture.h"
@@ -147,7 +148,7 @@ void SetNativeMsaa(uint32_t key, uint32_t msaa)
 // The surface's MSAA layout when the current view is another one of an MSAA surface, else -1.
 int ForeignNativeMsaa()
 {
-    static const bool off = getenv("FM2_NO_FOREIGN_MSAA") != nullptr; // A/B
+    static LiveSwitch off("FM2_NO_FOREIGN_MSAA"); // A/B
     if (off)
         return -1;
     const uint32_t surface = gpureg::Get(0x2000 /* RB_SURFACE_INFO */), key = LayoutKey(surface);
@@ -161,7 +162,7 @@ uint32_t BigPassSizeUncached()
     // A view of a big MSAA surface in another MSAA mode belongs to the same pass.
     if (const int native = ForeignNativeMsaa(); native >= 0)
         pitch = pitch * MsaaAcross((gpureg::Get(0x2000) >> 16) & 3) / MsaaAcross(uint32_t(native));
-    static const bool off = getenv("FM2_NO_BIG_PASS") != nullptr;
+    static LiveSwitch off("FM2_NO_BIG_PASS");
     return !off && pitch > kWidth ? std::min<uint32_t>(2048, pitch * 64 / 65) : 0;
 }
 // Asked several times per draw (PassWidth, PassHeight, ScaleX, ScaleY): the answer only changes
@@ -180,7 +181,7 @@ uint32_t PassWidth() { const uint32_t big = BigPassSize(); return big ? big : kW
 // 1024x1024 target through a 4x view (480x512, pitch 520) while a layer is being moved.
 bool TallView()
 {
-    static const bool off = getenv("FM2_NO_TALL_VIEW") != nullptr; // A/B
+    static LiveSwitch off("FM2_NO_TALL_VIEW"); // A/B
     const uint32_t surface = gpureg::Get(0x2000 /* RB_SURFACE_INFO */);
     return !off && g_tallHeight && surface != g_tallInfo && ((surface ^ g_tallInfo) >> 16 & 3) && LayoutKey(surface) == g_tallKey;
 }
@@ -591,7 +592,7 @@ struct TexturePool
 // A texture in the pool (or committed, if it does not fit a heap). Starts in `state`.
 ComPtr<ID3D12Resource> CreateTexture(const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state, const char* kind)
 {
-    static const bool committed = getenv("FM2_COMMITTED_TEXTURES") != nullptr; // A/B
+    static LiveSwitch committed("FM2_COMMITTED_TEXTURES"); // A/B
     TexturePool& pool = g_texturePool;
     const D3D12_RESOURCE_ALLOCATION_INFO info = g_r.device->GetResourceAllocationInfo(0, 1, &desc);
     const uint64_t size = (info.SizeInBytes + 0xFFFF) & ~0xFFFFull;
@@ -892,7 +893,7 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
     pd.SampleMask = UINT_MAX;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    static const bool noCull = getenv("FM2_NO_CULL") != nullptr;
+    static LiveSwitch noCull("FM2_NO_CULL");
     if (noCull)
         pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
@@ -996,7 +997,7 @@ void Init()
         // trilinear picks blurred levels at grazing angles (blotchy asphalt). Not the clamped
         // sampler: it also reads shadow maps and other render targets, where averaging depth
         // over a long footprint breaks the shadows (black patches, glitchy car shadows).
-        static const bool noAniso = getenv("FM2_NO_ANISO") != nullptr; // A/B
+        static LiveSwitch noAniso("FM2_NO_ANISO"); // A/B
         if (filters[i] == D3D12_FILTER_MIN_MAG_MIP_LINEAR && modes[i] == D3D12_TEXTURE_ADDRESS_MODE_WRAP && !noAniso)
         {
             samplers[i].Filter = D3D12_FILTER_ANISOTROPIC;
@@ -1314,7 +1315,7 @@ void BeginFrameIfNeeded()
     void FinishPhotoWriteback(UINT frameIndex);
     FinishDepthWriteback(UINT(&f - g_r.frames)); // this slot's previous frame has completed
     FinishPhotoWriteback(UINT(&f - g_r.frames));
-    static const bool perf = getenv("FM2_PERF") != nullptr;
+    static LiveSwitch perf("FM2_PERF");
     const UINT frameIndex = UINT(&f - g_r.frames);
     if (!g_occlusionPending[frameIndex].empty())
     {
@@ -2034,7 +2035,7 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
     // over the first words), so only shaders a pipeline uses go into the cache.
     cs.ucodeBE = codeBE;
     const auto getStart = std::chrono::steady_clock::now();
-    static const bool perfLog = getenv("FM2_PERF") != nullptr;
+    static LiveSwitch perfLog("FM2_PERF");
     const char* path = "full";
     struct LogSlow
     {
@@ -2050,7 +2051,7 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
         }
     } logSlow{ getStart, cs, path };
     const ucode::Shader parsed = ucode::Parse(codeBE.data(), uint32_t(codeBE.size()), pixel);
-    static const bool noCanonical = getenv("FM2_NO_CANONICAL") != nullptr;
+    static LiveSwitch noCanonical("FM2_NO_CANONICAL");
     const uint64_t canonical = pixel || noCanonical ? 0 : CanonicalKey(parsed);
     if (canonical)
         path = g_canonical.count(canonical) ? (g_canonical[canonical]->IsReady() ? "full, layout fallback" : "full, base not ready") : "full, new canonical";
@@ -2552,7 +2553,7 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     // 5 invert, 6 incr wrap, 7 decr wrap. Back faces use their own ops when enabled.
     static const D3D12_STENCIL_OP kOps[8] = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_ZERO, D3D12_STENCIL_OP_REPLACE, D3D12_STENCIL_OP_INCR_SAT,
         D3D12_STENCIL_OP_DECR_SAT, D3D12_STENCIL_OP_INVERT, D3D12_STENCIL_OP_INCR, D3D12_STENCIL_OP_DECR };
-    static const bool noStencil = getenv("FM2_NO_STENCIL") != nullptr;
+    static LiveSwitch noStencil("FM2_NO_STENCIL");
     if ((depth & 1) && !noStencil)
     {
         auto& ds = pd.DepthStencilState;
@@ -2571,11 +2572,11 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
         ds.BackFace = (depth >> 7) & 1 ? faceOps(20) : ds.FrontFace;
     }
     // Culling: bit 0 front, bit 1 back; bit 2 set means clockwise faces are front.
-    static const bool flip = getenv("FM2_CULL_FLIP") != nullptr;
+    static LiveSwitch flip("FM2_CULL_FLIP");
     pd.RasterizerState.FrontCounterClockwise = ((mode & 4) == 0) != flip;
     // Only real triangle primitives keep the guest winding; generated geometry
     // (rectangle corners, point sprites) is never culled.
-    static const bool noCull = getenv("FM2_NO_CULL") != nullptr; // A/B
+    static LiveSwitch noCull("FM2_NO_CULL"); // A/B
     pd.RasterizerState.CullMode = !cullable || noCull ? D3D12_CULL_MODE_NONE
         : (mode & 3) == 1 ? D3D12_CULL_MODE_FRONT : (mode & 3) == 2 ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
@@ -2631,7 +2632,7 @@ void WaitHoldingImpl(const std::function<bool()>& done);
 // shadow passes undrawn). Cold builds can take 100+ ms; the overlay says so.
 ID3D12PipelineState* WaitForPipeline(const std::shared_ptr<PipelineEntry>& entry)
 {
-    static const bool async = getenv("FM2_ASYNC_PIPELINES") != nullptr;
+    static LiveSwitch async("FM2_ASYNC_PIPELINES");
     if (async && entry->state.load(std::memory_order_acquire) == 0)
         return nullptr;
     WaitHoldingImpl([&] { return entry->state.load(std::memory_order_acquire) != 0; });
@@ -2649,7 +2650,7 @@ PipelineKey MakePipelineKey(uint64_t vsHash, uint64_t psHash, bool depthOnly, bo
     (void)noZParsed;
     if (noZTo && g_r.frame + 1 == noZFrame && g_r.drawsThisFrame >= noZFrom && g_r.drawsThisFrame < noZTo)
         depth &= ~(getenv("FM2_NO_ZWRITE") ? 4u : 2u);
-    static const bool zFuncAlways = getenv("FM2_ZFUNC_ALWAYS") != nullptr;
+    static LiveSwitch zFuncAlways("FM2_ZFUNC_ALWAYS");
     if (zFuncAlways)
         depth |= 0x70; // debug: depth func ALWAYS for every draw
     const uint32_t mask = depthOnly ? 0 : gpureg::Get(RB_COLOR_MASK) & 0xF;
@@ -2670,13 +2671,13 @@ std::chrono::steady_clock::time_point g_lastLongHold{}; // end of the last hold 
 // draw is skipped for the half second that takes, instead of freezing every frame.
 bool GameSettled()
 {
-    static const bool never = getenv("FM2_NO_SETTLED_SKIP") != nullptr;
+    static LiveSwitch never("FM2_NO_SETTLED_SKIP");
     return !never && g_lastLongHold.time_since_epoch().count() != 0 && std::chrono::steady_clock::now() - g_lastLongHold > std::chrono::seconds(4);
 }
 
 bool SkippableDraw(bool depthOnly, uint32_t blend)
 {
-    static const bool noSkip = getenv("FM2_NO_SKIP_BLENDED") != nullptr;
+    static LiveSwitch noSkip("FM2_NO_SKIP_BLENDED");
     if (noSkip || depthOnly)
         return false;
     const bool opaque = (blend & 0xFF1F1F1F) == 0x00010001 || (blend & 0x1F) == 1 && ((blend >> 8) & 0x1F) == 0;
@@ -3039,7 +3040,7 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
     }
     const uint32_t w = fetch.Width(), h = fetch.Height();
     auto& cached = g_r.textures[TextureKey(fetch.Address(), fetch.Format(), w, h)];
-    static const bool dumpAll = getenv("FM2_DUMP_TEXTURES") != nullptr;
+    static LiveSwitch dumpAll("FM2_DUMP_TEXTURES");
     const bool forceDecode = dumpAll && RendererTracing();
     if (cached.resource && cached.checkedFrame == g_r.frame && !forceDecode)
     {
@@ -3050,11 +3051,11 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
     // A texture unchanged for many checks (most of them: loaded once) is checked every 4th
     // frame (staggered), not every frame: hashing all textures in use cost ~0.5 ms a frame.
     // Ones that change (video, render-to-texture on the CPU) never get here.
-    static const bool checkAlways = getenv("FM2_CHECK_TEXTURES_ALWAYS") != nullptr; // A/B
+    static LiveSwitch checkAlways("FM2_CHECK_TEXTURES_ALWAYS"); // A/B
     const uint64_t textureKey = TextureKey(fetch.Address(), fetch.Format(), w, h);
     // Unchanged for 300 checks (a few seconds): every 16th frame (a CPU-side update shows up at most
     // ~0.1 s late). FM2_TEXTURE_CHECK_EVERY4=1 keeps every 4th (A/B).
-    static const bool every4 = getenv("FM2_TEXTURE_CHECK_EVERY4") != nullptr;
+    static LiveSwitch every4("FM2_TEXTURE_CHECK_EVERY4");
     const uint64_t checkMask = !every4 && cached.unchanged >= 300 ? 15 : 3;
     if (cached.resource && !checkAlways && !forceDecode && cached.unchanged >= 30 && ((g_r.frame + (textureKey >> 32)) & checkMask) != 0)
     {
@@ -3066,7 +3067,7 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
     cached.checkedFrame = g_r.frame;
     // DXT formats stay compressed on the GPU (BC1-BC4): no decode, a quarter to an eighth of
     // the upload. D3D12 needs block-aligned sizes; others are decoded to RGBA8.
-    static const bool noNativeBC = getenv("FM2_NO_NATIVE_BC") != nullptr;
+    static LiveSwitch noNativeBC("FM2_NO_NATIVE_BC");
     const uint32_t bc = !noNativeBC && w % 4 == 0 && h % 4 == 0 && !forceDecode ? TextureBCKind(fetch.Format()) : 0;
     const uint8_t* source = GuestPtr<uint8_t>(GpuPhysToGuest(fetch.Address()));
     // The whole base level: the old guess (pitch * height / 2) covered only the first half of a
@@ -3105,7 +3106,7 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
     } uploadLog{ uploadStart, fetch, wasNew };
     // The title's own mip levels (distant surfaces sample the smaller, averaged ones: without
     // them the road and grass shimmer and look grainy). Down to the packed tail.
-    static const bool noMips = getenv("FM2_NO_MIPS") != nullptr; // A/B
+    static LiveSwitch noMips("FM2_NO_MIPS"); // A/B
     std::vector<TextureFetch> levels{ fetch };
     for (uint32_t l = 1; !noMips && !forceDecode; l++)
     {
@@ -3514,7 +3515,7 @@ struct TileState
     uint32_t surface = ~0u; // RB_SURFACE_INFO of the tiled pass (~0: any)
 };
 thread_local TileState g_tile;
-static const bool g_noForeignTile = getenv("FM2_NO_FOREIGN_TILE") != nullptr; // A/B for the paint-editor tile fix
+static LiveSwitch g_noForeignTile("FM2_NO_FOREIGN_TILE"); // A/B for the paint-editor tile fix
 
 // Tiling: each tile pass is shifted into EDRAM by the window offset and
 // clipped to the tile. We render in screen space, so draws (and resolves)
@@ -3536,7 +3537,7 @@ D3D12_RECT WindowScissor()
     }
     // Taller than the screen on a pass narrower than it: a tall render target (see PassHeight).
     const uint32_t surfaceInfo = gpureg::Get(0x2000 /* RB_SURFACE_INFO */);
-    static const bool noTall = getenv("FM2_NO_TALL_PASS") != nullptr;
+    static LiveSwitch noTall("FM2_NO_TALL_PASS");
     if (!noTall && y1 > int32_t(kHeight) && y1 <= 2048 && (surfaceInfo & 0x3FFF) < kWidth)
     {
         if (g_tallInfo != surfaceInfo || g_tallHeight != uint32_t(y1))
@@ -3545,7 +3546,7 @@ D3D12_RECT WindowScissor()
         g_tallHeight = uint32_t(y1);
         g_tallKey = LayoutKey(surfaceInfo);
         // FM2_CAPTURE_TALL=1: trace this very frame from here on (its dump is taken at the swap).
-        static const bool captureTall = getenv("FM2_CAPTURE_TALL") != nullptr;
+        static LiveSwitch captureTall("FM2_CAPTURE_TALL");
         static bool traced = false;
         if (captureTall && !traced)
         {
@@ -3815,7 +3816,7 @@ void BeginTemporalFrame()
     const double ratio = double(OutputWidth()) / std::max(1u, g_upscale.renderWidth);
     const uint32_t phases = std::clamp(uint32_t(std::ceil(8.0 * ratio * ratio)), 8u, 64u);
     const uint32_t index = uint32_t(g_r.frame % phases) + 1;
-    static const bool noJitter = getenv("FM2_NO_JITTER") != nullptr;
+    static LiveSwitch noJitter("FM2_NO_JITTER");
     g_upscale.jitterPx[0] = noJitter ? 0.0f : Halton(index, 2) - 0.5f;
     g_upscale.jitterPx[1] = noJitter ? 0.0f : Halton(index, 3) - 0.5f;
     g_upscale.jitterNdc[0] = 2.0f * g_upscale.jitterPx[0] / float(std::max(1u, g_upscale.renderWidth));
@@ -4028,7 +4029,7 @@ ComPtr<ID3D12Resource> g_enhanceOut; // enhanced lighting output (Settings::enha
 // Returns the graded copy of `image` (in COPY_SOURCE state), or null to show it as is.
 ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image)
 {
-    static const bool off = getenv("FM2_NO_GAMMA") != nullptr;
+    static LiveSwitch off("FM2_NO_GAMMA");
     if (off || !g_gammaSet.load(std::memory_order_relaxed) || !InitUpscale())
         return nullptr;
     // 17 points of the table (green; the title writes equal channels), at x = k/16.
@@ -4332,7 +4333,7 @@ void Resolve()
     const uint32_t sourceSelect = control & 7;
     const uint64_t traceFrame = TraceFrame();
     // FM2_TRACE_RESOLVES=1: every resolve (not just those of the traced frame), with its time.
-    static const bool traceAllResolves = getenv("FM2_TRACE_RESOLVES") != nullptr;
+    static LiveSwitch traceAllResolves("FM2_TRACE_RESOLVES");
     // FM2_TRACE_RESOLVES_MIN=<width>: only resolves at least that wide (less slowdown).
     static const long traceMinWidth = getenv("FM2_TRACE_RESOLVES_MIN") ? atol(getenv("FM2_TRACE_RESOLVES_MIN")) : 0;
     if ((traceAllResolves && rect.right - rect.left >= traceMinWidth) || (traceFrame && g_r.frame + 1 == traceFrame))
@@ -4368,7 +4369,7 @@ void Resolve()
         // depth copies give the full 720 rows for every tile (976, 1232 with the tile's offset),
         // and each "taller" copy recreated the texture, dropping the tiles before it (the lower
         // two thirds of the picture came out black). It grows only when the rows don't fit.
-        static const bool noKeep = getenv("FM2_NO_HEIGHT_KEEP") != nullptr;
+        static LiveSwitch noKeep("FM2_NO_HEIGHT_KEEP");
         if (auto it = g_r.resolved.find(base); !noKeep && it != g_r.resolved.end() && it->second.resource && rect.top > 0 &&
                                                 uint32_t(rect.bottom) <= it->second.height && it->second.height < height)
             height = it->second.height;
@@ -4412,7 +4413,7 @@ void Resolve()
         // Depth of the 4x scene copied out as 8888 (Photo Mode only, every frame; races copy smaller
         // depth images the same way and must not pay for a readback): the title reads the depth under the
         // reticle on the CPU for its focus point, so these rows also go to memory.
-        static const bool noDepthWriteback = getenv("FM2_NO_DEPTH_WRITEBACK") != nullptr;
+        static LiveSwitch noDepthWriteback("FM2_NO_DEPTH_WRITEBACK");
         if (depth && destFormat == 6 && !noDepthWriteback && width >= kWidth && ((gpureg::Get(RB_SURFACE_INFO) >> 16) & 3) == 2) // 4x scene tiles only
             WriteDepthToGuest(base, width, height, info, rect);
         // Photo Mode's picture (the 4x 8888 image, its last tile): saving locks it and compresses it
@@ -4429,7 +4430,7 @@ void Resolve()
     // row from the tile down.
     D3D12_RECT clearRect = rect;
     const uint32_t surfacePitch = gpureg::Get(RB_SURFACE_INFO) & 0x3FFF;
-    static const bool noClearExtend = getenv("FM2_NO_CLEAR_EXTEND") != nullptr;
+    static LiveSwitch noClearExtend("FM2_NO_CLEAR_EXTEND");
     if (!noClearExtend && surfacePitch && uint32_t(rect.right - rect.left) >= std::min<uint32_t>(surfacePitch, kWidth) && rect.left == 0)
         clearRect.bottom = PassHeight();
     if ((control >> 8) & 1) // colour clear (ARGB)
@@ -4684,7 +4685,7 @@ void PredictBeginImpl()
 void WarmupStep()
 {
     DrainScan(3.0);
-    static const bool off = getenv("FM2_NO_WARMUP") != nullptr;
+    static LiveSwitch off("FM2_NO_WARMUP");
     if (off || g_manifest.next >= g_manifest.pending.size())
         return;
     const auto start = std::chrono::steady_clock::now();
@@ -4737,7 +4738,7 @@ struct Overlay
 
 bool OverlayWanted(std::vector<std::string>& lines)
 {
-    static const bool disabled = getenv("FM2_NO_OVERLAY") != nullptr;
+    static LiveSwitch disabled("FM2_NO_OVERLAY");
     if (disabled)
         return false;
     const uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -4865,7 +4866,7 @@ ID3D12Resource* PrepareOverlayOn(ID3D12GraphicsCommandList* list, const std::fun
         }
         std::vector<uint32_t> pixels;
         RenderOverlayPixels(lines, pixels);
-        static const bool dumpOverlay = getenv("FM2_OVERLAY_DUMP") != nullptr;
+        static LiveSwitch dumpOverlay("FM2_OVERLAY_DUMP");
         if (dumpOverlay)
         {
             std::vector<uint8_t> rgba(pixels.size() * 4);
@@ -5772,7 +5773,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
 {
     Section(0);
     g_drawSamplesResolve = false;
-    static const bool noRender = getenv("FM2_NO_RENDER") != nullptr;
+    static LiveSwitch noRender("FM2_NO_RENDER");
     if (noRender)
         return;
     if (!g_r.ok)
@@ -5798,7 +5799,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // background scan is enough.
         const bool unseen = g_r.shaders.find(C().vsHash) == g_r.shaders.end() || g_r.shaders.find(C().psHash) == g_r.shaders.end();
         static auto lastScan = std::chrono::steady_clock::time_point{};
-        static const bool noScan = getenv("FM2_NO_SHADER_SCAN") != nullptr;
+        static LiveSwitch noScan("FM2_NO_SHADER_SCAN");
         if (unseen && !noScan)
         {
             if (g_scanKnown.count(C().vsHash) || g_scanKnown.count(C().psHash))
@@ -5820,7 +5821,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     const CompiledShader& vs = GetShader(C().vsHash, C().vsCode, false);
     const CompiledShader& ps = GetShader(C().psHash, C().psCode, true);
     Section(1);
-    static const bool asyncShaders = getenv("FM2_ASYNC_SHADERS") != nullptr;
+    static LiveSwitch asyncShaders("FM2_ASYNC_SHADERS");
     const bool shadersPending = vs.state.load(std::memory_order_acquire) == CompiledShader::Pending || ps.state.load(std::memory_order_acquire) == CompiledShader::Pending;
     if (shadersPending && SkippableDraw(edramMode == 5, gpureg::Get(RB_BLENDCONTROL0)))
     {
@@ -5853,7 +5854,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // everything else is expanded here.
     const uint32_t prim = initiator & 0x3F, indexSource = (initiator >> 6) & 3, indexCount = initiator >> 16;
     const bool restartOn = (gpureg::Get(PA_SU_SC_MODE_CNTL) >> 21) & 1;
-    static const bool noDirectIndex = getenv("FM2_NO_DIRECT_INDEX") != nullptr;
+    static LiveSwitch noDirectIndex("FM2_NO_DIRECT_INDEX");
     const bool directIndex = g_r.physical && !noDirectIndex && (indexSource == 0 || indexSource == 2) &&
         (prim == 4 || prim == 13 || (prim == 6 && !restartOn));
     const uint32_t directVertices = prim == 4 ? indexCount / 3 * 3 : prim == 13 ? indexCount / 4 * 6 : (indexCount >= 3 ? (indexCount - 2) * 3 : 0);
@@ -6003,7 +6004,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         const auto* src = reinterpret_cast<const __m128i*>(gpureg::File() + gpureg::AluConstants * 4);
         auto* dv = reinterpret_cast<__m128i*>(vc->c);
         auto* dp = reinterpret_cast<__m128i*>(pc->c);
-        static const bool allConstants = getenv("FM2_ALL_CONSTANTS") != nullptr; // A/B
+        static LiveSwitch allConstants("FM2_ALL_CONSTANTS"); // A/B
         const uint32_t nv = allConstants ? 256 : std::min(vs.info.constantsUsed, 256u), np = allConstants ? 256 : std::min(ps.info.constantsUsed, 256u);
         for (uint32_t i = 0; i < nv; i++)
             _mm_storeu_si128(dv + i, _mm_shuffle_epi8(_mm_loadu_si128(src + i), swap));
@@ -6054,7 +6055,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         const uint32_t address = d0 & 0xFFFFFFFC, bytes = ((d1 >> 2) & 0xFFFFFF) * 4;
         // Large buffers (static geometry) are read in place; small ones may be
         // rewritten before the GPU runs this frame, so they are copied.
-        static const bool noDirect = getenv("FM2_NO_DIRECT_FETCH") != nullptr;
+        static LiveSwitch noDirect("FM2_NO_DIRECT_FETCH");
         static const uint32_t directBytes = getenv("FM2_DIRECT_FETCH_KB") ? uint32_t(atoi(getenv("FM2_DIRECT_FETCH_KB"))) * 1024u : kDirectFetchBytes;
         if (g_r.physical && !noDirect && bytes >= directBytes)
         {
@@ -6064,7 +6065,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             continue;
         }
         // FM2_TRACE_MIDSIZE=1: log copied buffers of 16-64 KB that change within a frame (they must stay copied)
-        static const bool traceMid = getenv("FM2_TRACE_MIDSIZE") != nullptr;
+        static LiveSwitch traceMid("FM2_TRACE_MIDSIZE");
         static const uint32_t traceMinBytes = traceMid ? uint32_t(atoi(getenv("FM2_TRACE_MIDSIZE"))) * 1024u : 0;
         if (traceMid && bytes >= traceMinBytes)
         {
@@ -6099,7 +6100,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         const bool gameWidened = g_cameraAspectWidened.load(std::memory_order_relaxed);
         vc->vwide[0] = gameWidened ? 1.0f : 1.0f / extent;
         vc->vwide[1] = wide / extent;
-        static const bool noSqueeze = getenv("FM2_NO_HUD_SQUEEZE") != nullptr; // A/B: 2D stretched with the view
+        static LiveSwitch noSqueeze("FM2_NO_HUD_SQUEEZE"); // A/B: 2D stretched with the view
         vc->vwide[2] = noSqueeze ? 1.0f : 1.0f / wide;
         vc->vwide[3] = 1; // set after the textures are bound (below)
     }
@@ -6116,7 +6117,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // The title clears its (non-MSAA) shadow depth maps through views of the same EDRAM
     // with MSAA on: a pixel of a 4x surface covers 2x2 samples of the linear layout we
     // render in, a pixel of a 2x surface 1x2. Scale those clear rectangles to match.
-    static const bool noMsaaScale = getenv("FM2_NO_MSAA_SCALE") != nullptr;
+    static LiveSwitch noMsaaScale("FM2_NO_MSAA_SCALE");
     if (!noMsaaScale && (initiator & 0x3F) == 8 && (gpureg::Get(RB_COLOR_MASK) & 0xF) == 0 && (gpureg::Get(RB_SURFACE_INFO) & 0x3FFF) < 1000)
     {
         const uint32_t msaa = (gpureg::Get(RB_SURFACE_INFO) >> 16) & 3;
@@ -6156,7 +6157,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     vc->vte[0] = gpureg::Get(PA_CL_VTE_CNTL);
     vc->vte[1] = vc->vte[2] = vc->vte[3] = 0;
     // Triangle lists and restart-free strips from an index buffer: a real indexed draw.
-    static const bool noIndexed = getenv("FM2_NO_INDEXED") != nullptr;
+    static LiveSwitch noIndexed("FM2_NO_INDEXED");
     D3D12_INDEX_BUFFER_VIEW indexView{};
     uint32_t indexedCount = 0;
     if (directIndex && !noIndexed && indexSource == 0 && (prim == 4 || prim == 6))
@@ -6260,14 +6261,14 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         g_textureFailure[0] = 0;
         ID3D12Resource* texture = cube ? GetCubeTexture(fetch, format) : GetTexture(fetch, format, native);
         // Debug: FM2_NO_LIVE_CUBE=1 binds the fallback for cubes the title rendered (live reflections).
-        if (static const bool noLiveCube = getenv("FM2_NO_LIVE_CUBE") != nullptr; noLiveCube && cube && ResolvedFor(fetch))
+        if (static LiveSwitch noLiveCube("FM2_NO_LIVE_CUBE"); noLiveCube && cube && ResolvedFor(fetch))
             texture = nullptr;
         const uint32_t index = texture ? BindlessIndex(texture, format, cube) : (cube ? 1u : 0u);
         if (RendererTracing())
             CaptureTexture(fetch, slot, cube, texture != nullptr, index, native, g_textureFailure);
         // w: dimension (1 2D, 3 cube); bit 31 + bits 8-19: the fetch swizzle, applied in the
         // shader for textures that live on the GPU (resolves). Decoded ones are swizzled already.
-        static const bool noGpuSwizzle = getenv("FM2_NO_GPU_SWIZZLE") != nullptr;
+        static LiveSwitch noGpuSwizzle("FM2_NO_GPU_SWIZZLE");
         const ResolvedTexture* resolvedPtr = ResolvedFor(fetch);
         const bool onGpu = (!noGpuSwizzle && fetch.Type() == 2 && resolvedPtr != nullptr) || native;
         // Our resolved textures keep red and blue in place; when the title
@@ -6285,7 +6286,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // 19-20 (mag): 0 point. With only one axis clamped (kerbs: clamped across, repeating
         // along) the wrapping sampler is used and the shader clamps that axis (bits 18, 19).
         const uint32_t clampX = (fetch.dwords[0] >> 10) & 7, clampY = (fetch.dwords[0] >> 13) & 7;
-        static const bool oldClamp = getenv("FM2_OLD_CLAMP") != nullptr; // A/B: X's mode for both axes (before the kerb fix)
+        static LiveSwitch oldClamp("FM2_OLD_CLAMP"); // A/B: X's mode for both axes (before the kerb fix)
         const bool clamp = oldClamp ? clampX != 0 : clampX != 0 && clampY != 0;
         const bool point = ((fetch.dwords[3] >> 19) & 3) == 0;
         pc->tinfo[slot][0] = (point ? (clamp ? 2 : 3) : (clamp ? 1 : 0)) | ((uint32_t(fetch.ExpAdjust()) & 0x3F) << 8);
@@ -6708,7 +6709,7 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
     const auto now = std::chrono::steady_clock::now();
     g_perf.swapSeconds += std::chrono::duration<double>(now - t0).count();
     g_perf.frames++;
-    static const bool perf = getenv("FM2_PERF") != nullptr;
+    static LiveSwitch perf("FM2_PERF");
     static auto lastSwap = now;
     static double frameDraw = 0, lastDrawTotal = 0;
     {
@@ -7039,7 +7040,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     }
     // FM2_CAPTURE_TALL=1: the same capture as F12, once a pass taller than the screen was drawn.
     {
-        static const bool captureTall = getenv("FM2_CAPTURE_TALL") != nullptr;
+        static LiveSwitch captureTall("FM2_CAPTURE_TALL");
         static bool capturedTall = false;
         if (captureTall && !capturedTall && g_tallSeen)
         {
@@ -7077,7 +7078,7 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
             dumpFrame = g_r.frame;
     }
     g_tile = TileState{};
-    static const bool dumpSecond = getenv("FM2_SKIP_VS") != nullptr;
+    static LiveSwitch dumpSecond("FM2_SKIP_VS");
     static const uint64_t dumpEvery = getenv("FM2_DUMP_EVERY") ? strtoull(getenv("FM2_DUMP_EVERY"), nullptr, 10) : 0;
     static uint32_t sweepCountForDump = [] { uint32_t a = 0, b = 0, c = 0; if (const char* e = getenv("FM2_SWEEP")) sscanf(e, "%u,%u,%u", &a, &b, &c); return c; }();
     const bool sweepDump = fromResolve && sweepCountForDump && dumpFrame && g_r.frame >= dumpFrame && g_r.frame < dumpFrame + sweepCountForDump;

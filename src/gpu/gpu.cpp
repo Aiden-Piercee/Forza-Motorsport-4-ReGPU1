@@ -14,6 +14,7 @@
 #include <windows.h>
 
 #include "render/presenter.h"
+#include "live_switch.h"
 #include "settings.h"
 #include "kernel/imports.h"
 #include "kernel/thread.h"
@@ -282,7 +283,7 @@ void Flush()
             parallel++;
             parallelDraws += g_draws;
         }
-        static const bool perf = getenv("FM2_PERF") != nullptr;
+        static LiveSwitch perf("FM2_PERF");
         if (perf && std::chrono::steady_clock::now() - last > std::chrono::seconds(2))
         {
             last = std::chrono::steady_clock::now();
@@ -687,7 +688,7 @@ uint32_t ExecutePacket(uint32_t ptr)
     const uint32_t opcode = (header >> 8) & 0x7F;
     const uint32_t data = ptr + 4;
     auto arg = [&](uint32_t i) { return LoadBE32(data + i * 4); };
-    static const bool tracePredication = getenv("FM2_TRACE_PRED") != nullptr;
+    static LiveSwitch tracePredication("FM2_TRACE_PRED");
     static std::atomic<int> predLogged{ 0 };
     if (tracePredication && (header & 1) && (g_gpu.binSelect != 0xFFFFFFFFull || g_gpu.binMask != 0xFFFFFFFFull) && predLogged++ < (getenv("FM2_TRACE_PRED_MAX") ? atoi(getenv("FM2_TRACE_PRED_MAX")) : 400))
         Log("pred: op %02X mask %016llX select %016llX -> %s", opcode, (unsigned long long)g_gpu.binMask, (unsigned long long)g_gpu.binSelect,
@@ -751,7 +752,7 @@ uint32_t ExecutePacket(uint32_t ptr)
         }
         // Real counts when draws are recorded here in stream order (not with the draw thread
         // or workers, whose lists the query would not wrap): the sun flare fades behind trees.
-        static const bool fake = getenv("FM2_FAKE_OCCLUSION") != nullptr; // A/B: the old fixed answer
+        static LiveSwitch fake("FM2_FAKE_OCCLUSION"); // A/B: the old fixed answer
         const bool real = !fake && !work::Active() && !seg::Enabled();
         uint32_t samples = 1000;
         if (real && !end)
@@ -823,7 +824,7 @@ uint32_t ExecutePacket(uint32_t ptr)
             const auto us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count();
             g_gpu.waits++;
             g_gpu.waitMicros += us;
-            static const bool perf = getenv("FM2_PERF") != nullptr;
+            static LiveSwitch perf("FM2_PERF");
             if (perf)
             {
                 // Time per wait target, logged every 2 s.
@@ -1071,7 +1072,7 @@ void LookaheadBuffer(uint32_t address, uint32_t dwords, int depth, LookState& st
 
 void GpuLookahead()
 {
-    static const bool off = getenv("FM2_NO_LOOKAHEAD") != nullptr;
+    static LiveSwitch off("FM2_NO_LOOKAHEAD");
     if (off || work::Active() || !t_cpContext) // (only on the command processor thread: its stream and registers)
         return;
     constexpr uint32_t kFirst = 0x2000, kCount = 0x3000;
@@ -1222,7 +1223,7 @@ void VblankLoop()
             return int64_t(1000000 / hz);
         }();
         next += std::chrono::microseconds(periodUs);
-        static const bool coarse = getenv("FM2_COARSE_SLEEP") != nullptr; // A/B: the old 1 ms sleeps
+        static LiveSwitch coarse("FM2_COARSE_SLEEP"); // A/B: the old 1 ms sleeps
         if (coarse)
             std::this_thread::sleep_until(next);
         else
@@ -1436,7 +1437,7 @@ GUEST_EXPORT(VdSwap)
     {
         static auto next = Clock::now();
         const auto now = Clock::now();
-        static const bool coarse = getenv("FM2_COARSE_SLEEP") != nullptr;
+        static LiveSwitch coarse("FM2_COARSE_SLEEP");
         if (next > now)
         {
             if (coarse)

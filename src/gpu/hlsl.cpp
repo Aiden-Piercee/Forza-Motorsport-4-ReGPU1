@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include "gpu/hlsl.h"
+#include "live_switch.h"
 
 #include <cstdio>
 
@@ -534,7 +535,7 @@ struct Emitter
                 fprintf(stderr, "vfetch: fmt %u signed %d norm %d exp %d stride %u offset %u mini %d round %d\n", f.format, f.isSigned, f.isNormalized,
                     f.expAdjust, lastStride, f.offset, f.isMini, lastRound);
             const uint32_t k = uint32_t(result.vertexFetchLayout.size());
-            static const bool bakedFetch = getenv("FM2_BAKED_VFETCH") != nullptr;
+            static LiveSwitch bakedFetch("FM2_BAKED_VFETCH");
             const bool dynamic = !bakedFetch && k < 32 && f.src == lastSrc && f.srcSwizzle == lastSrcSwizzle;
             literalFetch = literalFetch || !dynamic;
             if (layoutOnly)

@@ -8,6 +8,7 @@
 
 #include "kernel/imports.h"
 #include "kernel/thread.h"
+#include "live_switch.h"
 #include "log.h"
 #include "memory.h"
 
@@ -157,7 +158,7 @@ LONG WINAPI OnWatchHit(EXCEPTION_POINTERS* info)
         }
         GuestThread* t = CurrentGuestThread();
         // (Reading the byte here would trigger a read watchpoint again.)
-        static const bool readsToo = getenv("FM2_WATCHRW") != nullptr;
+        static LiveSwitch readsToo("FM2_WATCHRW");
         Log("watchpoint: thread %u %s %02X (dr6 %llX): %s", t ? t->id : 0, readsToo ? "touched" : "wrote",
             readsToo ? 0u : unsigned(*reinterpret_cast<uint8_t*>(info->ContextRecord->Dr0)), info->ContextRecord->Dr6, out.c_str());
         static int ringDumps = 0;
@@ -206,7 +207,7 @@ void ArmWatchpoint(void* threadHandle)
     c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     GetThreadContext(threadHandle, &c);
     c.Dr0 = address;
-    static const bool readsToo = getenv("FM2_WATCHRW") != nullptr; // trap reads as well as writes
+    static LiveSwitch readsToo("FM2_WATCHRW"); // trap reads as well as writes
     c.Dr7 = (c.Dr7 & ~0xF0003ull) | 1 | ((readsToo ? 3ull : 1ull) << 16); // L0, write (or read/write), 1 byte
     const uint32_t guest = uint32_t(address - uint64_t(g_base));
     if (guest >= 0xA0000000)

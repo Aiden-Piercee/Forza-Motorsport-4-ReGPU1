@@ -6,6 +6,7 @@
 
 #include <windows.h>
 
+#include "live_switch.h"
 #include "log.h"
 
 namespace
@@ -178,7 +179,7 @@ uint32_t GuestAllocPhysical(uint32_t size, uint32_t alignment, uint32_t viewBase
         Log("guest physical memory exhausted allocating %#x bytes", size);
         return 0;
     }
-    static const bool trace = getenv("FM2_TRACE_PHYS") != nullptr;
+    static LiveSwitch trace("FM2_TRACE_PHYS");
     if (trace)
         Log("phys: alloc %08X size %X", viewBase + offset, size);
     memset(g_base + 0xA0000000 + offset, 0, (size + 15) & ~15u);
@@ -187,7 +188,7 @@ uint32_t GuestAllocPhysical(uint32_t size, uint32_t alignment, uint32_t viewBase
 
 bool GuestFree(uint32_t address)
 {
-    static const bool trace = getenv("FM2_TRACE_PHYS") != nullptr;
+    static LiveSwitch trace("FM2_TRACE_PHYS");
     if (trace && IsPhysicalView(address))
         Log("phys: free %08X", address);
     if (IsPhysicalView(address))

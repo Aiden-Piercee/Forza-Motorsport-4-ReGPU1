@@ -9,6 +9,7 @@
 
 #include "kernel/imports.h"
 #include "kernel/runtime.h"
+#include "live_switch.h"
 #include "loader.h"
 #include "kernel/vfs.h"
 
@@ -313,7 +314,7 @@ uint32_t OpenFile(uint32_t handleOut, uint32_t access, uint32_t attributes, uint
     }
 
     StoreBE32(handleOut, CreateHandle(file));
-    static const bool trace = getenv("FM2_TRACE_FILES") != nullptr;
+    static LiveSwitch trace("FM2_TRACE_FILES");
     if (trace)
         Log("vfs: open %s -> %08X", guest.c_str(), file->handle);
     SetIoStatus(iosb, X_STATUS_SUCCESS, information);
@@ -542,7 +543,7 @@ GUEST_EXPORT(NtSetInformationFile)
         }
         fs::path target;
         bool readOnly = false;
-        static const bool trace = getenv("FM2_TRACE_FILES") != nullptr;
+        static LiveSwitch trace("FM2_TRACE_FILES");
         if (!VfsResolve(guest, target, &readOnly) || readOnly)
         {
             status = X_STATUS_ACCESS_DENIED;
@@ -607,7 +608,7 @@ GUEST_EXPORT(NtQueryFullAttributesFile)
     HostInfo h;
     if (!VfsResolve(guest, host, nullptr) || !QueryHostInfo(host, h))
     {
-        static const bool trace = getenv("FM2_TRACE_FILES") != nullptr;
+        static LiveSwitch trace("FM2_TRACE_FILES");
         if (trace)
             Log("vfs: attributes not found %s", guest.c_str());
         Return(ctx, X_STATUS_OBJECT_NAME_NOT_FOUND);
@@ -647,7 +648,7 @@ GUEST_EXPORT(NtQueryDirectoryFile)
         }
         file->nextEntry = 0;
         file->listed = true;
-        static const bool traceFiles = getenv("FM2_TRACE_FILES") != nullptr;
+        static LiveSwitch traceFiles("FM2_TRACE_FILES");
         if (traceFiles)
             Log("vfs: list %s mask '%s' -> %zu entries", file->guestPath.c_str(), pattern.c_str(), file->entries.size());
     }
@@ -672,7 +673,7 @@ GUEST_EXPORT(NtQueryDirectoryFile)
     HostInfo h;
     QueryHostInfo(e.path(), h);
     {
-        static const bool traceFiles = getenv("FM2_TRACE_FILES") != nullptr;
+        static LiveSwitch traceFiles("FM2_TRACE_FILES");
         if (traceFiles && file->guestPath.find("dlczips") != std::string::npos)
             Log("vfs:   entry %zu '%s' attributes %08X size %llu", file->nextEntry, name.c_str(), h.attributes, (unsigned long long)h.size);
     }
