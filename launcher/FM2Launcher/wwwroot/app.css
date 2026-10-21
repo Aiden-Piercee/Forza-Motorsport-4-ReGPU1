@@ -176,3 +176,15 @@ select:focus, input:focus { border-color: var(--accent); }
 .thumb:hover { border-color: #3a404c; }
 .thumb.on { border-color: var(--accent); }
 .thumb.on span { color: var(--text); }
+
+/* profiles */
+.item.pick { width: 100%; text-align: left; font: inherit; color: var(--text); cursor: pointer; }
+.item.pick.on { border-color: var(--accent); }
+.badge-on { font-size: 10.5px; font-weight: 600; color: var(--ok); border: 1px solid #1f5a39; border-radius: 99px; padding: 0 6px; margin-left: 6px; vertical-align: 1px; }
+.panel-head .badge-on { margin-left: 0; }
+.panel-head.sub { margin-top: 14px; }
+.inline { display: flex; gap: 6px; }
+.inline input { flex: 1; min-width: 0; }
+#page-profiles .list { flex: 0 1 auto; }
+#page-profiles .panel > .list:first-of-type { flex: 1; }
+.dialog input, .dialog select { width: 100%; margin-top: 4px; }

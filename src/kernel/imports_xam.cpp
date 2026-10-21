@@ -23,15 +23,31 @@
 
 namespace
 {
-// The profile's offline XUID (0xE000...): derived from its name, so each profile's saves
-// carry their own owner.
+// The profile's offline XUID (0xE000...). The saves are signed for their owner, so it is kept in
+// the profile folder (profiles\<name>\xuid): a copied, renamed or imported profile stays valid.
+// A profile without the file gets the one derived from its name (what every profile had before).
 uint64_t Xuid()
 {
     static const uint64_t xuid = [] {
+        const auto file = ContentDir().parent_path() / "xuid";
+        if (FILE* f = _wfopen(file.c_str(), L"r"))
+        {
+            unsigned long long v = 0;
+            const bool ok = fscanf(f, "%llx", &v) == 1 && (v >> 60) == 0xE;
+            fclose(f);
+            if (ok)
+                return uint64_t(v);
+        }
         uint64_t h = 0xCBF29CE484222325ull;
         for (char c : GetSettings().profile)
             h = (h ^ uint8_t(c)) * 0x100000001B3ull;
-        return 0xE000000000000000ull | (h & 0x0000FFFFFFFFFFFFull);
+        const uint64_t derived = 0xE000000000000000ull | (h & 0x0000FFFFFFFFFFFFull);
+        if (FILE* f = _wfopen(file.c_str(), L"w"))
+        {
+            fprintf(f, "%016llX\n", (unsigned long long)derived);
+            fclose(f);
+        }
+        return derived;
     }();
     return xuid;
 }

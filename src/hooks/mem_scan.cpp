@@ -23,8 +23,9 @@ void MemScanOnSwap(uint64_t frame)
     if (!parsed || frame != at)
         return;
     const uint32_t want = __builtin_bswap32(bits);
+    static const int kMax = getenv("FM2_SCAN_MAX") ? atoi(getenv("FM2_SCAN_MAX")) : 200;
     int found = 0;
-    for (uint64_t a = 0x10000; a < 0x100000000ull && found < 200;)
+    for (uint64_t a = 0x10000; a < 0x100000000ull && found < kMax;)
     {
         MEMORY_BASIC_INFORMATION mi{};
         if (!VirtualQuery(g_base + a, &mi, sizeof(mi)))
@@ -33,7 +34,7 @@ void MemScanOnSwap(uint64_t frame)
         if (mi.State == MEM_COMMIT && (mi.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READWRITE)) && !(mi.Protect & PAGE_GUARD))
         {
             const uint32_t* p = reinterpret_cast<const uint32_t*>(g_base + start);
-            for (uint64_t i = 0; i < (end - start) / 4 && found < 200; i++)
+            for (uint64_t i = 0; i < (end - start) / 4 && found < kMax; i++)
                 if (p[i] == want)
                 {
                     const uint32_t addr = uint32_t(start + i * 4);

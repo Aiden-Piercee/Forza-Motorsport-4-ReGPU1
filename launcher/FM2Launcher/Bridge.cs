@@ -83,6 +83,60 @@ public sealed class Bridge(CoreWebView2 web, Form owner)
                     System.Diagnostics.Process.Start("explorer.exe", $"\"{path}\"");
                     return null;
                 }
+            case "profiles.list": return ProfilesState();
+            case "profiles.use":
+                Profiles.SetActive(Str(a, "name"));
+                return ProfilesState();
+            case "profiles.create":
+                Profiles.Create(Str(a, "name"));
+                return ProfilesState();
+            case "profiles.duplicate":
+                Profiles.Duplicate(Str(a, "name"), Str(a, "newName"));
+                return ProfilesState();
+            case "profiles.rename":
+                Profiles.Rename(Str(a, "name"), Str(a, "newName"));
+                return ProfilesState();
+            case "profiles.delete":
+                {
+                    var b = Profiles.Delete(Str(a, "name"));
+                    return new { backup = b.File, state = ProfilesState() };
+                }
+            case "profiles.backup":
+                {
+                    var b = Profiles.MakeBackup(Str(a, "name"));
+                    return new { backup = b.File, state = ProfilesState() };
+                }
+            case "profiles.restore":
+                {
+                    var name = Profiles.Restore(Str(a, "file"), a?["asName"]?.GetValue<string>());
+                    return new { name, state = ProfilesState() };
+                }
+            case "profiles.import":
+                {
+                    using var dialog = new OpenFileDialog { Title = "Import a profile", Filter = "Profile zip|*.zip" };
+                    if (dialog.ShowDialog(owner) != DialogResult.OK) return null;
+                    var name = Profiles.Restore(dialog.FileName, a?["asName"]?.GetValue<string>());
+                    return new { name, state = ProfilesState() };
+                }
+            case "profiles.export":
+                {
+                    var name = Str(a, "name");
+                    using var dialog = new SaveFileDialog { Title = "Export profile", FileName = Profiles.FolderName(name) + ".zip", Filter = "Profile zip|*.zip" };
+                    if (dialog.ShowDialog(owner) != DialogResult.OK) return false;
+                    Profiles.Export(name, dialog.FileName);
+                    return true;
+                }
+            case "profiles.mergePhotos":
+                return new { copied = Profiles.MergePhotos(Str(a, "from"), Str(a, "into")), state = ProfilesState() };
+            case "profiles.cheats":
+                {
+                    if (Game.Running) throw new InvalidOperationException("Close the game first: cheats are read when it starts.");
+                    a!["cheats"].Deserialize<Cheats>(Json)!.Save(Profiles.FolderName(Str(a, "name")));
+                    return ProfilesState();
+                }
+            case "profiles.openBackups":
+                System.Diagnostics.Process.Start("explorer.exe", $"\"{Directory.CreateDirectory(Profiles.Backups).FullName}\"");
+                return null;
             case "photos.list": return Photos.List();
             case "photos.copy":
                 Photos.Copy(a!.GetValue<string>());
@@ -115,6 +169,10 @@ public sealed class Bridge(CoreWebView2 web, Form owner)
                 throw new ArgumentException($"Unknown command {cmd}.");
         }
     }
+
+    static string Str(JsonNode? a, string key) => a?[key]?.GetValue<string>() ?? throw new ArgumentException($"Missing {key}.");
+
+    static object ProfilesState() => new { profiles = Profiles.List(), backups = Profiles.ListBackups(), running = Game.Running };
 
     object UpdateInfo()
     {

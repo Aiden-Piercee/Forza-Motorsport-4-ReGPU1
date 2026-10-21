@@ -50,17 +50,34 @@ function toast(text, good) {
   toast.timer = setTimeout(() => { t.hidden = true }, 5000)
 }
 function confirmBox(title, text, yes) {
+  return askBox(title, text, yes).then((v) => v !== null)
+}
+// The same dialog with a text box (opts.input: its starting text) or a list (opts.options: [{value, name}]):
+// resolves to what was entered or picked, or null when cancelled.
+function askBox(title, text, yes, opts) {
+  opts = opts || {}
   return new Promise((resolve) => {
     $("confirm-title").textContent = title
     $("confirm-text").textContent = text
     $("confirm-yes").textContent = yes || "OK"
+    const input = $("confirm-input"), select = $("confirm-select")
+    input.hidden = opts.input === undefined
+    select.hidden = !opts.options
+    if (!input.hidden) input.value = opts.input
+    if (opts.options) fill(select, opts.options, opts.options.length ? opts.options[0].value : "")
     const box = $("confirm")
     box.hidden = false
+    if (!input.hidden) { input.focus(); input.select() }
+    const done = (ok) => {
+      box.hidden = true
+      input.onkeydown = null
+      resolve(!ok ? null : !input.hidden ? input.value.trim() : opts.options ? select.value : true)
+    }
+    input.onkeydown = (e) => { if (e.key === "Enter") done(true); if (e.key === "Escape") done(false) }
     box.onclick = (e) => {
       const c = e.target.dataset && e.target.dataset.choice
       if (!c && e.target !== box) return
-      box.hidden = true
-      resolve(c === "yes")
+      done(c === "yes")
     }
   })
 }
@@ -110,8 +127,9 @@ $("tabs").onclick = (e) => {
   const b = e.target.closest("button")
   if (!b) return
   for (const t of $("tabs").children) t.classList.toggle("on", t === b)
-  for (const p of ["play", "photos", "settings", "updates"]) $("page-" + p).hidden = p !== b.dataset.tab
+  for (const p of ["play", "profiles", "photos", "settings", "updates"]) $("page-" + p).hidden = p !== b.dataset.tab
   if (b.dataset.tab === "photos") loadPhotos()
+  else if (b.dataset.tab === "profiles") loadProfiles()
   else if (b.dataset.tab !== "play") refresh()
 }
 
@@ -346,6 +364,136 @@ $("update-apply").onclick = () => guarded(async () => {
 function onProgress(d) {
   $("progress").querySelector(".bar").style.width = Math.round(d.p * 100) + "%"
   $("update-status").textContent = d.text
+}
+
+// ---- profiles: each one's saves, backups and cheats (Profiles.cs)
+
+let profiles = null
+let profileSel = null
+async function loadProfiles() {
+  await guarded(async () => { profiles = await call("profiles.list"); renderProfiles() })
+}
+function selectedProfile() { return profiles && profiles.profiles.find((p) => p.name === profileSel) }
+function when(d) { return d ? new Date(d).toLocaleString() : "never" }
+function renderProfiles() {
+  const ps = profiles.profiles
+  if (!ps.some((p) => p.name === profileSel)) profileSel = (ps.find((p) => p.active) || ps[0] || {}).name || null
+  const list = $("prof-list")
+  list.replaceChildren()
+  if (!ps.length) list.append(el("div", "empty", "No profiles yet. Play once, or make one with New."))
+  for (const p of ps) {
+    const it = el("button", "item pick" + (p.name === profileSel ? " on" : ""))
+    const main = el("div", "main")
+    const title = el("div", "title", p.name)
+    if (p.active) title.append(el("span", "badge-on", "Playing"))
+    main.append(title, el("div", "meta", `${p.photos} photo${p.photos === 1 ? "" : "s"} · ${size(p.bytes)} · ${p.lastPlayed ? new Date(p.lastPlayed).toLocaleDateString() : "never played"}`))
+    it.append(main)
+    it.onclick = () => { profileSel = p.name; renderProfiles() }
+    list.append(it)
+  }
+
+  const p = selectedProfile()
+  const running = profiles.running
+  $("prof-title").textContent = p ? p.name : "Profile"
+  $("prof-active").hidden = !(p && p.active)
+  const info = $("prof-info")
+  info.replaceChildren()
+  if (p) for (const [k, v] of [["Last played", when(p.lastPlayed)], ["Photos", String(p.photos)], ["Size", size(p.bytes)], ["XUID", p.xuid]])
+    info.append(el("div", "k", k), el("div", "v", v))
+  for (const id of ["prof-use", "prof-backup", "prof-duplicate", "prof-rename", "prof-export", "prof-merge", "prof-delete"]) $(id).disabled = !p
+  for (const id of ["prof-duplicate", "prof-rename", "prof-merge", "prof-delete", "prof-import"]) if (running) $(id).disabled = true
+  $("prof-use").disabled = !p || p.active
+  $("prof-merge").disabled = !p || running || ps.length < 2
+  $("prof-status").textContent = running ? "The game is running: close it to change profiles." : ""
+
+  const c = p ? p.cheats : {}
+  $("cheat-infinite").classList.toggle("on", !!c.infiniteCredits)
+  $("cheat-level").classList.toggle("on", !!c.maxLevel)
+  $("cheat-cars").classList.toggle("on", !!c.allCars)
+  for (const id of ["cheat-infinite", "cheat-level", "cheat-cars", "cheat-give", "cheat-give-apply"]) $(id).disabled = !p || running
+  const pending = []
+  if (c.giveCredits) pending.push(`${c.giveCredits.toLocaleString()} CR waiting to be added`)
+  if (c.allCars) pending.push("every car is added on the next start")
+  $("cheat-pending").textContent = pending.length ? "Next start: " + pending.join("; ") + "." : ""
+
+  const bl = $("prof-backups")
+  bl.replaceChildren()
+  if (!profiles.backups.length) bl.append(el("div", "empty", "No backups yet."))
+  for (const b of profiles.backups) {
+    const it = el("div", "item")
+    const main = el("div", "main")
+    main.append(el("div", "title", b.profile), el("div", "meta", `${when(b.made)} · ${size(b.bytes)}`))
+    const restore = el("button", "ghost small", "Restore")
+    restore.dataset.tip = "Puts this backup back. The profile's current save is backed up first."
+    restore.disabled = running
+    restore.onclick = () => guarded(async () => {
+      if (!await confirmBox(`Restore ${b.profile}?`, `The ${b.profile} profile goes back to this backup from ${when(b.made)}. Its current save is backed up first.`, "Restore")) return
+      const r = await call("profiles.restore", { file: b.file })
+      profiles = r.state; profileSel = r.name; renderProfiles()
+      toast(`${r.name} restored.`, true)
+    })
+    it.append(main, restore)
+    bl.append(it)
+  }
+}
+async function profileCall(cmd, args, done) {
+  await guarded(async () => {
+    const r = await call(cmd, args)
+    if (r && r.profiles) profiles = r
+    else if (r && r.state) profiles = r.state
+    renderProfiles()
+    if (done) toast(typeof done === "function" ? done(r) : done, true)
+  })
+}
+$("prof-new").onclick = async () => {
+  const name = await askBox("New profile", "A name of up to 15 characters.", "Create", { input: "" })
+  if (name) { await profileCall("profiles.create", { name }, `${name} created. Pick "Play as this profile" to start it.`); profileSel = name; renderProfiles() }
+}
+$("prof-use").onclick = () => profileCall("profiles.use", { name: profileSel }, `Playing as ${profileSel} from now on.`).then(refresh)
+$("prof-backup").onclick = () => profileCall("profiles.backup", { name: profileSel }, `${profileSel} backed up.`)
+$("prof-duplicate").onclick = async () => {
+  const newName = await askBox(`Duplicate ${profileSel}`, "The copy's name. It gets the whole career, garage, liveries and photos.", "Duplicate", { input: profileSel.slice(0, 12) + " 2" })
+  if (newName) { await profileCall("profiles.duplicate", { name: profileSel, newName }, `${newName} created.`); profileSel = newName; renderProfiles() }
+}
+$("prof-rename").onclick = async () => {
+  const newName = await askBox(`Rename ${profileSel}`, "The new name. Its saves keep working.", "Rename", { input: profileSel })
+  if (newName && newName !== profileSel) { const old = profileSel; profileSel = newName; await profileCall("profiles.rename", { name: old, newName }, `Renamed to ${newName}.`); refresh() }
+}
+$("prof-export").onclick = () => guarded(async () => { if (await call("profiles.export", { name: profileSel })) toast("Profile exported.", true) })
+$("prof-import").onclick = () => guarded(async () => {
+  const r = await call("profiles.import", {})
+  if (!r) return
+  profiles = r.state; profileSel = r.name; renderProfiles()
+  toast(`${r.name} imported.`, true)
+})
+$("prof-merge").onclick = async () => {
+  const others = profiles.profiles.filter((p) => p.name !== profileSel).map((p) => ({ value: p.name, name: `${p.name} (${p.photos} photo${p.photos === 1 ? "" : "s"})` }))
+  const from = await askBox(`Merge photos into ${profileSel}`, "Copies another profile's saved photos into this one (the other profile keeps them too). Careers and garages can't be merged: each is one encrypted save.", "Copy photos", { options: others })
+  if (from) await profileCall("profiles.mergePhotos", { from, into: profileSel }, (r) => `${r.copied} photo${r.copied === 1 ? "" : "s"} copied.`)
+}
+$("prof-delete").onclick = async () => {
+  if (!await confirmBox(`Delete ${profileSel}?`, "Its career, garage, liveries and photos are deleted. A backup is made first, so you can restore it from the Backups list.", "Delete")) return
+  await profileCall("profiles.delete", { name: profileSel }, "Deleted (a backup was kept).")
+  refresh()
+}
+$("prof-backups-open").onclick = () => guarded(() => call("profiles.openBackups"))
+function setCheats(patch) {
+  const p = selectedProfile()
+  if (!p) return
+  return profileCall("profiles.cheats", { name: p.name, cheats: { ...p.cheats, ...patch } })
+}
+$("cheat-infinite").onclick = () => setCheats({ infiniteCredits: !selectedProfile().cheats.infiniteCredits })
+$("cheat-level").onclick = () => setCheats({ maxLevel: !selectedProfile().cheats.maxLevel })
+$("cheat-cars").onclick = async () => {
+  const on = !selectedProfile().cheats.allCars
+  if (on && !await confirmBox("Unlock every car?", "Every car in the game (about 470) is added to this profile's garage the next time you play. The game freezes for about 20 seconds while it does, and it can't be undone, so back up first if you might want the old garage.", "Unlock")) return
+  setCheats({ allCars: on })
+}
+$("cheat-give-apply").onclick = () => {
+  const n = parseInt($("cheat-give").value.replace(/[^0-9]/g, ""), 10)
+  if (!n) return toast("Type how many credits to add.")
+  $("cheat-give").value = ""
+  setCheats({ giveCredits: Math.min(999999999, (selectedProfile().cheats.giveCredits || 0) + n) }).then(() => toast(`${n.toLocaleString()} CR will be added the next time you play.`, true))
 }
 
 // ---- photos (Photo Mode saves, read straight from the profiles folder)
