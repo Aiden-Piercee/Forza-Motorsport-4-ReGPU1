@@ -689,9 +689,11 @@ uint32_t ExecutePacket(uint32_t ptr)
     auto arg = [&](uint32_t i) { return LoadBE32(data + i * 4); };
     static const bool tracePredication = getenv("FM2_TRACE_PRED") != nullptr;
     static std::atomic<int> predLogged{ 0 };
-    if (tracePredication && (header & 1) && (g_gpu.binSelect != 0xFFFFFFFFull || g_gpu.binMask != 0xFFFFFFFFull) && predLogged++ < 400)
+    if (tracePredication && (header & 1) && (g_gpu.binSelect != 0xFFFFFFFFull || g_gpu.binMask != 0xFFFFFFFFull) && predLogged++ < (getenv("FM2_TRACE_PRED_MAX") ? atoi(getenv("FM2_TRACE_PRED_MAX")) : 400))
         Log("pred: op %02X mask %016llX select %016llX -> %s", opcode, (unsigned long long)g_gpu.binMask, (unsigned long long)g_gpu.binSelect,
             (g_gpu.binSelect & g_gpu.binMask) ? "run" : "skip");
+    if (tracePredication && opcode == 0x2D && (header & 1) && (g_gpu.binSelect & g_gpu.binMask) && predLogged < 100000000)
+        Log("pred: set constant %08X: %08X %08X %08X (count %u)", arg(0), count > 1 ? arg(1) : 0, count > 2 ? arg(2) : 0, count > 3 ? arg(3) : 0, count);
     if (RendererTracing() && opcode != 0x10)
         Log("pm4: op %02X count %u%s", opcode, count, (header & 1) && !(g_gpu.binSelect & g_gpu.binMask) ? " (predicated off)" : "");
     if ((header & 1) && !(g_gpu.binSelect & g_gpu.binMask))

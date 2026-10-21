@@ -75,10 +75,9 @@ The keyboard only works while the game window has focus.
   cannot be skipped by a button. Tick "Skip intro videos" in the launcher (or set
   FM2_SKIP_INTRO=1) to go straight to the title screen. Input recordings made before the clock
   fix start about 90 seconds too early.
-- Photo Mode shows a black screen. Probably the same cause as the garage thumbnails below: it
-  reads a render target back through memory. FM2_RESOLVE_WRITEBACK handles small ones; a
-  full-screen readback would need an on-demand path (the capture tools in out/capture and
-  FM2_TRACE_RESOLVES show what it resolves).
+- Photo Mode: the viewfinder renders now (it was black below the top third). Taking and saving
+  a photo is not tested yet: if the saved picture is black, it reads the image back through
+  memory like the garage thumbnails below (FM2_RESOLVE_WRITEBACK handles small ones).
 - Garage thumbnails: cars created from now on get a correct thumbnail. Thumbnails saved by
   earlier runs are noise and stay that way in that profile.
 - "Xbox 360" text: the wording is UTF-16 inside the LSB2 string tables of every language zip

@@ -3497,6 +3497,7 @@ struct TileState
 {
     int originY = 0;
     D3D12_RECT rect{ 0, 0, 1 << 14, 1 << 14 };
+    uint32_t surface = ~0u; // RB_SURFACE_INFO of the tiled pass (~0: any)
 };
 thread_local TileState g_tile;
 
@@ -4329,7 +4330,14 @@ void Resolve()
         // resolved 720 rows at a time and sampled as 1024 rows. The texture keeps all its rows
         // (clamped to kHeight it was stretched 1.4x vertically when sampled).
         constexpr uint32_t kMaxResolveHeight = 2048;
-        const uint32_t height = std::clamp<uint32_t>(((pitchReg >> 16) & 0x3FFF) + uint32_t(rect.top), 1, kMaxResolveHeight);
+        uint32_t height = std::clamp<uint32_t>(((pitchReg >> 16) & 0x3FFF) + uint32_t(rect.top), 1, kMaxResolveHeight);
+        // A later tile into an image that already holds its rows keeps the image: Photo Mode's
+        // depth copies give the full 720 rows for every tile (976, 1232 with the tile's offset),
+        // and each "taller" copy recreated the texture, dropping the tiles before it (the lower
+        // two thirds of the picture came out black). It grows only when the rows don't fit.
+        if (auto it = g_r.resolved.find(base); it != g_r.resolved.end() && it->second.resource && rect.top > 0 &&
+                                                uint32_t(rect.bottom) <= it->second.height && it->second.height < height)
+            height = it->second.height;
         const uint32_t info = gpureg::Get(RB_COPY_DEST_INFO);
         const bool depth = sourceSelect == 4;
         // Destination: 8888 stays 8-bit (clamped, as the hardware does); other
@@ -6087,8 +6095,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         {
             g_tile.originY = -wy;
             g_tile.rect = scissor;
+            g_tile.surface = gpureg::Get(RB_SURFACE_INFO);
         }
-        else if (g_tile.originY != 0)
+        // Only draws on the tiled pass's own surface are tile-relative: Photo Mode draws its
+        // depth-of-field composite once, full-screen, into another view of the same EDRAM after
+        // the 4x scene's three tiles, and clipped to the last tile it covered only the bottom
+        // third (the rest of the picture was black).
+        else if (g_tile.originY != 0 && (g_tile.surface == ~0u || g_tile.surface == gpureg::Get(RB_SURFACE_INFO)))
         {
             shiftY = float(g_tile.originY + wy);
             scissor.left = std::max(scissor.left, g_tile.rect.left);
