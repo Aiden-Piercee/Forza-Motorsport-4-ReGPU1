@@ -1,5 +1,5 @@
 diff --git a/XenonAnalyse/main.cpp b/XenonAnalyse/main.cpp
-index d08371e..492ec12 100644
+index d08371e..0bafcf0 100644
 --- a/XenonAnalyse/main.cpp
 +++ b/XenonAnalyse/main.cpp
 @@ -1,5 +1,7 @@
@@ -82,7 +82,7 @@ index d08371e..492ec12 100644
 +    TracedInsn w;
 +    if (depth > 4 || !FindWriter(image, address, reg, w))
 +        return false;
-+    first = std::min(first, w.address);
++    first = (std::min)(first, w.address);
 +    switch (w.insn.opcode->id)
 +    {
 +    case PPC_INST_LIS:
@@ -120,7 +120,7 @@ index d08371e..492ec12 100644
 +    // rlwinm rA, rS, sh, 0, 31 - sh is slwi rA, rS, sh.
 +    if (w.insn.operands[2] != shift || w.insn.operands[3] != 0 || w.insn.operands[4] != 31 - shift)
 +        return false;
-+    first = std::min(first, w.address);
++    first = (std::min)(first, w.address);
 +    index = w.insn.operands[1];
 +    return true;
 +}
@@ -135,7 +135,7 @@ index d08371e..492ec12 100644
 +        size_t f = first;
 +        if (base != 0 && ConstantOf(image, load.address, base, table, f) && ScaledIndex(image, load.address, offset, shift, index, f))
 +        {
-+            first = std::min(f, load.address);
++            first = (std::min)(f, load.address);
 +            return true;
 +        }
 +    }
@@ -197,7 +197,7 @@ index d08371e..492ec12 100644
 +                offset.insn.operands[4] == 31 - offset.insn.operands[2])
 +            {
 +                shift = offset.insn.operands[2];
-+                f = std::min(f, offset.address);
++                f = (std::min)(f, offset.address);
 +                if (!FindWriter(image, offset.address, offset.insn.operands[1], offset))
 +                    continue;
 +            }
@@ -313,6 +313,116 @@ index d08371e..492ec12 100644
      std::ofstream f(argv[2]);
      f.write(out.data(), out.size());
  
+diff --git a/XenonRecomp/pch.h b/XenonRecomp/pch.h
+index c9f9a85..b64eaac 100644
+--- a/XenonRecomp/pch.h
++++ b/XenonRecomp/pch.h
+@@ -12,6 +12,7 @@
+ #include <image.h>
+ #include <toml++/toml.hpp>
+ #include <unordered_map>
++#include <set>
+ #include <unordered_set>
+ #include <xbox.h>
+ #include <xxhash.h>
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 94d68ba..ca3bc23 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -252,6 +252,47 @@ void Recompiler::Analyse()
+     }
+ 
+     std::sort(functions.begin(), functions.end(), [](auto& lhs, auto& rhs) { return lhs.base < rhs.base; });
++
++    // A function must hold every case of its jump tables. .pdata or the sweep
++    // can end it at the bctr, which leaves the cases outside it; grow it through
++    // the functions the cases land in (those stay functions of their own).
++    auto holder = [&](size_t address)
++        {
++            auto it = std::upper_bound(functions.begin(), functions.end(), address, [](size_t a, const Function& f) { return a < f.base; });
++            return it == functions.begin() ? functions.end() : std::prev(it);
++        };
++    size_t grown = 0;
++    for (bool changed = true; changed;)
++    {
++        changed = false;
++        for (const auto& [tableBase, table] : config.switchTables)
++        {
++            auto fn = holder(tableBase);
++            if (fn == functions.end() || tableBase >= fn->base + fn->size)
++                continue;
++            size_t end = fn->base + fn->size;
++            for (size_t label : table.labels)
++            {
++                if (label < fn->base || label < end)
++                    continue;
++                auto target = holder(label);
++                end = std::max({ end, label + 4, target->base + target->size });
++            }
++            if (end - (fn->base + fn->size) > 0x10000)
++            {
++                fmt::println("WARNING: jump table at {:X} reaches {:X}, too far past its function {:X}; not growing it", tableBase, end, fn->base);
++                continue;
++            }
++            if (end != fn->base + fn->size)
++            {
++                fn->size = end - fn->base;
++                changed = true;
++                grown++;
++            }
++        }
++    }
++    if (grown != 0)
++        fmt::println("Grew {} functions over the cases of their jump tables", grown);
+ }
+ 
+ bool Recompiler::Recompile(
+@@ -2396,6 +2437,12 @@ bool Recompiler::Recompile(const Function& fn)
+     static std::unordered_set<size_t> labels;
+     labels.clear();
+ 
++    // The bdz/bdnz family always emits a goto. A target outside the function
++    // (a tail branch, or the padding after the last instruction on a path that
++    // never runs) gets a label at the end that leaves the function instead.
++    static std::set<size_t> outsideCtrTargets;
++    outsideCtrTargets.clear();
++
+     for (size_t addr = base; addr < end; addr += 4)
+     {
+         const uint32_t instruction = ByteSwap(*(uint32_t*)((char*)data + addr - base));
+@@ -2405,7 +2452,13 @@ bool Recompiler::Recompile(const Function& fn)
+             if (op == PPC_OP_B)
+                 labels.emplace(addr + PPC_BI(instruction));
+             else if (op == PPC_OP_BC)
+-                labels.emplace(addr + PPC_BD(instruction));
++            {
++                const size_t target = addr + PPC_BD(instruction);
++                labels.emplace(target);
++                const bool decrementsCtr = ((instruction >> 21) & 0x4) == 0;
++                if (decrementsCtr && (target < fn.base || target >= fn.base + fn.size))
++                    outsideCtrTargets.emplace(target);
++            }
+         }
+ 
+         auto switchTable = config.switchTables.find(addr);
+@@ -2543,6 +2596,17 @@ bool Recompiler::Recompile(const Function& fn)
+         ++data;
+     }
+ 
++    for (size_t target : outsideCtrTargets)
++    {
++        println("loc_{:X}:", target);
++        auto targetSymbol = image.symbols.find(target);
++        if (targetSymbol != image.symbols.end() && targetSymbol->address == target && targetSymbol->type == Symbol_Function)
++            println("\t{}(ctx, base);", targetSymbol->name);
++        else
++            println("\tPPC_CALL_INDIRECT_FUNC(0x{:X});", target);
++        println("\treturn;");
++    }
++
+ #if 0
+     if (insn.opcode == nullptr || (insn.opcode->id != PPC_INST_B && insn.opcode->id != PPC_INST_BCTR && insn.opcode->id != PPC_INST_BLR))
+         fmt::println("Function at {:X} ends prematurely with instruction {} at {:X}", fn.base, insn.opcode != nullptr ? insn.opcode->name : "INVALID", base - 4);
 diff --git a/XenonUtils/xex.cpp b/XenonUtils/xex.cpp
 index e6ff10f..e4a5c13 100644
 --- a/XenonUtils/xex.cpp

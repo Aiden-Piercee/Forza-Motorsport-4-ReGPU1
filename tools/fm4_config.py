@@ -81,12 +81,17 @@ def read_pdata(img, base, sections):
     return funcs
 
 
-def exception_words(img, base, funcs):
-    counts = collections.Counter()
+def exception_words(img, base, funcs, code):
+    """Handler addresses before ExceptionFlag functions. Words there that are not
+    code addresses are returned apart: they are instructions, not handler data,
+    and must not become invalid_instructions entries."""
+    counts, other = collections.Counter(), collections.Counter()
     for begin, _, has_eh in funcs:
         if has_eh:
-            counts[struct.unpack_from(">I", img, begin - 8 - base)[0]] += 1
-    return counts
+            word = struct.unpack_from(">I", img, begin - 8 - base)[0]
+            in_code = any(s <= word < s + n for s, n in code)
+            (counts if in_code else other)[word] += 1
+    return counts, other
 
 
 def gpr_run_candidates(img, base, code, opcode):
@@ -159,10 +164,12 @@ def main():
 
     funcs = read_pdata(img, base, sections)
     starts = [f[0] for f in funcs]
-    eh = exception_words(img, base, funcs)
+    eh, not_handlers = exception_words(img, base, funcs, code)
     print(f"\n{len(funcs)} .pdata functions, {sum(eh.values())} with exception data")
     for w, c in eh.most_common():
         print(f"  exception data word 0x{w:08X}: {c} functions")
+    for w, c in not_handlers.most_common():
+        print(f"  ignored 0x{w:08X} before {c} function(s): not a code address")
 
     for label, opcode in (("setjmp (std r14..r31 -> r3)", 62), ("longjmp (ld r14..r31 <- r3)", 58)):
         hits = gpr_run_candidates(img, base, code, opcode)

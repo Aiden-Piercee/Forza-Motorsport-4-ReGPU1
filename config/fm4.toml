@@ -42,6 +42,11 @@ longjmp_address = 0x82768700
 # and the check that found it (tools/fallthrough.py, tools/fm4_crosscheck.py, a
 # runtime trace). Empty until the first recompile has been checked.
 functions = [
+    # SwitchToFiber. .pdata folds it into 0x82C85370 (the new-fiber start thunk
+    # CreateFiber puts in LR), and callers reach it through the stub at
+    # 0x82C82C10 (b 0x82C85380). The fiber hooks replace it, so it needs its
+    # own entry; its last instruction is the b at 0x82C85788.
+    { address = 0x82C85380, size = 0x40C },
 ]
 
 invalid_instructions = [

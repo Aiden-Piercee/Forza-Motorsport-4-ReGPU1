@@ -21,8 +21,14 @@ for line in $IMAGES; do
     [ "$(sha256sum "game/$xex" | cut -d' ' -f1)" = "$sha" ] || { echo "game/$xex: unsupported version (SHA-256 differs)"; exit 1; }
 done
 
-cmd //c "tools\vcenv.cmd ninja -C build/tools xenonrecomp/XenonRecomp/XenonRecomp.exe xenonrecomp/XenonAnalyse/XenonAnalyse.exe xexdump.exe" | tail -1
 mkdir -p out
+# A failed tool build must stop here, or the steps below run the old binaries.
+if ! cmd //c "tools\vcenv.cmd ninja -C build/tools xenonrecomp/XenonRecomp/XenonRecomp.exe xenonrecomp/XenonAnalyse/XenonAnalyse.exe xexdump.exe" > out/tools-build.log 2>&1; then
+    tail -30 out/tools-build.log
+    echo "building the tools failed (out/tools-build.log)"
+    exit 1
+fi
+tail -1 out/tools-build.log
 
 if [ "$1" = "--prepare" ]; then
     for line in $IMAGES; do
