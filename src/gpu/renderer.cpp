@@ -2781,9 +2781,6 @@ void WaitHoldingImpl(const std::function<bool()>& done);
 // shadow passes undrawn). Cold builds can take 100+ ms; the overlay says so.
 ID3D12PipelineState* WaitForPipeline(const std::shared_ptr<PipelineEntry>& entry)
 {
-    static LiveSwitch async("FM2_ASYNC_PIPELINES");
-    if (async && entry->state.load(std::memory_order_acquire) == 0)
-        return nullptr;
     WaitHoldingImpl([&] { return entry->state.load(std::memory_order_acquire) != 0; });
     return entry->state.load() == 1 ? entry->pso.Get() : nullptr;
 }
@@ -2810,27 +2807,12 @@ PipelineKey MakePipelineKey(uint64_t vsHash, uint64_t psHash, bool depthOnly, bo
     return PipelineKey{ vsHash, psHash, blend, depth, stencil | (mask << 24) | (mode << 28), uint32_t(alphaToMask) | (uint32_t(cullable) << 1) };
 }
 
-// Alpha-blended colour draws (smoke, sparks, glows) are skippable for the moment it
-// takes to build their pipeline; opaque and depth-only draws (shadow maps, geometry)
-// are not: dropping those leaves holes or a black ground.
 std::chrono::steady_clock::time_point g_lastLongHold{}; // end of the last hold of 2 s or more
 
-// Once a loading hold has finished and the game is running (4 s later), new content that
-// shows up first-time (other cars, effects at speed) builds in the background and the
-// draw is skipped for the half second that takes, instead of freezing every frame.
+// The game is running: a loading hold has finished at least 4 s ago (draw workers start then).
 bool GameSettled()
 {
-    static LiveSwitch never("FM2_NO_SETTLED_SKIP");
-    return !never && g_lastLongHold.time_since_epoch().count() != 0 && std::chrono::steady_clock::now() - g_lastLongHold > std::chrono::seconds(4);
-}
-
-bool SkippableDraw(bool depthOnly, uint32_t blend)
-{
-    static LiveSwitch noSkip("FM2_NO_SKIP_BLENDED");
-    if (noSkip || depthOnly)
-        return false;
-    const bool opaque = (blend & 0xFF1F1F1F) == 0x00010001 || (blend & 0x1F) == 1 && ((blend >> 8) & 0x1F) == 0;
-    return !opaque || GameSettled();
+    return g_lastLongHold.time_since_epoch().count() != 0 && std::chrono::steady_clock::now() - g_lastLongHold > std::chrono::seconds(4);
 }
 
 ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion = false)
@@ -2856,11 +2838,7 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
         }
         entry = EnsurePipeline(vs, ps, key);
     }
-    if (SkippableDraw(depthOnly, key.blend) && entry->state.load(std::memory_order_acquire) == 0)
-    {
-        g_skippedPipeline++;
-        return nullptr; // builds in the background; later frames draw it
-    }
+    // Every draw waits for its pipeline: a draw is never dropped because it is still building.
     g_waitWhat = depthOnly ? "pipeline (depth only)" : "pipeline";
     g_waitBlend = key.blend;
     const auto waitStart = g_perfTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -6023,35 +6001,18 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     const CompiledShader& ps = GetShader(C().psHash, C().psCode, true);
     Section(1);
-    static LiveSwitch asyncShaders("FM2_ASYNC_SHADERS");
-    const bool shadersPending = vs.state.load(std::memory_order_acquire) == CompiledShader::Pending || ps.state.load(std::memory_order_acquire) == CompiledShader::Pending;
-    if (shadersPending && SkippableDraw(edramMode == 5, gpureg::Get(RB_BLENDCONTROL0)))
-    {
-        g_skippedPipeline++;
-        return; // compiling in the background
-    }
+    // The shaders were translated from this draw's own microcode; wait for them to compile.
     g_waitWhat = "shader";
     g_waitBlend = gpureg::Get(RB_BLENDCONTROL0);
-    if (!asyncShaders)
-        WaitHoldingImpl([&] {
-            return vs.state.load(std::memory_order_acquire) != CompiledShader::Pending && ps.state.load(std::memory_order_acquire) != CompiledShader::Pending;
-        });
+    WaitHoldingImpl([&] {
+        return vs.state.load(std::memory_order_acquire) != CompiledShader::Pending && ps.state.load(std::memory_order_acquire) != CompiledShader::Pending;
+    });
     if (!vs.IsReady() || !ps.IsReady())
     {
         TraceSkip(vs.state == CompiledShader::Failed || ps.state == CompiledShader::Failed ? "shader" : "compiling", initiator);
         g_r.skippedThisFrame++;
         return;
     }
-    // A fetch from vertex fetch constant 96 or above (index field past the 96 slots) has no
-    // vertex data. With the layout baked in, such shaders failed to compile and their draws
-    // were skipped; read from vfl they compile and draw garbage (black shapes on Mugello).
-    for (uint32_t k : vs.info.vertexFetchConstants)
-        if (k >= 96)
-        {
-            TraceSkip("invalid vertex fetch constant", initiator);
-            g_r.skippedThisFrame++;
-            return;
-        }
     // Triangle lists and restart-free strips read their indices on the GPU;
     // everything else is expanded here.
     const uint32_t prim = initiator & 0x3F, indexSource = (initiator >> 6) & 3, indexCount = initiator >> 16;
@@ -6258,6 +6219,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     memset(vc->vf, 0, sizeof(vc->vf));
     for (uint32_t k : vs.info.vertexFetchConstants)
     {
+        // Index 31 with select 3 names slot 96, past the 32 x 3 vertex fetch constants. No
+        // register backs it; the shader's LoadGuest returns zero for it and the draw goes ahead.
+        if (k >= 96)
+            continue;
         const uint32_t d0 = gpureg::Get(gpureg::FetchConstants + k * 2), d1 = gpureg::Get(gpureg::FetchConstants + k * 2 + 1);
         const uint32_t address = d0 & 0xFFFFFFFC, bytes = ((d1 >> 2) & 0xFFFFFF) * 4;
         // Large buffers (static geometry) are read in place; small ones may be

@@ -72,6 +72,8 @@ uint Swap(uint v, uint e)
 
 uint LoadGuest(uint fetch, uint dword)
 {
+    if (fetch >= 96)
+        return 0; // slot 96 (index 31, select 3) has no fetch constant behind it: the data reads as zero
     uint a = vf[fetch].x + dword * 4;
     return Swap(vf[fetch].z ? gphys.Load(a) : gmem.Load(a), vf[fetch].y);
 }
