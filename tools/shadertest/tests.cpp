@@ -16,6 +16,7 @@ static const std::string kDxc = getenv("DXC") ? getenv("DXC") : "dxc";
 
 static void Write(const std::string& path, const void* d, size_t n) { FILE* f = fopen(path.c_str(), "wb"); fwrite(d, 1, n, f); fclose(f); }
 static std::vector<char> Read(const std::string& p) { std::ifstream f(p, std::ios::binary); return { std::istreambuf_iterator<char>(f), {} }; }
+static void Sh(const std::string& cmd) { if (system(cmd.c_str()) != 0) {} }
 static bool Run(const std::string& cmd) { int r = system((cmd + " > out/last.log 2>&1").c_str()); return r == 0; }
 static void Check(bool ok, const std::string& what)
 {
@@ -29,12 +30,14 @@ static TranslatedShader Translate(const std::string& name, const Program& p, boo
     ucode::Shader s = ucode::Parse(words.data(), uint32_t(words.size()), pixel);
     TranslatedShader t = TranslateShader(s);
     Write("out/" + name + ".dis", ucode::Disassemble(s).data(), ucode::Disassemble(s).size());
+    // Also in the shader-cache naming, as input for run.sh survey.
+    Write(std::string("out/ucode/") + (pixel ? "ps_" : "vs_") + name + ".ucode", words.data(), words.size() * 4);
     if (!t.ok) { printf("  FAIL translate %s: %s\n", name.c_str(), t.error.c_str()); g_fail++; return t; }
     Write("out/" + name + ".hlsl", t.hlsl.data(), t.hlsl.size());
     // The stage itself must compile (dxc as a stand-in for fxc: syntax and semantics).
     const bool compiled = Run(kDxc + " -HV 2016 -T " + (pixel ? "ps_6_0" : "vs_6_0") + " -E main out/" + name + ".hlsl -Fo out/" + name + ".dxil");
     Check(compiled, name + ": " + (pixel ? "ps" : "vs") + " compiles");
-    if (!compiled) system("head -30 out/last.log");
+    if (!compiled) Sh("head -30 out/last.log");
     return t;
 }
 
@@ -68,7 +71,7 @@ void cs_main(uint3 tid : SV_DispatchThreadID)
     if (!Run(kDxc + " -HV 2016 -spirv -fspv-target-env=vulkan1.2 -T cs_6_0 -E cs_main -fvk-t-shift 10 0 -fvk-u-shift 40 0 -fvk-s-shift 20 0 out/" + name +
             ".cs.hlsl -Fo out/" + name + ".spv"))
     {
-        system("head -30 out/last.log");
+        Sh("head -30 out/last.log");
         Check(false, name + ": compute wrapper compiles");
         return {};
     }
@@ -81,7 +84,7 @@ void cs_main(uint3 tid : SV_DispatchThreadID)
     if (!Run("./vkrun out/" + name + ".spv out/" + name + ".out " + std::to_string(bytes) + " " + std::to_string(threads) + " 0:out/" + name + ".cb 1:out/" +
             name + ".cb 10:out/" + name + ".gmem 11:out/" + name + ".gmem 40:out/" + name + ".u0in"))
     {
-        system("cat out/last.log");
+        Sh("cat out/last.log");
         Check(false, name + ": runs");
         return {};
     }
@@ -110,7 +113,7 @@ static std::array<uint32_t, 3> OutPos(uint32_t r) { return V(MAX, 62, 15, R(r), 
 
 int main()
 {
-    system("mkdir -p out");
+    Sh("mkdir -p out/ucode");
 
     // 1. One loop: aL-relative constant reads and an aL-relative temp destination; aL back to 0 after.
     {
