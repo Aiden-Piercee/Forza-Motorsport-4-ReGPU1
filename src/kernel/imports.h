@@ -9,10 +9,12 @@
 #include "log.h"
 #include "memory.h"
 
-// Every import goes through TraceImport (FM2_TRACE_IMPORTS=<seconds>: log
-// calls made after that time, a few per name).
+// Every import goes through TraceImport and TraceImportReturn (FM2_TRACE_IMPORTS=<seconds>: log calls made
+// after that time, a few per name, with what they return; FM2_TRACE_IMPORTS_MATCH=Xam,XNotify: only names
+// containing one of those).
 void TraceImport(const char* name, PPCContext& ctx);
-#define GUEST_EXPORT(name)                                         static void Impl_##name(PPCContext& __restrict ctx, uint8_t* base);     PPC_FUNC(__imp__##name)                                        {                                                                  TraceImport(#name, ctx);                                       Impl_##name(ctx, base);                                    }                                                              static void Impl_##name(PPCContext& __restrict ctx, uint8_t* base)
+void TraceImportReturn(const char* name, PPCContext& ctx);
+#define GUEST_EXPORT(name)                                         static void Impl_##name(PPCContext& __restrict ctx, uint8_t* base);     PPC_FUNC(__imp__##name)                                        {                                                                  TraceImport(#name, ctx);                                       Impl_##name(ctx, base);                                        TraceImportReturn(#name, ctx);                             }                                                              static void Impl_##name(PPCContext& __restrict ctx, uint8_t* base)
 
 inline uint32_t StackArg(PPCContext& ctx, int index) // index 8 = 9th argument
 {

@@ -1,12 +1,15 @@
 #include "kernel/runtime.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <thread>
 
 #include <intrin.h>
 #include <windows.h>
 
 #include <unordered_map>
+#include <vector>
 
 #include "kernel/imports.h"
 #include "kernel/thread.h"
@@ -146,10 +149,29 @@ void CompleteOverlapped(uint32_t overlapped, uint32_t result, uint32_t extendedE
         LOG_ONCE("XOVERLAPPED completion routines are not called yet");
 }
 
+namespace
+{
+thread_local const char* t_tracedImport = nullptr; // the import whose call was just logged (nesting: the innermost)
+}
+
 void TraceImport(const char* name, PPCContext& ctx)
 {
     static const double after = getenv("FM2_TRACE_IMPORTS") ? atof(getenv("FM2_TRACE_IMPORTS")) : -1;
     if (after < 0)
+        return;
+    static const std::vector<std::string> match = [] {
+        std::vector<std::string> v;
+        std::string s = getenv("FM2_TRACE_IMPORTS_MATCH") ? getenv("FM2_TRACE_IMPORTS_MATCH") : "";
+        for (size_t at = 0; at <= s.size();)
+        {
+            const size_t comma = std::min(s.find(',', at), s.size());
+            if (comma > at)
+                v.push_back(s.substr(at, comma - at));
+            at = comma + 1;
+        }
+        return v;
+    }();
+    if (!match.empty() && std::none_of(match.begin(), match.end(), [&](const std::string& m) { return strstr(name, m.c_str()) != nullptr; }))
         return;
     static const auto start = Clock::now();
     if (std::chrono::duration<double>(Clock::now() - start).count() < after)
@@ -159,5 +181,17 @@ void TraceImport(const char* name, PPCContext& ctx)
     std::lock_guard lock(mutex);
     static const int limit = getenv("FM2_TRACE_LIMIT") ? atoi(getenv("FM2_TRACE_LIMIT")) : 5;
     if (counts[name]++ < limit)
-        Log("import %s (thread %u, lr %08llX, r3 %08X r4 %08X r5 %08X r9 %08X)", name, CurrentGuestThreadId(), ctx.lr, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r9.u32);
+    {
+        Log("import %s (thread %u, lr %08llX, r3 %08X r4 %08X r5 %08X r6 %08X r7 %08X r9 %08X)", name, CurrentGuestThreadId(), ctx.lr, ctx.r3.u32, ctx.r4.u32,
+            ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r9.u32);
+        t_tracedImport = name;
+    }
+}
+
+void TraceImportReturn(const char* name, PPCContext& ctx)
+{
+    if (!t_tracedImport || strcmp(t_tracedImport, name) != 0)
+        return;
+    t_tracedImport = nullptr;
+    Log("import %s -> %08X (thread %u)", name, ctx.r3.u32, CurrentGuestThreadId());
 }
