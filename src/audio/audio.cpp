@@ -28,6 +28,7 @@ constexpr uint32_t kRingFrames = 32;
 constexpr uint32_t kTargetQueued = 4, kMaxQueued = 8;
 
 std::atomic<uint32_t> g_callback{ 0 };
+// The callback gets the address of a word holding the client's argument, not the argument itself.
 std::atomic<uint32_t> g_callbackArg{ 0 };
 std::shared_ptr<ThreadObject> g_audioThread;
 // FM2_TRACE_AUDIO=1: once a second, the callbacks run, frames submitted and frames dropped.
@@ -179,7 +180,9 @@ GUEST_EXPORT(XAudioRegisterRenderDriverClient)
     // (callback struct { u32 fn, u32 arg }*, driver*)
     const uint32_t callback = ctx.r3.u32;
     g_callback = LoadBE32(callback);
-    g_callbackArg = LoadBE32(callback + 4);
+    if (!g_callbackArg)
+        g_callbackArg = GuestAlloc(Heap::Virtual, 4, 4);
+    StoreBE32(g_callbackArg, LoadBE32(callback + 4));
     StoreIfNonNull(ctx.r4.u32, 0x41550000);
     if (!g_audioThread)
     {
