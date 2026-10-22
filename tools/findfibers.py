@@ -11,9 +11,9 @@ another title:
   - the five XAPI functions read or write the current fiber at KTHREAD+0x164,
     reached through KPCR+0x100 (lwz rX,0x100(r13)), and the creating ones
     allocate the 0xA50-byte fiber object;
-  - the register swap stores r14..r31 and loads them back, with no .pdata
-    entry or a short one;
-  - SwitchToFiber branches to the swap.
+  - the register swap stores r14..r31 through one register and loads them
+    through another (FM4 keeps it inside SwitchToFiber, after its prologue);
+  - SwitchToFiber, or a stub before it, branches to the swap's function.
 
 It prints every function with that evidence in address order, plus a guessed
 name. The XAPI object keeps these functions together (FM2: 82754CD0..82754EF0),
@@ -47,7 +47,8 @@ def pdata_functions(img, base, sections):
 
 
 def gpr_run(words, opcode):
-    """True if the words hold `std/ld r14..r31, d(rB)` in order, one base register."""
+    """The base register if the words hold `std/ld r14..r31, d(rB)` in order with
+    one base register, else None."""
     want, ra = 14, None
     for w in words:
         if (w >> 26) == opcode and (w >> 21) & 31 == want and w & 3 == 0:
@@ -56,8 +57,8 @@ def gpr_run(words, opcode):
             if (w >> 16) & 31 == ra:
                 want += 1
                 if want == 32:
-                    return True
-    return False
+                    return ra
+    return None
 
 
 def branch_target(w, addr):
@@ -84,7 +85,14 @@ def main():
     for s, n in code:
         words = struct.unpack_from(f">{n // 4}I", img, s - base)
         for i, w in enumerate(words):
-            if (w >> 26) == 62 and (w >> 21) & 31 == 14 and w & 3 == 0 and gpr_run(words[i:i + 64], 62) and gpr_run(words[i:i + 160], 58):
+            if (w >> 26) != 62 or (w >> 21) & 31 != 14 or w & 3 != 0:
+                continue
+            # The swap saves into one fiber and restores from another (FM4: from
+            # r3), with the FPRs and VMX registers in between. The save/restore
+            # helpers use the same base for both, so they do not count.
+            saved = gpr_run(words[i:i + 64], 62)
+            restored = gpr_run(words[i:i + 400], 58)
+            if saved is not None and restored is not None and saved != restored:
                 swaps.append(s + i * 4)
     # The swap's entry is the start of its block: the .pdata function holding
     # the first store, or the store itself.
@@ -103,7 +111,7 @@ def main():
         to_swap = False
         for i, w in enumerate(words):
             t, _ = branch_target(w, begin + i * 4)
-            if t is not None and (t in swap_entries or any(0 <= t - e < 0x200 for e in swaps)):
+            if t is not None and t in swap_entries:
                 to_swap = True
         if not (kpcr and (load164 or store164)) and not (a50 and kpcr):
             continue

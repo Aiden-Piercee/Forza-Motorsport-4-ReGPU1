@@ -1,0 +1,336 @@
+diff --git a/XenonAnalyse/main.cpp b/XenonAnalyse/main.cpp
+index d08371e..492ec12 100644
+--- a/XenonAnalyse/main.cpp
++++ b/XenonAnalyse/main.cpp
+@@ -1,5 +1,7 @@
+ #include <cassert>
++#include <algorithm>
+ #include <iterator>
++#include <unordered_set>
+ #include <file.h>
+ #include <disasm.h>
+ #include <image.h>
+@@ -172,6 +174,248 @@ void* SearchMask(const void* source, const uint32_t* compare, size_t compareCoun
+     return nullptr;
+ }
+ 
++// Jump tables the fixed instruction patterns below miss, because the compiler
++// ordered the instructions differently (FM4: lis; rlwinm; addi; lwzx; mtctr;
++// bctr). Works back from a bctr through the registers that feed it, within the
++// straight-line code before it.
++struct TracedInsn
++{
++    ppc_insn insn{};
++    size_t address{};
++};
++
++static bool EndsBlock(const ppc_insn& insn)
++{
++    switch (insn.opcode->id)
++    {
++    case PPC_INST_B:
++    case PPC_INST_BLR:
++    case PPC_INST_BCTR:
++        return true;
++    default:
++        return false;
++    }
++}
++
++// The nearest instruction before `address` (at most `window` back) that writes
++// `reg` with one of the instructions jump-table code uses.
++static bool FindWriter(const Image& image, size_t address, uint32_t reg, TracedInsn& out, int window = 16)
++{
++    for (int i = 1; i <= window; i++)
++    {
++        const size_t a = address - 4 * i;
++        const auto* code = (const uint32_t*)image.Find(a);
++        if (code == nullptr)
++            return false;
++        ppc_insn insn;
++        ppc::Disassemble(code, a, insn);
++        if (insn.opcode == nullptr || EndsBlock(insn))
++            return false;
++        switch (insn.opcode->id)
++        {
++        case PPC_INST_LIS:
++        case PPC_INST_LI:
++        case PPC_INST_ADDI:
++        case PPC_INST_ORI:
++        case PPC_INST_RLWINM:
++        case PPC_INST_LWZX:
++        case PPC_INST_LBZX:
++        case PPC_INST_LHZX:
++        case PPC_INST_ADD:
++        case PPC_INST_MR:
++            if (insn.operands[0] == reg)
++            {
++                out = { insn, a };
++                return true;
++            }
++            break;
++        default:
++            break;
++        }
++    }
++    return false;
++}
++
++// The constant a lis/addi/ori chain leaves in `reg` at `address`.
++static bool ConstantOf(const Image& image, size_t address, uint32_t reg, uint32_t& value, size_t& first, int depth = 0)
++{
++    TracedInsn w;
++    if (depth > 4 || !FindWriter(image, address, reg, w))
++        return false;
++    first = std::min(first, w.address);
++    switch (w.insn.opcode->id)
++    {
++    case PPC_INST_LIS:
++        value = w.insn.operands[1] << 16;
++        return true;
++    case PPC_INST_LI:
++        value = w.insn.operands[1];
++        return true;
++    case PPC_INST_ADDI:
++        if (!ConstantOf(image, w.address, w.insn.operands[1], value, first, depth + 1))
++            return false;
++        value += w.insn.operands[2];
++        return true;
++    case PPC_INST_ORI:
++        if (!ConstantOf(image, w.address, w.insn.operands[1], value, first, depth + 1))
++            return false;
++        value |= w.insn.operands[2];
++        return true;
++    default:
++        return false;
++    }
++}
++
++// `reg` = index << shift at `address`: the index register and the shift.
++static bool ScaledIndex(const Image& image, size_t address, uint32_t reg, uint32_t shift, uint32_t& index, size_t& first)
++{
++    if (shift == 0)
++    {
++        index = reg;
++        return true;
++    }
++    TracedInsn w;
++    if (!FindWriter(image, address, reg, w) || w.insn.opcode->id != PPC_INST_RLWINM)
++        return false;
++    // rlwinm rA, rS, sh, 0, 31 - sh is slwi rA, rS, sh.
++    if (w.insn.operands[2] != shift || w.insn.operands[3] != 0 || w.insn.operands[4] != 31 - shift)
++        return false;
++    first = std::min(first, w.address);
++    index = w.insn.operands[1];
++    return true;
++}
++
++// A table load `op rD, rA, rB`: the table address and the index register.
++static bool TableLoad(const Image& image, const TracedInsn& load, uint32_t shift, uint32_t& table, uint32_t& index, size_t& first)
++{
++    for (int swap = 0; swap < 2; swap++)
++    {
++        const uint32_t base = load.insn.operands[1 + swap];
++        const uint32_t offset = load.insn.operands[2 - swap];
++        size_t f = first;
++        if (base != 0 && ConstantOf(image, load.address, base, table, f) && ScaledIndex(image, load.address, offset, shift, index, f))
++        {
++            first = std::min(f, load.address);
++            return true;
++        }
++    }
++    return false;
++}
++
++enum class TraceResult
++{
++    NotATable,
++    Unresolved,
++    Found,
++};
++
++static TraceResult TraceBctr(const Image& image, size_t bctr, SwitchTable& table)
++{
++    TracedInsn mtctr{};
++    bool foundMtctr = false;
++    for (int i = 1; i <= 4 && !foundMtctr; i++)
++    {
++        const auto* code = (const uint32_t*)image.Find(bctr - 4 * i);
++        ppc::Disassemble(code, bctr - 4 * i, mtctr.insn);
++        if (mtctr.insn.opcode == nullptr || EndsBlock(mtctr.insn))
++            return TraceResult::NotATable;
++        mtctr.address = bctr - 4 * i;
++        foundMtctr = mtctr.insn.opcode->id == PPC_INST_MTCTR;
++    }
++    if (!foundMtctr)
++        return TraceResult::NotATable;
++
++    TracedInsn target;
++    if (!FindWriter(image, mtctr.address, mtctr.insn.operands[0], target))
++        return TraceResult::NotATable;
++
++    size_t first = target.address;
++    uint32_t tableAddress = 0;
++    uint32_t index = 0;
++    uint32_t labelBase = 0;
++    uint32_t shift = 0;
++    if (target.insn.opcode->id == PPC_INST_LWZX)
++    {
++        table.type = SWITCH_ABSOLUTE;
++        if (!TableLoad(image, target, 2, tableAddress, index, first))
++            return TraceResult::Unresolved;
++    }
++    else if (target.insn.opcode->id == PPC_INST_ADD)
++    {
++        // base + offset[index] (byte or halfword offsets, optionally shifted).
++        bool resolved = false;
++        for (int swap = 0; swap < 2 && !resolved; swap++)
++        {
++            size_t f = first;
++            if (!ConstantOf(image, target.address, target.insn.operands[1 + swap], labelBase, f))
++                continue;
++            TracedInsn offset;
++            if (!FindWriter(image, target.address, target.insn.operands[2 - swap], offset))
++                continue;
++            shift = 0;
++            if (offset.insn.opcode->id == PPC_INST_RLWINM && offset.insn.operands[3] == 0 &&
++                offset.insn.operands[4] == 31 - offset.insn.operands[2])
++            {
++                shift = offset.insn.operands[2];
++                f = std::min(f, offset.address);
++                if (!FindWriter(image, offset.address, offset.insn.operands[1], offset))
++                    continue;
++            }
++            if (offset.insn.opcode->id == PPC_INST_LBZX)
++            {
++                table.type = shift != 0 ? SWITCH_COMPUTED : SWITCH_BYTEOFFSET;
++                resolved = TableLoad(image, offset, 0, tableAddress, index, f);
++            }
++            else if (offset.insn.opcode->id == PPC_INST_LHZX && shift == 0)
++            {
++                table.type = SWITCH_SHORTOFFSET;
++                resolved = TableLoad(image, offset, 1, tableAddress, index, f);
++            }
++            if (resolved)
++                first = f;
++        }
++        // An add that does not read a table is some other computed jump.
++        if (!resolved)
++            return TraceResult::NotATable;
++    }
++    else
++    {
++        return TraceResult::NotATable;
++    }
++
++    // The bounds check before the table: cmplwi crN, rX, count - 1 and bgt/ble crN.
++    SwitchTable bounds{};
++    ScanTable((const uint32_t*)image.Find(first), first, bounds);
++    if (bounds.base == 0)
++        return TraceResult::Unresolved;
++
++    table.labels.resize(bounds.labels.size());
++    for (size_t i = 0; i < table.labels.size(); i++)
++    {
++        switch (table.type)
++        {
++        case SWITCH_ABSOLUTE:
++            table.labels[i] = ((const be<uint32_t>*)image.Find(tableAddress))[i];
++            break;
++        case SWITCH_COMPUTED:
++        case SWITCH_BYTEOFFSET:
++            table.labels[i] = labelBase + (uint32_t(((const uint8_t*)image.Find(tableAddress))[i]) << shift);
++            break;
++        case SWITCH_SHORTOFFSET:
++            table.labels[i] = labelBase + ((const be<uint16_t>*)image.Find(tableAddress))[i];
++            break;
++        }
++        // Every case must be code near the jump.
++        const size_t label = table.labels[i];
++        if (label % 4 != 0 || label + 0x40000 < bctr || label > bctr + 0x40000)
++            return TraceResult::Unresolved;
++    }
++    table.base = first;
++    table.r = index;
++    table.defaultLabel = bounds.defaultLabel;
++    return TraceResult::Found;
++}
++
+ static std::string out;
+ 
+ template<class... Args>
+@@ -305,6 +549,53 @@ int main(int argc, char** argv)
+     scanPattern(offsetSwitch, std::size(offsetSwitch), SWITCH_BYTEOFFSET);
+     scanPattern(wordOffsetSwitch, std::size(wordOffsetSwitch), SWITCH_SHORTOFFSET);
+ 
++    // Every bctr the patterns above did not cover: trace it back to its table.
++    std::unordered_set<size_t> covered;
++    for (const auto& table : switches)
++    {
++        for (size_t a = table.base; a < table.base + 0x40; a += 4)
++        {
++            ppc_insn insn;
++            ppc::Disassemble((const uint32_t*)image.Find(a), a, insn);
++            if (insn.opcode != nullptr && insn.opcode->id == PPC_INST_BCTR)
++            {
++                covered.insert(a);
++                break;
++            }
++        }
++    }
++    size_t traced = 0;
++    std::vector<size_t> unresolved;
++    println("# ---- TRACED JUMPTABLE ----");
++    for (const auto& section : image.sections)
++    {
++        if (!(section.flags & SectionFlags_Code))
++            continue;
++        // Traces look up to 0x80 bytes back; no table sits at a section's start.
++        for (size_t a = section.base + 0x100; a < section.base + section.size; a += 4)
++        {
++            if (ByteSwap(*(const uint32_t*)(section.data + (a - section.base))) != 0x4E800420 || covered.count(a))
++                continue;
++            SwitchTable table{};
++            switch (TraceBctr(image, a, table))
++            {
++            case TraceResult::Found:
++                printTable(table);
++                switches.emplace_back(std::move(table));
++                traced++;
++                break;
++            case TraceResult::Unresolved:
++                unresolved.push_back(a);
++                break;
++            case TraceResult::NotATable:
++                break;
++            }
++        }
++    }
++    fmt::println("{} jump tables ({} traced from their bctr)", switches.size(), traced);
++    for (size_t a : unresolved)
++        fmt::println("WARNING: bctr at {:X} reads a table that could not be resolved; add it by hand", a);
++
+     std::ofstream f(argv[2]);
+     f.write(out.data(), out.size());
+ 
+diff --git a/XenonUtils/xex.cpp b/XenonUtils/xex.cpp
+index e6ff10f..e4a5c13 100644
+--- a/XenonUtils/xex.cpp
++++ b/XenonUtils/xex.cpp
+@@ -1,5 +1,6 @@
+ #include "xex.h"
+ #include "image.h"
++#include <algorithm>
+ #include <cassert>
+ #include <cstdio>
+ #include <cstring>
+@@ -181,6 +182,9 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize)
+                 imageSize += blocks[i].dataSize + blocks[i].zeroSize;
+             }
+ 
++            // The blocks can end before the image does (the rest is zero), and
++            // image.size below is the security info's size: cover both.
++            imageSize = std::max<size_t>(imageSize, security->imageSize);
+             result = std::make_unique<uint8_t[]>(imageSize);
+             auto* destData = result.get();
+ 
