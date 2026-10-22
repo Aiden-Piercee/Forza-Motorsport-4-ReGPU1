@@ -511,7 +511,7 @@ GUEST_EXPORT(NtQueryInformationFile)
         written = 0x38;
         break;
     default:
-        Log("NtQueryInformationFile: class %u not supported", cls);
+        Log("NtQueryInformationFile: class %u not supported (%s, lr %08llX)", cls, file->path.filename().string().c_str(), ctx.lr);
         SetIoStatus(iosb, X_STATUS_NOT_IMPLEMENTED, 0);
         Return(ctx, X_STATUS_NOT_IMPLEMENTED);
         return;
