@@ -88,16 +88,37 @@ struct Output : IXAudio2VoiceCallback
         Log("audio: output 5.1 float at %u Hz", kRate);
     }
 
+    // FM2_DUMP_AUDIO=<file.wav>: everything the title submits, played or not (FM2_SILENT), as
+    // 6-channel float WAV (header sizes left at their maximum; players read to the end).
+    static FILE* OpenDump()
+    {
+        const char* path = getenv("FM2_DUMP_AUDIO");
+        FILE* f = path ? fopen(path, "wb") : nullptr;
+        if (f)
+        {
+            const uint32_t rate = kRate, bytesPerSec = kRate * kChannels * 4, size = 0xFFFFFFF0u;
+            const uint16_t fmt = 3, ch = kChannels, align = kChannels * 4, bits = 32;
+            const uint32_t fmtSize = 16;
+            fwrite("RIFF", 1, 4, f), fwrite(&size, 4, 1, f), fwrite("WAVEfmt ", 1, 8, f), fwrite(&fmtSize, 4, 1, f);
+            fwrite(&fmt, 2, 1, f), fwrite(&ch, 2, 1, f), fwrite(&rate, 4, 1, f), fwrite(&bytesPerSec, 4, 1, f);
+            fwrite(&align, 2, 1, f), fwrite(&bits, 2, 1, f), fwrite("data", 1, 4, f), fwrite(&size, 4, 1, f);
+        }
+        return f;
+    }
+
     // One title frame: planar big-endian floats to interleaved host floats.
     void Submit(uint32_t samples)
     {
         g_statSubmitted++;
-        if (!ok || queued.load() >= int(kRingFrames) - 1)
-        {
+        const bool play = ok && queued.load() < int(kRingFrames) - 1;
+        if (!play)
             g_statDropped++;
+        static FILE* dump = OpenDump();
+        if (!play && !dump)
             return;
-        }
-        float* out = &ring[size_t(next) * kFrameSamples * kChannels];
+        // A dropped frame is converted aside: the ring's next slot may still be queued at the device.
+        static std::vector<float> aside(size_t(kFrameSamples) * kChannels);
+        float* out = play ? &ring[size_t(next) * kFrameSamples * kChannels] : aside.data();
         const uint32_t* in = GuestPtr<uint32_t>(samples);
         for (uint32_t c = 0; c < kChannels; c++)
             for (uint32_t i = 0; i < kFrameSamples; i++)
@@ -105,27 +126,13 @@ struct Output : IXAudio2VoiceCallback
                 const uint32_t bits = __builtin_bswap32(in[c * kFrameSamples + i]);
                 memcpy(&out[i * kChannels + c], &bits, 4);
             }
-        // FM2_DUMP_AUDIO=<file.wav>: everything the title submits, as 6-channel float WAV
-        // (header sizes left at their maximum; players read to the end).
-        static FILE* dump = [] {
-            const char* path = getenv("FM2_DUMP_AUDIO");
-            FILE* f = path ? fopen(path, "wb") : nullptr;
-            if (f)
-            {
-                const uint32_t rate = kRate, bytesPerSec = kRate * kChannels * 4, size = 0xFFFFFFF0u;
-                const uint16_t fmt = 3, ch = kChannels, align = kChannels * 4, bits = 32;
-                const uint32_t fmtSize = 16;
-                fwrite("RIFF", 1, 4, f), fwrite(&size, 4, 1, f), fwrite("WAVEfmt ", 1, 8, f), fwrite(&fmtSize, 4, 1, f);
-                fwrite(&fmt, 2, 1, f), fwrite(&ch, 2, 1, f), fwrite(&rate, 4, 1, f), fwrite(&bytesPerSec, 4, 1, f);
-                fwrite(&align, 2, 1, f), fwrite(&bits, 2, 1, f), fwrite("data", 1, 4, f), fwrite(&size, 4, 1, f);
-            }
-            return f;
-        }();
         if (dump)
         {
             fwrite(out, 4, size_t(kFrameSamples) * kChannels, dump);
             fflush(dump);
         }
+        if (!play)
+            return;
         XAUDIO2_BUFFER b{};
         b.AudioBytes = kFrameSamples * kChannels * 4;
         b.pAudioData = reinterpret_cast<const BYTE*>(out);
@@ -210,6 +217,16 @@ GUEST_EXPORT(XAudioSubmitRenderDriverFrame)
     // (driver, samples*)
     if (ctx.r4.u32)
         g_output.Submit(ctx.r4.u32);
+    Return(ctx, X_STATUS_SUCCESS);
+}
+
+GUEST_EXPORT(XAudioGetSpeakerConfig)
+{
+    // (config*): the dashboard's audio output setting. The high word is the digital output
+    // (bit 16: Dolby Digital, i.e. 5.1), the low word the analog one (1: stereo). The render
+    // driver above always takes 5.1 and the host mixes it down, so report digital 5.1 with
+    // analog stereo: 0x00010001, what Xenia reports as well.
+    StoreIfNonNull(ctx.r3.u32, 0x00010001);
     Return(ctx, X_STATUS_SUCCESS);
 }
 
