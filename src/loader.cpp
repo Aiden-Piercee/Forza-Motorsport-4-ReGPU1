@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <windows.h>
 #include <vector>
 
@@ -53,8 +54,21 @@ uint32_t AllocZeroed(uint32_t size)
     return GuestAlloc(Heap::Virtual, size, 16);
 }
 
-// Guest storage for a kernel variable export, by xboxkrnl ordinal.
+uint32_t NewKernelVariable(uint32_t ordinal);
+
+// Guest storage for a kernel variable export, by xboxkrnl ordinal. The kernel has one of each:
+// every module importing it gets the same storage (a module given a copy of its own would
+// read, say, a KeTimeStampBundle nobody updates).
 uint32_t KernelVariable(uint32_t ordinal)
+{
+    static std::unordered_map<uint32_t, uint32_t> variables;
+    auto [it, added] = variables.try_emplace(ordinal, 0);
+    if (added)
+        it->second = NewKernelVariable(ordinal);
+    return it->second;
+}
+
+uint32_t NewKernelVariable(uint32_t ordinal)
 {
     switch (ordinal)
     {
