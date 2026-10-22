@@ -1,5 +1,5 @@
 diff --git a/XenonAnalyse/main.cpp b/XenonAnalyse/main.cpp
-index d08371e..7ce2cdd 100644
+index d08371e..5c2a1b7 100644
 --- a/XenonAnalyse/main.cpp
 +++ b/XenonAnalyse/main.cpp
 @@ -1,5 +1,9 @@
@@ -12,7 +12,7 @@ index d08371e..7ce2cdd 100644
  #include <file.h>
  #include <disasm.h>
  #include <image.h>
-@@ -172,6 +176,358 @@ void* SearchMask(const void* source, const uint32_t* compare, size_t compareCoun
+@@ -172,6 +176,433 @@ void* SearchMask(const void* source, const uint32_t* compare, size_t compareCoun
      return nullptr;
  }
  
@@ -173,10 +173,12 @@ index d08371e..7ce2cdd 100644
 +// The number of entries a table indexed by `index` has, seen from `first`, the
 +// table code's first instruction. Uses the smaller of:
 +//  - a mask on the index (clrlwi rI, rS, n: 2^(32-n) entries);
-+//  - cmplwi crN, rI, count - 1 with a bgt/ble on crN, up to 160 instructions back
-+//    in address order, as long as nothing on the way writes rI and no call
-+//    passes while rI is a volatile register (a compare after the mask is
-+//    reached before the mask).
++//  - cmplwi crN, rX, count - 1 with a bgt/ble on crN, up to 160 instructions back
++//    in address order, where rX holds the index's value: rI itself, a register
++//    the index was copied from (mr rI, rX), or, in unoptimised code, a register
++//    loaded from the stack slot the index was loaded from (lwz rI, d(r1)).
++//    Scanning stops where the value is overwritten, at a blr, and at a call
++//    while the value is in a volatile register or on the stack.
 +// FM4 often masks a byte index and then compares it, so the mask alone would
 +// read past the table. Without either, an earlier table on the same index that
 +// has `first` as a case gives the bound: a second dispatch reached only from
@@ -189,9 +191,28 @@ index d08371e..7ce2cdd 100644
 +    if (FindWriter(image, first, index, w) && w.insn.opcode->id == PPC_INST_CLRLWI && w.insn.operands[2] >= 24)
 +        maskCount = size_t(1) << (32 - w.insn.operands[2]);
 +
-+    const bool volatileIndex = index == 0 || (index >= 3 && index <= 12);
++    struct Compare
++    {
++        size_t count;
++        uint32_t defaultLabel;
++    };
 +    // The target of the bgt/ble on each condition register: the default case.
 +    std::unordered_map<uint32_t, uint32_t> branchOnCr;
++    // Bounded compares seen so far, by the register they compare. A compare
++    // counts once the scan reaches where its register got the index's value.
++    std::unordered_map<uint32_t, Compare> compares;
++    auto accept = [&](const Compare& c)
++        {
++            count = maskCount != 0 ? (std::min)(c.count, maskCount) : c.count;
++            defaultLabel = c.defaultLabel;
++            return true;
++        };
++
++    // Where the index's value lives at this point of the scan: a register, or
++    // (once the register's writer has been passed) a stack slot.
++    uint32_t reg = index;
++    bool inSlot = false;
++    uint32_t slot = 0;
 +    for (int i = 1; i <= 160 && first - 4 * i >= sectionBase; i++)
 +    {
 +        const size_t a = first - 4 * i;
@@ -202,31 +223,69 @@ index d08371e..7ce2cdd 100644
 +        ppc::Disassemble(code, a, insn);
 +        if (insn.opcode == nullptr)
 +            continue; // padding or an inline table
-+        switch (insn.opcode->id)
++        const uint32_t id = insn.opcode->id;
++        if (id == PPC_INST_BGT || id == PPC_INST_BLE)
 +        {
-+        case PPC_INST_BGT:
-+        case PPC_INST_BLE:
 +            branchOnCr[insn.operands[0]] = insn.operands[1];
 +            continue;
-+        case PPC_INST_BGTLR:
-+        case PPC_INST_BLELR:
++        }
++        if (id == PPC_INST_BGTLR || id == PPC_INST_BLELR)
++        {
 +            branchOnCr[insn.operands[0]] = 0;
 +            continue;
-+        case PPC_INST_CMPLWI:
-+            if (insn.operands[1] == index && branchOnCr.count(insn.operands[0]))
++        }
++        if (id == PPC_INST_CMPLWI)
++        {
++            const auto cr = branchOnCr.find(insn.operands[0]);
++            if (cr != branchOnCr.end())
 +            {
-+                count = size_t(insn.operands[2]) + 1;
-+                defaultLabel = branchOnCr[insn.operands[0]];
-+                if (maskCount != 0)
-+                    count = (std::min)(count, maskCount);
-+                return true;
++                const Compare c{ size_t(insn.operands[2]) + 1, cr->second };
++                if (!inSlot && insn.operands[1] == reg)
++                    return accept(c);
++                compares[insn.operands[1]] = c;
 +            }
 +            continue;
-+        default:
++        }
++        if (id == PPC_INST_BLR)
++            break;
++
++        if (inSlot)
++        {
++            // A load of the slot into a compared register.
++            if (id == PPC_INST_LWZ && insn.operands[2] == 1 && insn.operands[1] == slot && compares.count(insn.operands[0]))
++                return accept(compares[insn.operands[0]]);
++            const bool storesToStack = StartsWith(insn.opcode->name, "st") && !EndsWith(insn.opcode->name, "x") && insn.operands[2] == 1;
++            if (IsCall(insn) || WritesGpr(insn, 1) || (storesToStack && int32_t(insn.operands[1]) < int32_t(slot) + 4 &&
++                int32_t(insn.operands[1]) + 8 > int32_t(slot)))
++                break;
++        }
++        else if (WritesGpr(insn, reg))
++        {
++            if (id == PPC_INST_MR)
++            {
++                // The value came from another register.
++                reg = insn.operands[1];
++                if (compares.count(reg))
++                    return accept(compares[reg]);
++            }
++            else if (id == PPC_INST_LWZ && insn.operands[2] == 1)
++            {
++                inSlot = true;
++                slot = insn.operands[1];
++            }
++            else
++            {
++                break;
++            }
++        }
++        else if (IsCall(insn) && (reg == 0 || (reg >= 3 && reg <= 12)))
++        {
 +            break;
 +        }
-+        if (WritesGpr(insn, index) || (volatileIndex && IsCall(insn)) || insn.opcode->id == PPC_INST_BLR)
-+            break;
++
++        // A compared register overwritten here held another value when it was compared.
++        for (auto it = compares.begin(); it != compares.end();)
++            it = WritesGpr(insn, it->first) ? compares.erase(it) : std::next(it);
 +    }
 +
 +    if (maskCount != 0)
@@ -339,7 +398,23 @@ index d08371e..7ce2cdd 100644
 +    size_t count = 0;
 +    uint32_t defaultLabel = 0;
 +    if (!FindBound(image, sectionBase, first, index, known, count, defaultLabel))
-+        return TraceResult::Unresolved;
++    {
++        // An absolute table right after the bctr, with no bound in the code,
++        // ends where its first case begins.
++        if (table.type != SWITCH_ABSOLUTE || tableAddress != bctr + 4)
++            return TraceResult::Unresolved;
++        const auto* words = (const be<uint32_t>*)image.Find(tableAddress);
++        uint32_t end = 0xFFFFFFFF;
++        for (count = 0; tableAddress + 4 * count < end && count < 1024; count++)
++        {
++            const uint32_t label = words[count];
++            if (label <= tableAddress + 4 * count)
++                return TraceResult::Unresolved;
++            end = (std::min)(end, label);
++        }
++        if (tableAddress + 4 * count != end)
++            return TraceResult::Unresolved;
++    }
 +
 +    table.labels.resize(count);
 +    for (size_t i = 0; i < table.labels.size(); i++)
@@ -371,7 +446,7 @@ index d08371e..7ce2cdd 100644
  static std::string out;
  
  template<class... Args>
-@@ -305,6 +661,62 @@ int main(int argc, char** argv)
+@@ -305,6 +736,62 @@ int main(int argc, char** argv)
      scanPattern(offsetSwitch, std::size(offsetSwitch), SWITCH_BYTEOFFSET);
      scanPattern(wordOffsetSwitch, std::size(wordOffsetSwitch), SWITCH_SHORTOFFSET);
  
