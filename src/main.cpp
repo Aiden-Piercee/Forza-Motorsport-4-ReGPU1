@@ -6,12 +6,11 @@
 #include "kernel/runtime.h"
 #include "kernel/thread.h"
 #include "loader.h"
-#include "debug.h"
 #include "log.h"
 #include "memory.h"
+#include "regpu/regpu.h"
 
 void CrashHandlerInit();
-void GpuLogState();
 void D3DDebugLog();
 
 int main(int argc, char** argv)
@@ -32,13 +31,6 @@ int main(int argc, char** argv)
         }
     }
     RuntimeInit(gameDir);
-    DebugServerStart(); // FM2_DEBUG=1: tools/fm2ctl.py drives the running game
-    if (getenv("FM2_BOOTSCREEN_PREVIEW"))
-    {
-        void BootScreenPreview();
-        BootScreenPreview();
-        return 0;
-    }
     ThreadSystemInit(g_title.tlsTemplate, g_title.tlsDataSize, g_title.tlsSlotCount);
 
     void StartThreadProfiler();
@@ -65,7 +57,7 @@ int main(int argc, char** argv)
     {
         Log("watchdog:");
         LogGuestThreads();
-        GpuLogState();
+        regpu::LogState();
         D3DDebugLog();
         void LogFileStats();
         LogFileStats();

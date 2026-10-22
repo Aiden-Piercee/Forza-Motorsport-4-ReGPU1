@@ -66,33 +66,41 @@ if(NOT FM4_BUILD_FM2_HOOKS)
 endif()
 list(APPEND FM4_SOURCES "${FM4_GENERATED}/stubs.cpp" "${FM4_GENERATED}/recomp_modules.cpp")
 
-# Upscalers: AMD FidelityFX SDK (MIT) and NVIDIA DLSS SDK, fetched into thirdparty/ (see README).
+# The GPU: ReGPU (thirdparty/ReGPU, MIT), a static library that provides the Vd* imports. It
+# builds against XenonRecomp and the main image's ppc_config.h, and needs the AMD FidelityFX SDK
+# (MIT) for FSR 1; FSR 3 and NVIDIA DLSS are used when their SDKs are in thirdparty/ (see README).
 set(FM4_FFX "${CMAKE_SOURCE_DIR}/thirdparty/fidelityfx/Kits/FidelityFX")
-if(NOT EXISTS "${FM4_FFX}/upscalers/fsr3/include/gpu/fsr1/ffx_fsr1.h")
-    message(FATAL_ERROR "thirdparty/fidelityfx is missing: clone FidelityFX-SDK v2.3.0 there (see README)")
-endif()
-# FSR 1 compute shaders, compiled with fxc at build time and embedded.
-set(FM4_GENERATED "${CMAKE_BINARY_DIR}/generated")
-add_custom_command(OUTPUT "${FM4_GENERATED}/fsr1_cs.h"
-    COMMAND py -3 -I "${CMAKE_SOURCE_DIR}/tools/embed_hlsl.py" "${CMAKE_SOURCE_DIR}/src/gpu/fsr1.hlsl" "${FM4_GENERATED}/fsr1_cs.h"
-            EasuMain,RcasMain,DepthCopyMain,GammaMain,EnhanceMain "${FM4_FFX}/api/internal/gpu" "${FM4_FFX}/upscalers/fsr3/include/gpu/fsr1"
-    DEPENDS "${CMAKE_SOURCE_DIR}/src/gpu/fsr1.hlsl" "${CMAKE_SOURCE_DIR}/tools/embed_hlsl.py"
-    COMMENT "Compiling FSR 1 shaders")
-list(APPEND FM4_SOURCES "${FM4_GENERATED}/fsr1_cs.h")
 set(FM4_DLSS "${CMAKE_SOURCE_DIR}/thirdparty/dlss")
-if(NOT EXISTS "${FM4_DLSS}/include/nvsdk_ngx.h")
-    message(FATAL_ERROR "thirdparty/dlss is missing: clone NVIDIA/DLSS v310.9.16 there (see README)")
+set(REGPU_XENONRECOMP "${CMAKE_SOURCE_DIR}/thirdparty/XenonRecomp")
+set(REGPU_PPC_DIR "${CMAKE_SOURCE_DIR}/out/ppc")
+set(REGPU_FFX "${FM4_FFX}")
+if(EXISTS "${FM4_FFX}/signedbin/amd_fidelityfx_upscaler_dx12.dll")
+    set(REGPU_FSR3 ON)
 endif()
+if(EXISTS "${FM4_DLSS}/include/nvsdk_ngx.h")
+    set(REGPU_DLSS ON)
+    set(REGPU_DLSS_DIR "${FM4_DLSS}")
+endif()
+add_subdirectory(thirdparty/ReGPU)
+
 add_executable(fm4 ${FM4_SOURCES} "${CMAKE_SOURCE_DIR}/src/fm2.rc")
-target_include_directories(fm4 PRIVATE src "${FM4_GENERATED}" "${FM4_DLSS}/include"
+target_include_directories(fm4 PRIVATE src "${FM4_GENERATED}"
     "${CMAKE_SOURCE_DIR}/out/ppc" thirdparty/XenonRecomp/thirdparty/simde)
-target_link_libraries(fm4 PRIVATE "${FM4_DLSS}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib" "${FM4_FFX}/signedbin/amd_fidelityfx_loader_dx12.lib")
-target_include_directories(fm4 PRIVATE "${FM4_FFX}/api/include" "${FM4_FFX}/upscalers/include")
-add_custom_command(TARGET fm4 POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    "${FM4_FFX}/signedbin/amd_fidelityfx_loader_dx12.dll" "${FM4_FFX}/signedbin/amd_fidelityfx_upscaler_dx12.dll" $<TARGET_FILE_DIR:fm4>)
-add_custom_command(TARGET fm4 POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    "${FM4_DLSS}/lib/Windows_x86_64/rel/nvngx_dlss.dll" $<TARGET_FILE_DIR:fm4>)
-target_link_libraries(fm4 PRIVATE ${FM4_PPC_LIBS} XenonUtils synchronization winmm onecore d3d12 dxgi d3dcompiler)
+target_link_libraries(fm4 PRIVATE regpu)
+if(REGPU_FSR3)
+    add_custom_command(TARGET fm4 POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${FM4_FFX}/signedbin/amd_fidelityfx_loader_dx12.dll" "${FM4_FFX}/signedbin/amd_fidelityfx_upscaler_dx12.dll" $<TARGET_FILE_DIR:fm4>)
+endif()
+if(REGPU_DLSS)
+    add_custom_command(TARGET fm4 POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${FM4_DLSS}/lib/Windows_x86_64/rel/nvngx_dlss.dll" $<TARGET_FILE_DIR:fm4>)
+endif()
+# ReGPU compiles the translated shaders with the redistributable d3dcompiler_47.dll beside the exe.
+if(EXISTS "${REGPU_D3DCOMPILER}")
+    add_custom_command(TARGET fm4 POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${REGPU_D3DCOMPILER}" $<TARGET_FILE_DIR:fm4>)
+endif()
+target_link_libraries(fm4 PRIVATE ${FM4_PPC_LIBS} XenonUtils synchronization winmm onecore)
 target_compile_definitions(fm4 PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 target_compile_options(fm4 PRIVATE -gline-tables-only)
 target_link_options(fm4 PRIVATE /STACK:0x1000000 /DEBUG)
@@ -108,8 +116,3 @@ target_include_directories(fm4 PRIVATE "${FM4_FFMPEG}/include")
 target_link_libraries(fm4 PRIVATE "${FM4_FFMPEG}/lib/avcodec.lib" "${FM4_FFMPEG}/lib/avutil.lib")
 file(GLOB FM4_FFMPEG_DLLS "${FM4_FFMPEG}/bin/avcodec-*.dll" "${FM4_FFMPEG}/bin/avutil-*.dll" "${FM4_FFMPEG}/bin/swresample-*.dll")
 add_custom_command(TARGET fm4 POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FM4_FFMPEG_DLLS} $<TARGET_FILE_DIR:fm4>)
-
-# Xenos shader disassembler for captured microcode.
-add_executable(xenos_dis tools/xenos_dis.cpp src/gpu/ucode.cpp src/gpu/hlsl.cpp)
-target_include_directories(xenos_dis PRIVATE src)
-target_link_libraries(xenos_dis PRIVATE d3dcompiler)

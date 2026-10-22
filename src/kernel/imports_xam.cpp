@@ -8,15 +8,13 @@
 #include <fstream>
 #include <vector>
 
-#include "gpu/renderer.h"
-#include "debug.h"
 #include "kernel/imports.h"
 #include "kernel/runtime.h"
 #include "kernel/thread.h"
 #include "kernel/vfs.h"
 #include "live_switch.h"
 #include "loader.h"
-#include "render/presenter.h"
+#include "regpu/regpu.h"
 #include "settings.h"
 
 #include <windows.h>
@@ -399,9 +397,17 @@ bool Key(int vk)
     return GetAsyncKeyState(vk) & 0x8000;
 }
 
+// Keyboard input only counts while one of this process's windows is in front.
+bool GameWindowHasFocus()
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+    return pid == GetCurrentProcessId();
+}
+
 void AddKeyboard(PadState& s)
 {
-    if (!PresenterHasFocus())
+    if (!GameWindowHasFocus())
         return;
     struct Map
     {
@@ -527,10 +533,10 @@ bool ReadPad(uint32_t user, PadState& s)
                         static const char* benchmark = getenv("FM2_BENCHMARK"); // report path
                         if (benchmark)
                         {
-                            BenchmarkRecord(false);
-                            BenchmarkWriteReport(benchmark);
+                            regpu::BenchmarkRecord(false);
+                            regpu::BenchmarkWriteReport(benchmark);
                         }
-                        RendererSaveCaches();
+                        regpu::SaveCaches();
                         Log("tour: finished, caches saved");
                         fflush(nullptr);
                         ExitProcess(0);
@@ -540,14 +546,14 @@ bool ReadPad(uint32_t user, PadState& s)
                     advance = elapsed >= atof(step.c_str() + 5);
                 else if (step == "IDLE")
                 {
-                    advance = elapsed >= 2.0 && RendererCompileIdle();
+                    advance = elapsed >= 2.0 && regpu::CompileIdle();
                 }
                 else if (step.rfind("RT:", 0) == 0)
                 {
                     s.rightTrigger = 255;
                     advance = elapsed >= atof(step.c_str() + 3);
                     // The benchmark measures the race, from 3 s after the throttle is held.
-                    BenchmarkRecord(!advance && elapsed >= 3.0);
+                    regpu::BenchmarkRecord(!advance && elapsed >= 3.0);
                 }
                 else if (step.rfind("LS:", 0) == 0 || step.rfind("RS:", 0) == 0)
                 {
@@ -629,7 +635,7 @@ bool ReadPad(uint32_t user, PadState& s)
                 if (exitAfter >= 0 && now > replay.back().t + exitAfter)
                 {
                     Log("input: replay finished");
-                    RendererSaveCaches();
+                    regpu::SaveCaches();
                     fflush(nullptr);
                     ExitProcess(0);
                 }
@@ -648,8 +654,8 @@ bool ReadPad(uint32_t user, PadState& s)
             }
         }
     }
-    // The debug server's input (debug.cpp) on top of everything else.
-    if (DebugPad d; user == 0 && DebugPadState(d))
+    // The debug server's input (ReGPU, REGPU_DEBUG=1) on top of everything else.
+    if (regpu::DebugPad d; user == 0 && regpu::DebugPadState(d))
     {
         connected = true;
         s.buttons |= d.buttons;

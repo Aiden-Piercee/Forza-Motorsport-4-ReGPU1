@@ -1,6 +1,9 @@
 # FM4 renderer port: translator status and change list
 
-The renderer under `src/gpu` came from Forza-Motorsport-2-ReGPU (MIT, see THIRD_PARTY_NOTICES.md).
+The renderer is now the ReGPU library in `thirdparty/ReGPU` (MIT, game-neutral; the port talks to it
+only through `include/regpu/regpu.h`, see `src/gpu_host.cpp`). The `src/gpu/...` and `tools/shadertest`,
+`tools/edramtest` paths below are in that submodule now. The translator and EDRAM changes listed here
+are library patches, so they stay free of FM4-specific code; FM4 fixes go through the library's hooks.
 This file lists what has changed so far to run FM4 on it, and what still has to change.
 The rules are the same as for the rest of the port. Output must match the 360 one to one: no skipped draws,
 no sizes keyed to one title, and HLSL only (no shader bytecode).

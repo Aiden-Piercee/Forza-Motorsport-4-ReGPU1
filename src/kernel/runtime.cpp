@@ -11,7 +11,6 @@
 #include "kernel/imports.h"
 #include "kernel/thread.h"
 #include "loader.h"
-#include "render/presenter.h"
 #include "settings.h"
 #include "user_dir.h"
 
@@ -62,7 +61,7 @@ double MeasureTsc()
 }
 }
 
-void GpuInit();
+void GpuStart(); // gpu_host.cpp
 void AudioInit();
 
 void RuntimeInit(const std::filesystem::path& gameDir)
@@ -101,8 +100,7 @@ void RuntimeInit(const std::filesystem::path& gameDir)
     std::filesystem::create_directories(g_contentDir, ec);
     std::filesystem::create_directories(DlcDir(), ec);
     Log("runtime: profile %s, saves in %s", GetSettings().profile.c_str(), g_contentDir.string().c_str());
-    PresenterInit();
-    GpuInit();
+    GpuStart();
     AudioInit();
 }
 

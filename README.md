@@ -198,8 +198,9 @@ code (`out/ppc`, ~131 MB) is generated from your own copy and never committed.
 | `FM2_TRACE_VFETCH=1` | Print every translated vertex fetch (format, stride, offset, scale) |
 | `FM2_NO_DIRECT_FETCH=1` | Copy all vertex data instead of reading large buffers in place |
 
-`build/rel/xenos_dis.exe <shaders...>` disassembles captured Xenos microcode;
-`--hlsl` translates and compiles them instead.
+The GPU is the ReGPU library (`thirdparty/ReGPU`). Its tools, including the Xenos
+disassembler and `tools/regpuctl.py` for the debug server (`REGPU_DEBUG=1`), and its
+`REGPU_*` switches are described in its own README and CLAUDE.md.
 
 `tools/callgraph.py` indexes the generated code (`build`, `callers sub_X`,
 `at <address>`); `build/tools/dis.exe <xex> <address> <count>` disassembles.

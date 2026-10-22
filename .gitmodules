@@ -1,3 +1,6 @@
 [submodule "thirdparty/XenonRecomp"]
 	path = thirdparty/XenonRecomp
 	url = https://github.com/hedge-dev/XenonRecomp
+[submodule "thirdparty/ReGPU"]
+	path = thirdparty/ReGPU
+	url = https://github.com/Aiden-Piercee/Forza-Motorsport-4-ReGPU
