@@ -55,6 +55,13 @@ struct Output : IXAudio2VoiceCallback
     void Init()
     {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        // FM2_SILENT=1: no output device (test runs beside a game someone is playing). The title's audio
+        // runs and is paced as usual; its frames are discarded.
+        if (getenv("FM2_SILENT"))
+        {
+            Log("audio: output off (FM2_SILENT); sound is discarded");
+            return;
+        }
         if (FAILED(XAudio2Create(&xaudio, 0, XAUDIO2_DEFAULT_PROCESSOR)) || FAILED(xaudio->CreateMasteringVoice(&master)))
         {
             Log("audio: no output device; sound is discarded");
