@@ -141,6 +141,7 @@ hijack FM4 functions:
   `diagnostics.cpp` (`StartWatch`, an empty `D3DDebugLog`, no-op easter-egg entry points, and
   the idle `g_patchConfig` / `g_cameraAspectWidened` the renderer reads).
 - `src/hooks/fm4/` - FM4 hooks. `fibers.cpp` is FM2's host-fiber implementation behind the
-  macros in `addresses.h`; **it is not built until those six addresses are filled in** (the
-  build prints a message), and the title will not get past its first fiber without them.
+  macros in `addresses.h`; it is **optional and off** until those six addresses are filled in. The ReXGlue fork
+  runs FM4 without fiber replacement, so FM4 may never reach the swap routine; add the hooks
+  if the register-swap routine ever runs (it is the only thing that Fatals).
 

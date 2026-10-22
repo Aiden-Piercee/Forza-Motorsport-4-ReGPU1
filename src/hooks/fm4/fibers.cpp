@@ -188,5 +188,6 @@ PPC_FUNC(FM4_XAPI_FIBER_SWAP_ROUTINE)
 }
 
 #else
-#pragma message("FM4 XAPI fiber hooks are not built: fill in src/hooks/fm4/addresses.h")
+// Optional: the ReXGlue fork plays FM4 without fiber replacement (no [rexcrt] table), so FM4
+// may never reach the swap routine. Fill in src/hooks/fm4/addresses.h if it does.
 #endif
