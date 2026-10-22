@@ -298,12 +298,21 @@ GUEST_EXPORT(RtlRaiseException)
         }
         return;
     }
-    Fatal("guest raised exception %08X at %08X (lr %08llX)", code, LoadBE32(record + 0xC), ctx.lr);
+    // EXCEPTION_RECORD: code, flags, nested record, address, parameter count, parameters.
+    const uint32_t flags = LoadBE32(record + 4), address = LoadBE32(record + 0xC), count = LoadBE32(record + 0x10);
+    char hex[64] = {};
+    for (uint32_t i = 0, n = 0; i < count && i < 4; i++)
+        n += snprintf(hex + n, sizeof(hex) - n, " %08X", LoadBE32(record + 0x14 + i * 4));
+    // The throwing function is the one containing lr; the crash handler's guest stack names it.
+    Fatal("guest raised exception %08X%s flags %08X at %08X, parameters%s (lr %08llX)", code,
+        code == 0xE06D7363 ? " (MSVC C++ throw; guest unwinding is not implemented)" : "", flags, address, hex, ctx.lr);
 }
 
 GUEST_EXPORT(RtlUnwind)
 {
-    Fatal("RtlUnwind called (lr %08llX): guest SEH unwinding is not supported", ctx.lr);
+    // (targetFrame, targetIp, exceptionRecord, returnValue)
+    Fatal("RtlUnwind(frame %08X, ip %08X, record %08X, value %08X) called (lr %08llX): guest SEH unwinding is not supported",
+        ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.lr);
 }
 
 GUEST_EXPORT(__C_specific_handler)
