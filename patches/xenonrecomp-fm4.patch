@@ -1,0 +1,683 @@
+diff --git a/XenonAnalyse/main.cpp b/XenonAnalyse/main.cpp
+index d08371e..5c2a1b7 100644
+--- a/XenonAnalyse/main.cpp
++++ b/XenonAnalyse/main.cpp
+@@ -1,5 +1,9 @@
+ #include <cassert>
++#include <algorithm>
+ #include <iterator>
++#include <unordered_map>
++#include <string_view>
++#include <unordered_set>
+ #include <file.h>
+ #include <disasm.h>
+ #include <image.h>
+@@ -172,6 +176,433 @@ void* SearchMask(const void* source, const uint32_t* compare, size_t compareCoun
+     return nullptr;
+ }
+ 
++// Jump tables the fixed instruction patterns below miss, because the compiler
++// ordered the instructions differently (FM4: lis; rlwinm; addi; lwzx; mtctr;
++// bctr). Works back from a bctr through the registers that feed it, within the
++// straight-line code before it.
++struct TracedInsn
++{
++    ppc_insn insn{};
++    size_t address{};
++};
++
++static bool EndsBlock(const ppc_insn& insn)
++{
++    switch (insn.opcode->id)
++    {
++    case PPC_INST_B:
++    case PPC_INST_BLR:
++    case PPC_INST_BCTR:
++        return true;
++    default:
++        return false;
++    }
++}
++
++static bool StartsWith(std::string_view text, std::string_view prefix)
++{
++    return text.substr(0, prefix.size()) == prefix;
++}
++
++static bool EndsWith(std::string_view text, std::string_view suffix)
++{
++    return text.size() >= suffix.size() && text.substr(text.size() - suffix.size()) == suffix;
++}
++
++// Whether the instruction writes general-purpose register `reg`. Loads and
++// stores with update also write their base register; floating-point and vector
++// instructions number their own registers, and stores, compares, moves to
++// special registers and branches only read theirs.
++static bool WritesGpr(const ppc_insn& insn, uint32_t reg)
++{
++    const std::string_view name = insn.opcode->name;
++    const bool update = (StartsWith(name, "l") || StartsWith(name, "st")) && (EndsWith(name, "u") || EndsWith(name, "ux"));
++    if (update && insn.operands[1] == reg)
++        return true;
++    for (const std::string_view reader : { "st", "cmp", "mt", "b", "dcb", "icb", "tw", "td", "sync", "isync", "eieio", "nop",
++        "f", "lf", "v", "lv", "mffs", "mfvscr", "cr", "mcrf" })
++    {
++        if (StartsWith(name, reader))
++            return false;
++    }
++    return insn.operands[0] == reg;
++}
++
++static bool IsCall(const ppc_insn& insn)
++{
++    switch (insn.opcode->id)
++    {
++    case PPC_INST_BL:
++    case PPC_INST_BCTRL:
++    case PPC_INST_BLRL:
++        return true;
++    default:
++        return false;
++    }
++}
++
++// The nearest instruction before `address` (at most `window` back, within the
++// straight-line code) that writes `reg`.
++static bool FindWriter(const Image& image, size_t address, uint32_t reg, TracedInsn& out, int window = 16)
++{
++    for (int i = 1; i <= window; i++)
++    {
++        const size_t a = address - 4 * i;
++        const auto* code = (const uint32_t*)image.Find(a);
++        if (code == nullptr)
++            return false;
++        ppc_insn insn;
++        ppc::Disassemble(code, a, insn);
++        if (insn.opcode == nullptr || EndsBlock(insn) || IsCall(insn))
++            return false;
++        if (WritesGpr(insn, reg))
++        {
++            out = { insn, a };
++            return true;
++        }
++    }
++    return false;
++}
++
++// The constant a lis/addi/ori chain leaves in `reg` at `address`.
++static bool ConstantOf(const Image& image, size_t address, uint32_t reg, uint32_t& value, size_t& first, int depth = 0)
++{
++    TracedInsn w;
++    if (depth > 4 || !FindWriter(image, address, reg, w))
++        return false;
++    first = (std::min)(first, w.address);
++    switch (w.insn.opcode->id)
++    {
++    case PPC_INST_LIS:
++        value = w.insn.operands[1] << 16;
++        return true;
++    case PPC_INST_LI:
++        value = w.insn.operands[1];
++        return true;
++    case PPC_INST_ADDI:
++        if (!ConstantOf(image, w.address, w.insn.operands[1], value, first, depth + 1))
++            return false;
++        value += w.insn.operands[2];
++        return true;
++    case PPC_INST_ORI:
++        if (!ConstantOf(image, w.address, w.insn.operands[1], value, first, depth + 1))
++            return false;
++        value |= w.insn.operands[2];
++        return true;
++    default:
++        return false;
++    }
++}
++
++// `reg` = index << shift at `address`: the index register and the shift.
++static bool ScaledIndex(const Image& image, size_t address, uint32_t reg, uint32_t shift, uint32_t& index, size_t& first)
++{
++    if (shift == 0)
++    {
++        index = reg;
++        return true;
++    }
++    TracedInsn w;
++    if (!FindWriter(image, address, reg, w) || w.insn.opcode->id != PPC_INST_RLWINM)
++        return false;
++    // rlwinm rA, rS, sh, 0, 31 - sh is slwi rA, rS, sh.
++    if (w.insn.operands[2] != shift || w.insn.operands[3] != 0 || w.insn.operands[4] != 31 - shift)
++        return false;
++    first = (std::min)(first, w.address);
++    index = w.insn.operands[1];
++    return true;
++}
++
++// A table load `op rD, rA, rB`: the table address and the index register.
++static bool TableLoad(const Image& image, const TracedInsn& load, uint32_t shift, uint32_t& table, uint32_t& index, size_t& first)
++{
++    for (int swap = 0; swap < 2; swap++)
++    {
++        const uint32_t base = load.insn.operands[1 + swap];
++        const uint32_t offset = load.insn.operands[2 - swap];
++        size_t f = first;
++        if (base != 0 && ConstantOf(image, load.address, base, table, f) && ScaledIndex(image, load.address, offset, shift, index, f))
++        {
++            first = (std::min)(f, load.address);
++            return true;
++        }
++    }
++    return false;
++}
++
++// The number of entries a table indexed by `index` has, seen from `first`, the
++// table code's first instruction. Uses the smaller of:
++//  - a mask on the index (clrlwi rI, rS, n: 2^(32-n) entries);
++//  - cmplwi crN, rX, count - 1 with a bgt/ble on crN, up to 160 instructions back
++//    in address order, where rX holds the index's value: rI itself, a register
++//    the index was copied from (mr rI, rX), or, in unoptimised code, a register
++//    loaded from the stack slot the index was loaded from (lwz rI, d(r1)).
++//    Scanning stops where the value is overwritten, at a blr, and at a call
++//    while the value is in a volatile register or on the stack.
++// FM4 often masks a byte index and then compares it, so the mask alone would
++// read past the table. Without either, an earlier table on the same index that
++// has `first` as a case gives the bound: a second dispatch reached only from
++// that table shares it.
++static bool FindBound(const Image& image, size_t sectionBase, size_t first, uint32_t index, const std::vector<SwitchTable>& known,
++    size_t& count, uint32_t& defaultLabel)
++{
++    TracedInsn w;
++    size_t maskCount = 0;
++    if (FindWriter(image, first, index, w) && w.insn.opcode->id == PPC_INST_CLRLWI && w.insn.operands[2] >= 24)
++        maskCount = size_t(1) << (32 - w.insn.operands[2]);
++
++    struct Compare
++    {
++        size_t count;
++        uint32_t defaultLabel;
++    };
++    // The target of the bgt/ble on each condition register: the default case.
++    std::unordered_map<uint32_t, uint32_t> branchOnCr;
++    // Bounded compares seen so far, by the register they compare. A compare
++    // counts once the scan reaches where its register got the index's value.
++    std::unordered_map<uint32_t, Compare> compares;
++    auto accept = [&](const Compare& c)
++        {
++            count = maskCount != 0 ? (std::min)(c.count, maskCount) : c.count;
++            defaultLabel = c.defaultLabel;
++            return true;
++        };
++
++    // Where the index's value lives at this point of the scan: a register, or
++    // (once the register's writer has been passed) a stack slot.
++    uint32_t reg = index;
++    bool inSlot = false;
++    uint32_t slot = 0;
++    for (int i = 1; i <= 160 && first - 4 * i >= sectionBase; i++)
++    {
++        const size_t a = first - 4 * i;
++        const auto* code = (const uint32_t*)image.Find(a);
++        if (code == nullptr)
++            break;
++        ppc_insn insn;
++        ppc::Disassemble(code, a, insn);
++        if (insn.opcode == nullptr)
++            continue; // padding or an inline table
++        const uint32_t id = insn.opcode->id;
++        if (id == PPC_INST_BGT || id == PPC_INST_BLE)
++        {
++            branchOnCr[insn.operands[0]] = insn.operands[1];
++            continue;
++        }
++        if (id == PPC_INST_BGTLR || id == PPC_INST_BLELR)
++        {
++            branchOnCr[insn.operands[0]] = 0;
++            continue;
++        }
++        if (id == PPC_INST_CMPLWI)
++        {
++            const auto cr = branchOnCr.find(insn.operands[0]);
++            if (cr != branchOnCr.end())
++            {
++                const Compare c{ size_t(insn.operands[2]) + 1, cr->second };
++                if (!inSlot && insn.operands[1] == reg)
++                    return accept(c);
++                compares[insn.operands[1]] = c;
++            }
++            continue;
++        }
++        if (id == PPC_INST_BLR)
++            break;
++
++        if (inSlot)
++        {
++            // A load of the slot into a compared register.
++            if (id == PPC_INST_LWZ && insn.operands[2] == 1 && insn.operands[1] == slot && compares.count(insn.operands[0]))
++                return accept(compares[insn.operands[0]]);
++            const bool storesToStack = StartsWith(insn.opcode->name, "st") && !EndsWith(insn.opcode->name, "x") && insn.operands[2] == 1;
++            if (IsCall(insn) || WritesGpr(insn, 1) || (storesToStack && int32_t(insn.operands[1]) < int32_t(slot) + 4 &&
++                int32_t(insn.operands[1]) + 8 > int32_t(slot)))
++                break;
++        }
++        else if (WritesGpr(insn, reg))
++        {
++            if (id == PPC_INST_MR)
++            {
++                // The value came from another register.
++                reg = insn.operands[1];
++                if (compares.count(reg))
++                    return accept(compares[reg]);
++            }
++            else if (id == PPC_INST_LWZ && insn.operands[2] == 1)
++            {
++                inSlot = true;
++                slot = insn.operands[1];
++            }
++            else
++            {
++                break;
++            }
++        }
++        else if (IsCall(insn) && (reg == 0 || (reg >= 3 && reg <= 12)))
++        {
++            break;
++        }
++
++        // A compared register overwritten here held another value when it was compared.
++        for (auto it = compares.begin(); it != compares.end();)
++            it = WritesGpr(insn, it->first) ? compares.erase(it) : std::next(it);
++    }
++
++    if (maskCount != 0)
++    {
++        count = maskCount;
++        return true;
++    }
++
++    for (const auto& table : known)
++    {
++        if (table.r == index && std::find(table.labels.begin(), table.labels.end(), first) != table.labels.end())
++        {
++            count = table.labels.size();
++            return true;
++        }
++    }
++    return false;
++}
++
++enum class TraceResult
++{
++    NotATable,
++    Unresolved,
++    Found,
++};
++
++static TraceResult TraceBctr(const Image& image, size_t sectionBase, size_t bctr, const std::vector<SwitchTable>& known, SwitchTable& table)
++{
++    TracedInsn mtctr{};
++    bool foundMtctr = false;
++    for (int i = 1; i <= 4 && !foundMtctr; i++)
++    {
++        const auto* code = (const uint32_t*)image.Find(bctr - 4 * i);
++        ppc::Disassemble(code, bctr - 4 * i, mtctr.insn);
++        if (mtctr.insn.opcode == nullptr || EndsBlock(mtctr.insn))
++            return TraceResult::NotATable;
++        mtctr.address = bctr - 4 * i;
++        foundMtctr = mtctr.insn.opcode->id == PPC_INST_MTCTR;
++    }
++    if (!foundMtctr)
++        return TraceResult::NotATable;
++
++    TracedInsn target;
++    if (!FindWriter(image, mtctr.address, mtctr.insn.operands[0], target))
++        return TraceResult::NotATable;
++
++    size_t first = target.address;
++    uint32_t tableAddress = 0;
++    uint32_t index = 0;
++    uint32_t labelBase = 0;
++    uint32_t shift = 0;
++    if (target.insn.opcode->id == PPC_INST_LWZX)
++    {
++        table.type = SWITCH_ABSOLUTE;
++        if (!TableLoad(image, target, 2, tableAddress, index, first))
++        {
++            // A word-indexed load from a constant table that fails is worth a
++            // warning; a load with another stride (a table of structs holding
++            // function pointers) is an indirect call.
++            uint32_t ignored = 0;
++            size_t f = first;
++            const bool wordIndexed = ScaledIndex(image, target.address, target.insn.operands[1], 2, ignored, f) ||
++                ScaledIndex(image, target.address, target.insn.operands[2], 2, ignored, f);
++            return wordIndexed ? TraceResult::Unresolved : TraceResult::NotATable;
++        }
++    }
++    else if (target.insn.opcode->id == PPC_INST_ADD)
++    {
++        // base + offset[index] (byte or halfword offsets, optionally shifted).
++        bool resolved = false;
++        for (int swap = 0; swap < 2 && !resolved; swap++)
++        {
++            size_t f = first;
++            if (!ConstantOf(image, target.address, target.insn.operands[1 + swap], labelBase, f))
++                continue;
++            TracedInsn offset;
++            if (!FindWriter(image, target.address, target.insn.operands[2 - swap], offset))
++                continue;
++            shift = 0;
++            if (offset.insn.opcode->id == PPC_INST_RLWINM && offset.insn.operands[3] == 0 &&
++                offset.insn.operands[4] == 31 - offset.insn.operands[2])
++            {
++                shift = offset.insn.operands[2];
++                f = (std::min)(f, offset.address);
++                if (!FindWriter(image, offset.address, offset.insn.operands[1], offset))
++                    continue;
++            }
++            if (offset.insn.opcode->id == PPC_INST_LBZX)
++            {
++                table.type = shift != 0 ? SWITCH_COMPUTED : SWITCH_BYTEOFFSET;
++                resolved = TableLoad(image, offset, 0, tableAddress, index, f);
++            }
++            else if (offset.insn.opcode->id == PPC_INST_LHZX && shift == 0)
++            {
++                table.type = SWITCH_SHORTOFFSET;
++                resolved = TableLoad(image, offset, 1, tableAddress, index, f);
++            }
++            if (resolved)
++                first = f;
++        }
++        // An add that does not read a table is some other computed jump.
++        if (!resolved)
++            return TraceResult::NotATable;
++    }
++    else
++    {
++        return TraceResult::NotATable;
++    }
++
++    size_t count = 0;
++    uint32_t defaultLabel = 0;
++    if (!FindBound(image, sectionBase, first, index, known, count, defaultLabel))
++    {
++        // An absolute table right after the bctr, with no bound in the code,
++        // ends where its first case begins.
++        if (table.type != SWITCH_ABSOLUTE || tableAddress != bctr + 4)
++            return TraceResult::Unresolved;
++        const auto* words = (const be<uint32_t>*)image.Find(tableAddress);
++        uint32_t end = 0xFFFFFFFF;
++        for (count = 0; tableAddress + 4 * count < end && count < 1024; count++)
++        {
++            const uint32_t label = words[count];
++            if (label <= tableAddress + 4 * count)
++                return TraceResult::Unresolved;
++            end = (std::min)(end, label);
++        }
++        if (tableAddress + 4 * count != end)
++            return TraceResult::Unresolved;
++    }
++
++    table.labels.resize(count);
++    for (size_t i = 0; i < table.labels.size(); i++)
++    {
++        switch (table.type)
++        {
++        case SWITCH_ABSOLUTE:
++            table.labels[i] = ((const be<uint32_t>*)image.Find(tableAddress))[i];
++            break;
++        case SWITCH_COMPUTED:
++        case SWITCH_BYTEOFFSET:
++            table.labels[i] = labelBase + (uint32_t(((const uint8_t*)image.Find(tableAddress))[i]) << shift);
++            break;
++        case SWITCH_SHORTOFFSET:
++            table.labels[i] = labelBase + ((const be<uint16_t>*)image.Find(tableAddress))[i];
++            break;
++        }
++        // Every case must be code near the jump.
++        const size_t label = table.labels[i];
++        if (label % 4 != 0 || label + 0x40000 < bctr || label > bctr + 0x40000)
++            return TraceResult::Unresolved;
++    }
++    table.base = first;
++    table.r = index;
++    table.defaultLabel = defaultLabel;
++    return TraceResult::Found;
++}
++
+ static std::string out;
+ 
+ template<class... Args>
+@@ -305,6 +736,62 @@ int main(int argc, char** argv)
+     scanPattern(offsetSwitch, std::size(offsetSwitch), SWITCH_BYTEOFFSET);
+     scanPattern(wordOffsetSwitch, std::size(wordOffsetSwitch), SWITCH_SHORTOFFSET);
+ 
++    // Every bctr the patterns above did not cover: trace it back to its table.
++    std::unordered_set<size_t> covered;
++    for (const auto& table : switches)
++    {
++        for (size_t a = table.base; a < table.base + 0x40; a += 4)
++        {
++            ppc_insn insn;
++            ppc::Disassemble((const uint32_t*)image.Find(a), a, insn);
++            if (insn.opcode != nullptr && insn.opcode->id == PPC_INST_BCTR)
++            {
++                covered.insert(a);
++                break;
++            }
++        }
++    }
++    size_t traced = 0;
++    std::vector<size_t> unresolved;
++    println("# ---- TRACED JUMPTABLE ----");
++    // A table bounded by an earlier one is found once that one is known, so
++    // repeat until a pass finds nothing new.
++    for (bool found = true; found;)
++    {
++        found = false;
++        unresolved.clear();
++        for (const auto& section : image.sections)
++        {
++            if (!(section.flags & SectionFlags_Code))
++                continue;
++            // Traces look up to 0x80 bytes back; no table sits at a section's start.
++            for (size_t a = section.base + 0x100; a < section.base + section.size; a += 4)
++            {
++                if (ByteSwap(*(const uint32_t*)(section.data + (a - section.base))) != 0x4E800420 || covered.count(a))
++                    continue;
++                SwitchTable table{};
++                switch (TraceBctr(image, section.base, a, switches, table))
++                {
++                case TraceResult::Found:
++                    printTable(table);
++                    switches.emplace_back(std::move(table));
++                    covered.insert(a);
++                    traced++;
++                    found = true;
++                    break;
++                case TraceResult::Unresolved:
++                    unresolved.push_back(a);
++                    break;
++                case TraceResult::NotATable:
++                    break;
++                }
++            }
++        }
++    }
++    fmt::println("{} jump tables ({} traced from their bctr)", switches.size(), traced);
++    for (size_t a : unresolved)
++        fmt::println("WARNING: bctr at {:X} reads a table that could not be resolved; add it by hand", a);
++
+     std::ofstream f(argv[2]);
+     f.write(out.data(), out.size());
+ 
+diff --git a/XenonRecomp/pch.h b/XenonRecomp/pch.h
+index c9f9a85..b64eaac 100644
+--- a/XenonRecomp/pch.h
++++ b/XenonRecomp/pch.h
+@@ -12,6 +12,7 @@
+ #include <image.h>
+ #include <toml++/toml.hpp>
+ #include <unordered_map>
++#include <set>
+ #include <unordered_set>
+ #include <xbox.h>
+ #include <xxhash.h>
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 94d68ba..b04275b 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -252,6 +252,47 @@ void Recompiler::Analyse()
+     }
+ 
+     std::sort(functions.begin(), functions.end(), [](auto& lhs, auto& rhs) { return lhs.base < rhs.base; });
++
++    // A function must hold every case of its jump tables. .pdata or the sweep
++    // can end it at the bctr, which leaves the cases outside it; grow it through
++    // the functions the cases land in (those stay functions of their own).
++    auto holder = [&](size_t address)
++        {
++            auto it = std::upper_bound(functions.begin(), functions.end(), address, [](size_t a, const Function& f) { return a < f.base; });
++            return it == functions.begin() ? functions.end() : std::prev(it);
++        };
++    size_t grown = 0;
++    for (bool changed = true; changed;)
++    {
++        changed = false;
++        for (const auto& [tableBase, table] : config.switchTables)
++        {
++            auto fn = holder(tableBase);
++            if (fn == functions.end() || tableBase >= fn->base + fn->size)
++                continue;
++            size_t end = fn->base + fn->size;
++            for (size_t label : table.labels)
++            {
++                if (label < fn->base || label < end)
++                    continue;
++                auto target = holder(label);
++                end = (std::max)({ end, label + 4, target->base + target->size });
++            }
++            if (end - (fn->base + fn->size) > 0x10000)
++            {
++                fmt::println("WARNING: jump table at {:X} reaches {:X}, too far past its function {:X}; not growing it", tableBase, end, fn->base);
++                continue;
++            }
++            if (end != fn->base + fn->size)
++            {
++                fn->size = end - fn->base;
++                changed = true;
++                grown++;
++            }
++        }
++    }
++    if (grown != 0)
++        fmt::println("Grew {} functions over the cases of their jump tables", grown);
+ }
+ 
+ bool Recompiler::Recompile(
+@@ -2396,6 +2437,12 @@ bool Recompiler::Recompile(const Function& fn)
+     static std::unordered_set<size_t> labels;
+     labels.clear();
+ 
++    // The bdz/bdnz family always emits a goto. A target outside the function
++    // (a tail branch, or the padding after the last instruction on a path that
++    // never runs) gets a label at the end that leaves the function instead.
++    static std::set<size_t> outsideCtrTargets;
++    outsideCtrTargets.clear();
++
+     for (size_t addr = base; addr < end; addr += 4)
+     {
+         const uint32_t instruction = ByteSwap(*(uint32_t*)((char*)data + addr - base));
+@@ -2405,7 +2452,13 @@ bool Recompiler::Recompile(const Function& fn)
+             if (op == PPC_OP_B)
+                 labels.emplace(addr + PPC_BI(instruction));
+             else if (op == PPC_OP_BC)
+-                labels.emplace(addr + PPC_BD(instruction));
++            {
++                const size_t target = addr + PPC_BD(instruction);
++                labels.emplace(target);
++                const bool decrementsCtr = ((instruction >> 21) & 0x4) == 0;
++                if (decrementsCtr && (target < fn.base || target >= fn.base + fn.size))
++                    outsideCtrTargets.emplace(target);
++            }
+         }
+ 
+         auto switchTable = config.switchTables.find(addr);
+@@ -2543,6 +2596,38 @@ bool Recompiler::Recompile(const Function& fn)
+         ++data;
+     }
+ 
++    // A function whose last instruction can fall through continues in the next
++    // function (FM4 has bodies that XenonAnalyse splits at a .pdata or bl-target
++    // boundary). Continue there, as the guest does. A trap ends the function: the
++    // recompiled trap is a no-op, and running on into the next function would
++    // make it run code the guest never reaches.
++    if (insn.opcode != nullptr)
++    {
++        const uint32_t id = insn.opcode->id;
++        const std::string_view lastName = insn.opcode->name;
++        const bool ends = id == PPC_INST_B || id == PPC_INST_BLR || id == PPC_INST_BCTR || id == PPC_INST_RFI ||
++            lastName.substr(0, 2) == "tw" || lastName.substr(0, 4) == "trap";
++        auto next = image.symbols.find(base);
++        if (!ends && next != image.symbols.end() && next->address == base && next->type == Symbol_Function)
++        {
++            println("	// falls through into {}", next->name);
++            println("	{}(ctx, base);", next->name);
++            println("	return;");
++            fallthroughCount++;
++        }
++    }
++
++    for (size_t target : outsideCtrTargets)
++    {
++        println("loc_{:X}:", target);
++        auto targetSymbol = image.symbols.find(target);
++        if (targetSymbol != image.symbols.end() && targetSymbol->address == target && targetSymbol->type == Symbol_Function)
++            println("\t{}(ctx, base);", targetSymbol->name);
++        else
++            println("\tPPC_CALL_INDIRECT_FUNC(0x{:X});", target);
++        println("\treturn;");
++    }
++
+ #if 0
+     if (insn.opcode == nullptr || (insn.opcode->id != PPC_INST_B && insn.opcode->id != PPC_INST_BCTR && insn.opcode->id != PPC_INST_BLR))
+         fmt::println("Function at {:X} ends prematurely with instruction {} at {:X}", fn.base, insn.opcode != nullptr ? insn.opcode->name : "INVALID", base - 4);
+@@ -2722,6 +2807,7 @@ void Recompiler::Recompile(const std::filesystem::path& headerFilePath)
+     }
+ 
+     SaveCurrentOutData();
++    fmt::println("{} functions fall through into the next function and continue there", fallthroughCount);
+ }
+ 
+ void Recompiler::SaveCurrentOutData(const std::string_view& name)
+diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
+index 8242db5..17a53e9 100644
+--- a/XenonRecomp/recompiler.h
++++ b/XenonRecomp/recompiler.h
+@@ -33,6 +33,7 @@ struct Recompiler
+     std::vector<Function> functions;
+     std::string out;
+     size_t cppFileIndex = 0;
++    size_t fallthroughCount = 0;
+     RecompilerConfig config;
+ 
+     bool LoadConfig(const std::string_view& configFilePath);
+diff --git a/XenonUtils/xex.cpp b/XenonUtils/xex.cpp
+index e6ff10f..e4a5c13 100644
+--- a/XenonUtils/xex.cpp
++++ b/XenonUtils/xex.cpp
+@@ -1,5 +1,6 @@
+ #include "xex.h"
+ #include "image.h"
++#include <algorithm>
+ #include <cassert>
+ #include <cstdio>
+ #include <cstring>
+@@ -181,6 +182,9 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize)
+                 imageSize += blocks[i].dataSize + blocks[i].zeroSize;
+             }
+ 
++            // The blocks can end before the image does (the rest is zero), and
++            // image.size below is the security info's size: cover both.
++            imageSize = std::max<size_t>(imageSize, security->imageSize);
+             result = std::make_unique<uint8_t[]>(imageSize);
+             auto* destData = result.get();
+ 

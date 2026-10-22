@@ -28,16 +28,25 @@ savevmx_14_address = 0x0
 restvmx_64_address = 0x0
 savevmx_64_address = 0x0
 
-# CRT setjmp/longjmp, if the title uses them: mapped to host setjmp/longjmp with
-# the guest context saved and restored around them. Confirm the candidates
-# tools/fm4_config.py lists with tools/xexdump's dis, then set both.
-# setjmp_address = 0x0
-# longjmp_address = 0x0
+# CRT setjmp/longjmp: mapped to host setjmp/longjmp with the guest context saved
+# and restored around them. Found from tools/fm4_config.py's candidates and
+# confirmed in the disassembly: setjmp saves f14-f31, r13-r31, v64+, CR at +304,
+# LR at +308 and r1 at +144, and returns 0. longjmp restores the same layout,
+# turns 0 into 1, and unwinds first when +312 is set. fm4_config.py's own two
+# candidates are not entry points: 0x82768B98 is inside setjmp and 0x82C85588
+# inside SwitchToFiber.
+setjmp_address = 0x82768B30
+longjmp_address = 0x82768700
 
 # Functions XenonRecomp's .pdata/branch analysis gets wrong, each with the reason
 # and the check that found it (tools/fallthrough.py, tools/fm4_crosscheck.py, a
 # runtime trace). Empty until the first recompile has been checked.
 functions = [
+    # SwitchToFiber. .pdata folds it into 0x82C85370 (the new-fiber start thunk
+    # CreateFiber puts in LR), and callers reach it through the stub at
+    # 0x82C82C10 (b 0x82C85380). The fiber hooks replace it, so it needs its
+    # own entry; its last instruction is the b at 0x82C85788.
+    { address = 0x82C85380, size = 0x40C },
 ]
 
 invalid_instructions = [
