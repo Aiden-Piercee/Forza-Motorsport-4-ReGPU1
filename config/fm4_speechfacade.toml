@@ -1,0 +1,46 @@
+# XenonRecomp config for FM4's SpeechFacade_default.xex, sha256
+# 49d506a2f8556836943d8bab3a50b6cd3877524500509ef462fb6e9802f2f4bf.
+# A separate image linked into the same program: symbol_prefix keeps its function
+# names and mapping table (sph_PPCFuncMappings) apart from default.xex's
+# (patches/xenonrecomp-modules.patch). Import names are shared.
+[main]
+file_path = "../game/SpeechFacade_default.xex"
+out_directory_path = "../out/ppc_sph"
+switch_table_file_path = "fm4_speechfacade_switch_tables.toml"
+symbol_prefix = "sph_"
+
+# Registers kept in host locals instead of the guest context (faster), as in FM2.
+# Hooks and the diagnostics read the GPRs and LR from the context, so those stay.
+skip_lr = false
+skip_msr = false
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+cr_as_local = true
+non_argument_as_local = false
+non_volatile_as_local = false
+
+# Register save/restore helpers. tools/fm4_config.py --write fills these in from
+# the xexdump image (0x0: not present in this image).
+restgprlr_14_address = 0x0
+savegprlr_14_address = 0x0
+restfpr_14_address = 0x0
+savefpr_14_address = 0x0
+restvmx_14_address = 0x0
+savevmx_14_address = 0x0
+restvmx_64_address = 0x0
+savevmx_64_address = 0x0
+
+# Functions XenonRecomp's .pdata/branch analysis gets wrong, each with the reason
+# and the check that found it (tools/fallthrough.py, tools/fm4_crosscheck.py, a
+# runtime trace). Empty until the first recompile has been checked.
+functions = [
+]
+
+invalid_instructions = [
+    { data = 0x00000000, size = 4 }, # Padding
+    # Exception data (handler + scope table) placed before functions with
+    # ExceptionFlag set in .pdata.
+    # BEGIN fm4_config.py exception data
+    # END fm4_config.py exception data
+]

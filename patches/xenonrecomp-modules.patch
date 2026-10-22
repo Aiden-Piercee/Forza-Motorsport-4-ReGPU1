@@ -1,0 +1,211 @@
+diff --git a/XenonRecomp/main.cpp b/XenonRecomp/main.cpp
+index 12c6d8c..3a52938 100644
+--- a/XenonRecomp/main.cpp
++++ b/XenonRecomp/main.cpp
+@@ -30,7 +30,7 @@ int main(int argc, char* argv[])
+         auto entry = recompiler.image.symbols.find(recompiler.image.entry_point);
+         if (entry != recompiler.image.symbols.end())
+         {
+-            entry->name = "_xstart";
++            entry->name = recompiler.config.symbolPrefix + "_xstart";
+         }
+ 
+         const char* headerFilePath =
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index fa91527..87b5130 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -104,7 +104,7 @@ void Recompiler::Analyse()
+                 auto& restgpr = functions.emplace_back();
+                 restgpr.base = config.restGpr14Address + (i - 14) * 4;
+                 restgpr.size = (32 - i) * 4 + 12;
+-                image.symbols.emplace(Symbol{ fmt::format("__restgprlr_{}", i), restgpr.base, restgpr.size, Symbol_Function });
++                image.symbols.emplace(Symbol{ config.symbolPrefix + fmt::format("__restgprlr_{}", i), restgpr.base, restgpr.size, Symbol_Function });
+             }
+ 
+             if (config.saveGpr14Address != 0)
+@@ -112,7 +112,7 @@ void Recompiler::Analyse()
+                 auto& savegpr = functions.emplace_back();
+                 savegpr.base = config.saveGpr14Address + (i - 14) * 4;
+                 savegpr.size = (32 - i) * 4 + 8;
+-                image.symbols.emplace(fmt::format("__savegprlr_{}", i), savegpr.base, savegpr.size, Symbol_Function);
++                image.symbols.emplace(config.symbolPrefix + fmt::format("__savegprlr_{}", i), savegpr.base, savegpr.size, Symbol_Function);
+             }
+ 
+             if (config.restFpr14Address != 0)
+@@ -120,7 +120,7 @@ void Recompiler::Analyse()
+                 auto& restfpr = functions.emplace_back();
+                 restfpr.base = config.restFpr14Address + (i - 14) * 4;
+                 restfpr.size = (32 - i) * 4 + 4;
+-                image.symbols.emplace(fmt::format("__restfpr_{}", i), restfpr.base, restfpr.size, Symbol_Function);
++                image.symbols.emplace(config.symbolPrefix + fmt::format("__restfpr_{}", i), restfpr.base, restfpr.size, Symbol_Function);
+             }
+ 
+             if (config.saveFpr14Address != 0)
+@@ -128,7 +128,7 @@ void Recompiler::Analyse()
+                 auto& savefpr = functions.emplace_back();
+                 savefpr.base = config.saveFpr14Address + (i - 14) * 4;
+                 savefpr.size = (32 - i) * 4 + 4;
+-                image.symbols.emplace(fmt::format("__savefpr_{}", i), savefpr.base, savefpr.size, Symbol_Function);
++                image.symbols.emplace(config.symbolPrefix + fmt::format("__savefpr_{}", i), savefpr.base, savefpr.size, Symbol_Function);
+             }
+ 
+             if (config.restVmx14Address != 0)
+@@ -136,7 +136,7 @@ void Recompiler::Analyse()
+                 auto& restvmx = functions.emplace_back();
+                 restvmx.base = config.restVmx14Address + (i - 14) * 8;
+                 restvmx.size = (32 - i) * 8 + 4;
+-                image.symbols.emplace(fmt::format("__restvmx_{}", i), restvmx.base, restvmx.size, Symbol_Function);
++                image.symbols.emplace(config.symbolPrefix + fmt::format("__restvmx_{}", i), restvmx.base, restvmx.size, Symbol_Function);
+             }
+ 
+             if (config.saveVmx14Address != 0)
+@@ -144,7 +144,7 @@ void Recompiler::Analyse()
+                 auto& savevmx = functions.emplace_back();
+                 savevmx.base = config.saveVmx14Address + (i - 14) * 8;
+                 savevmx.size = (32 - i) * 8 + 4;
+-                image.symbols.emplace(fmt::format("__savevmx_{}", i), savevmx.base, savevmx.size, Symbol_Function);
++                image.symbols.emplace(config.symbolPrefix + fmt::format("__savevmx_{}", i), savevmx.base, savevmx.size, Symbol_Function);
+             }
+         }
+ 
+@@ -155,7 +155,7 @@ void Recompiler::Analyse()
+                 auto& restvmx = functions.emplace_back();
+                 restvmx.base = config.restVmx64Address + (i - 64) * 8;
+                 restvmx.size = (128 - i) * 8 + 4;
+-                image.symbols.emplace(fmt::format("__restvmx_{}", i), restvmx.base, restvmx.size, Symbol_Function);
++                image.symbols.emplace(config.symbolPrefix + fmt::format("__restvmx_{}", i), restvmx.base, restvmx.size, Symbol_Function);
+             }
+ 
+             if (config.saveVmx64Address != 0)
+@@ -163,7 +163,7 @@ void Recompiler::Analyse()
+                 auto& savevmx = functions.emplace_back();
+                 savevmx.base = config.saveVmx64Address + (i - 64) * 8;
+                 savevmx.size = (128 - i) * 8 + 4;
+-                image.symbols.emplace(fmt::format("__savevmx_{}", i), savevmx.base, savevmx.size, Symbol_Function);
++                image.symbols.emplace(config.symbolPrefix + fmt::format("__savevmx_{}", i), savevmx.base, savevmx.size, Symbol_Function);
+             }
+         }
+     }
+@@ -171,7 +171,7 @@ void Recompiler::Analyse()
+     for (auto& [address, size] : config.functions)
+     {
+         functions.emplace_back(address, size);
+-        image.symbols.emplace(fmt::format("sub_{:X}", address), address, size, Symbol_Function);
++        image.symbols.emplace(config.symbolPrefix + fmt::format("sub_{:X}", address), address, size, Symbol_Function);
+     }
+ 
+     auto& pdata = *image.Find(".pdata");
+@@ -189,7 +189,7 @@ void Recompiler::Analyse()
+             f.base = fn.BeginAddress;
+             f.size = fn.FunctionLength * 4;
+ 
+-            image.symbols.emplace(fmt::format("sub_{:X}", f.base), f.base, f.size, Symbol_Function);
++            image.symbols.emplace(config.symbolPrefix + fmt::format("sub_{:X}", f.base), f.base, f.size, Symbol_Function);
+         }
+     }
+ 
+@@ -214,7 +214,7 @@ void Recompiler::Analyse()
+                 {
+                     auto data = section.data + address - section.base;
+                     auto& fn = functions.emplace_back(Function::Analyze(data, section.base + section.size - address, address));
+-                    image.symbols.emplace(fmt::format("sub_{:X}", fn.base), fn.base, fn.size, Symbol_Function);
++                    image.symbols.emplace(config.symbolPrefix + fmt::format("sub_{:X}", fn.base), fn.base, fn.size, Symbol_Function);
+                 }
+             }
+             data += 4;
+@@ -243,7 +243,7 @@ void Recompiler::Analyse()
+             else
+             {
+                 auto& fn = functions.emplace_back(Function::Analyze(data, dataEnd - data, base));
+-                image.symbols.emplace(fmt::format("sub_{:X}", fn.base), fn.base, fn.size, Symbol_Function);
++                image.symbols.emplace(config.symbolPrefix + fmt::format("sub_{:X}", fn.base), fn.base, fn.size, Symbol_Function);
+ 
+                 base += fn.size;
+                 data += fn.size;
+@@ -2378,7 +2378,7 @@ bool Recompiler::Recompile(const Function& fn)
+     }
+     else
+     {
+-        name = fmt::format("sub_{}", fn.base);
++        name = config.symbolPrefix + fmt::format("sub_{:X}", fn.base);
+     }
+ 
+ #ifdef XENON_RECOMP_USE_ALIAS
+@@ -2592,7 +2592,7 @@ void Recompiler::Recompile(const std::filesystem::path& headerFilePath)
+     {
+         println("#include \"ppc_recomp_shared.h\"\n");
+ 
+-        println("PPCFuncMapping PPCFuncMappings[] = {{");
++        println("PPCFuncMapping {}PPCFuncMappings[] = {{", config.symbolPrefix);
+         for (auto& symbol : image.symbols)
+             println("\t{{ 0x{:X}, {} }},", symbol.address, symbol.name);
+ 
+diff --git a/XenonRecomp/recompiler_config.cpp b/XenonRecomp/recompiler_config.cpp
+index 81330a4..aaf9282 100644
+--- a/XenonRecomp/recompiler_config.cpp
++++ b/XenonRecomp/recompiler_config.cpp
+@@ -17,6 +17,7 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
+         patchedFilePath = main["patched_file_path"].value_or<std::string>("");
+         outDirectoryPath = main["out_directory_path"].value_or<std::string>("");
+         switchTableFilePath = main["switch_table_file_path"].value_or<std::string>("");
++        symbolPrefix = main["symbol_prefix"].value_or<std::string>("");
+ 
+         skipLr = main["skip_lr"].value_or(false);
+         skipMsr = main["skip_msr"].value_or(false);
+diff --git a/XenonRecomp/recompiler_config.h b/XenonRecomp/recompiler_config.h
+index 534e503..02883e8 100644
+--- a/XenonRecomp/recompiler_config.h
++++ b/XenonRecomp/recompiler_config.h
+@@ -30,6 +30,10 @@ struct RecompilerConfig
+     std::string patchedFilePath;
+     std::string outDirectoryPath;
+     std::string switchTableFilePath;
++    // Prepended to every function name the analyser creates and to the
++    // PPCFuncMappings table, so several images can be linked into one
++    // program. Import names (__imp__*) are not prefixed.
++    std::string symbolPrefix;
+     std::unordered_map<uint32_t, RecompilerSwitchTable> switchTables;
+     bool skipLr = false;
+     bool ctrAsLocalVariable = false;
+diff --git a/XenonUtils/xex.cpp b/XenonUtils/xex.cpp
+index 4e79042..e6ff10f 100644
+--- a/XenonUtils/xex.cpp
++++ b/XenonUtils/xex.cpp
+@@ -1,6 +1,7 @@
+ #include "xex.h"
+ #include "image.h"
+ #include <cassert>
++#include <cstdio>
+ #include <cstring>
+ #include <vector>
+ #include <unordered_map>
+@@ -324,6 +325,7 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize)
+                 names = &XboxKernelExports;
+             }
+ 
++            size_t unnamedThunks = 0;
+             for (size_t im = 0; im < library->numberOfImports; im++)
+             {
+                 auto originalThunk = (Xex2ThunkData*)image.Find(descriptors[im].firstThunk);
+@@ -338,10 +340,20 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize)
+                     {
+                         image.symbols.insert({ name->second, descriptors[im].firstThunk, sizeof(thunk), Symbol_Function });
+                     }
++                    else
++                    {
++                        ++unnamedThunks;
++                    }
+ 
+                     memcpy(originalThunk, thunk, sizeof(thunk));
+                 }
+             }
++            // Function imports without a name are replaced by a no-op thunk: make that visible.
++            if (unnamedThunks != 0)
++            {
++                fprintf(stderr, "WARNING: %zu function imports from %.*s have no name and become no-op thunks\n",
++                    unnamedThunks, int(stringTable[i].size()), stringTable[i].data());
++            }
+             library = (Xex2ImportLibrary*)((char*)(library + 1) + library->numberOfImports * sizeof(Xex2ImportDescriptor));
+         }
+     }

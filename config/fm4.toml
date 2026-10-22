@@ -1,0 +1,49 @@
+# XenonRecomp config for Forza Motorsport 4 (4D530910), Europe Game of the Year
+# default.xex, sha256 b34dfb88978819cccda6dafd755e7139970a58fbf6707dfbcba06846857f52bd.
+# Paths are relative to this file. See docs/FM4-RECOMPILE.md.
+[main]
+file_path = "../game/default.xex"
+out_directory_path = "../out/ppc"
+switch_table_file_path = "fm4_switch_tables.toml"
+
+# Registers kept in host locals instead of the guest context (faster), as in FM2.
+# Hooks and the diagnostics read the GPRs and LR from the context, so those stay.
+skip_lr = false
+skip_msr = false
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+cr_as_local = true
+non_argument_as_local = false
+non_volatile_as_local = false
+
+# Register save/restore helpers. tools/fm4_config.py --write fills these in from
+# the xexdump image (0x0: not present in this image).
+restgprlr_14_address = 0x0
+savegprlr_14_address = 0x0
+restfpr_14_address = 0x0
+savefpr_14_address = 0x0
+restvmx_14_address = 0x0
+savevmx_14_address = 0x0
+restvmx_64_address = 0x0
+savevmx_64_address = 0x0
+
+# CRT setjmp/longjmp, if the title uses them: mapped to host setjmp/longjmp with
+# the guest context saved and restored around them. Confirm the candidates
+# tools/fm4_config.py lists with tools/xexdump's dis, then set both.
+# setjmp_address = 0x0
+# longjmp_address = 0x0
+
+# Functions XenonRecomp's .pdata/branch analysis gets wrong, each with the reason
+# and the check that found it (tools/fallthrough.py, tools/fm4_crosscheck.py, a
+# runtime trace). Empty until the first recompile has been checked.
+functions = [
+]
+
+invalid_instructions = [
+    { data = 0x00000000, size = 4 }, # Padding
+    # Exception data (handler + scope table) placed before functions with
+    # ExceptionFlag set in .pdata.
+    # BEGIN fm4_config.py exception data
+    # END fm4_config.py exception data
+]
