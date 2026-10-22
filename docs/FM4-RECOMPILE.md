@@ -151,6 +151,10 @@ Milestone 1 is done when step 7 prints `ok`, the logs have no unhandled
 instructions, and every fallthrough and cross-check entry is either fixed in the
 config or explained.
 
+`docs/FM4-RECOMPILE-REVIEW.md` records the results of this review for the
+Europe GOTY disc. Every remaining fallthrough and cross-check entry is
+explained there.
+
 ## What to keep, what never to commit
 
 Commit `config/*.toml`, including the generated switch tables, which hold
