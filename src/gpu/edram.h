@@ -75,6 +75,12 @@ struct SurfaceKey
     bool operator!=(const SurfaceKey& o) const { return !(*this == o); }
 };
 
+// A layout packed for the transfer shader's constants (gpu/edram_transfer_hlsl.h).
+inline uint32_t TransferInfo(const SurfaceKey& k)
+{
+    return k.baseTiles | k.PitchTiles() << 11 | k.msaa << 22 | uint32_t(k.Is64bpp()) << 24 | (k.format & 15) << 26;
+}
+
 struct Rect
 {
     int32_t left = 0, top = 0, right = 0, bottom = 0;

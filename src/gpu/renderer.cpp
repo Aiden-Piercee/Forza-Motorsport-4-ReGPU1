@@ -55,6 +55,8 @@
 #include "gpu/shader_scan.h"
 #include "gpu/boot_screen.h"
 #include "gpu/static_shaders.h"
+#include "gpu/edram.h"
+#include "gpu/edram_targets.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -958,6 +960,26 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
 
 void InitPipelineLibrary(ID3D12Device* device);
 
+// The EDRAM render target cache (gpu/edram_targets.h), started by REGPU_EDRAM_TARGETS=1
+// (REGPU_EDRAM_SCALE=1..4 its resolution scale). Until draws are bound to its targets, it runs
+// beside the screen-space surfaces, which still draw: each draw's targets are created and
+// claimed and the transfers recorded, to bring the cache up without changing the picture.
+// Startup only: the ownership it tracks depends on every draw since the start.
+edram::TargetCache g_edramTargets;
+bool g_edramTargetsOn = false;
+
+void InitEdramTargets()
+{
+    const char* on = getenv("REGPU_EDRAM_TARGETS");
+    if (!on || !atoi(on))
+        return;
+    const char* scale = getenv("REGPU_EDRAM_SCALE");
+    const uint32_t s = scale ? uint32_t(std::clamp(atoi(scale), 1, 4)) : 1u;
+    g_edramTargetsOn = g_edramTargets.Init(g_r.device, s, s);
+    if (!g_edramTargetsOn)
+        Log("renderer: the EDRAM render target cache did not start; screen-space surfaces only");
+}
+
 void Init()
 {
     g_r.device = RenderDevice();
@@ -1101,6 +1123,7 @@ void Init()
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     Check(d->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_r.blitRtvHeap)), "CreateDescriptorHeap(blit rtv)");
     InitDepthBlit();
+    InitEdramTargets();
     g_r.readback = CreateBuffer(UINT64((OutputWidth() * 4 + 255) & ~255u) * OutputHeight(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
 
     kRingSize = (getenv("FM2_RING_MB") ? std::clamp<UINT64>(UINT64(atoi(getenv("FM2_RING_MB"))), 16, 2048) : g_r.physical && !getenv("FM2_NO_DIRECT_FETCH") ? 64 : 384) << 20;
@@ -1229,6 +1252,54 @@ void SelectSurfaces(bool force)
     TransitionColor(D3D12_RESOURCE_STATE_RENDER_TARGET);
     C().list->OMSetRenderTargets(1, &C().rtv, FALSE, &C().dsv);
     g_drawState.motionTargets = false;
+}
+
+// This draw's render targets in the EDRAM target cache (see InitEdramTargets).
+void UpdateEdramTargets(const CompiledShader& ps)
+{
+    edram::PassRegisters r;
+    r.surfaceInfo = gpureg::Get(RB_SURFACE_INFO);
+    r.colorInfo[0] = gpureg::Get(RB_COLOR_INFO);
+    for (uint32_t i = 1; i < 4; i++)
+        r.colorInfo[i] = gpureg::Get(0x2002 + i); // RB_COLOR1..3_INFO
+    r.depthInfo = gpureg::Get(RB_DEPTH_INFO);
+    r.modeControl = gpureg::Get(RB_MODECONTROL);
+    r.colorMask = gpureg::Get(RB_COLOR_MASK);
+    r.depthControl = gpureg::Get(RB_DEPTHCONTROL);
+    r.windowOffset = gpureg::Get(PA_SC_WINDOW_OFFSET);
+    r.scissorTL = gpureg::Get(PA_SC_WINDOW_SCISSOR_TL);
+    r.scissorBR = gpureg::Get(PA_SC_WINDOW_SCISSOR_BR);
+    r.screenScissorTL = gpureg::Get(0x200E); // PA_SC_SCREEN_SCISSOR_TL
+    r.screenScissorBR = gpureg::Get(0x200F); // PA_SC_SCREEN_SCISSOR_BR
+    r.modeCntl = gpureg::Get(PA_SU_SC_MODE_CNTL);
+    r.vteCntl = gpureg::Get(PA_CL_VTE_CNTL);
+    r.vtxCntl = gpureg::Get(0x2302); // PA_SU_VTX_CNTL
+    r.viewportYScale = RegFloat(PA_CL_VPORT_YSCALE);
+    r.viewportYOffset = RegFloat(PA_CL_VPORT_YOFFSET);
+    r.psColorTargets = ps.info.colorTargetsWritten;
+    const edram::Pass pass = edram::DescribePass(r);
+    if (!pass.used)
+        return;
+    edram::RecordContext rc;
+    rc.list = C().list;
+    rc.descriptors = [](uint32_t count, D3D12_CPU_DESCRIPTOR_HANDLE& cpu, D3D12_GPU_DESCRIPTOR_HANDLE& gpu) {
+        FrameResources& f = Frame();
+        if (f.descriptorsUsed + count > kDescriptorsPerFrame)
+            return false;
+        const UINT slot = f.descriptorBase + f.descriptorsUsed;
+        f.descriptorsUsed += count;
+        cpu = Cpu(g_r.srvHeap.Get(), slot, g_r.srvStride);
+        gpu = Gpu(g_r.srvHeap.Get(), slot, g_r.srvStride);
+        return true;
+    };
+    edram::HostTarget* targets[5];
+    if (g_edramTargets.Update(pass, rc, targets))
+    {
+        // Back to the screen-space surfaces and the draw's root signature (as after a resolve blit).
+        C().list->OMSetRenderTargets(1, &C().rtv, FALSE, &C().dsv);
+        C().list->SetGraphicsRootSignature(g_r.rootSignature.Get());
+        g_drawState.Invalidate();
+    }
 }
 
 // Bindless texture descriptors: one per (resource, format, dimension), kept
@@ -5759,7 +5830,8 @@ uint32_t RendererDrawWorkers()
 
 bool RendererParallelReady()
 {
-    return RendererDrawWorkers() > 0 && g_r.ok && GameSettled() && GetSettings().upscaler == Settings::Upscaler::Off && !RendererTracing();
+    // (The EDRAM target cache's ownership follows draw order: one thread records.)
+    return RendererDrawWorkers() > 0 && !g_edramTargetsOn && g_r.ok && GameSettled() && GetSettings().upscaler == Settings::Upscaler::Off && !RendererTracing();
 }
 
 bool RendererIsResolveDraw()
@@ -6075,6 +6147,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     BeginFrameIfNeeded();
     SelectSurfaces(false);
+    if (g_edramTargetsOn)
+        UpdateEdramTargets(ps);
     // Temporal upscaling: the main view's draws in the scene also write motion vectors (their
     // shaders' motion variants, once compiled; until then the draw has no motion).
     const bool cullable = (initiator & 0x3F) != 8 && (initiator & 0x3F) != 1;
@@ -6955,6 +7029,13 @@ void RendererOnSwap(uint64_t frameNumber, uint32_t frontBuffer)
         if (perf && (g_scanPrefound || g_scanMissed))
             Log("perf:   new shaders at draw time: %u already found by scan, %u not", g_scanPrefound, g_scanMissed);
         g_scanPrefound = g_scanMissed = 0;
+        if (g_edramTargetsOn)
+        {
+            const edram::TargetCache::Stats es = g_edramTargets.TakeStats();
+            if (es.targetsCreated || es.transfers || es.skipped)
+                Log("edram: %llu targets created, %llu transfers (%llu tiles), %llu skipped", (unsigned long long)es.targetsCreated,
+                    (unsigned long long)es.transfers, (unsigned long long)es.transferTiles, (unsigned long long)es.skipped);
+        }
         if (perf && g_skippedPipeline)
             Log("perf:   draws skipped waiting for pipelines: %u", g_skippedPipeline);
         g_skippedPipeline = 0;

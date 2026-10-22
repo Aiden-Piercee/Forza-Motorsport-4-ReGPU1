@@ -86,10 +86,30 @@ change behaviour. Most of the remaining ~111 `FM2_*` names are debug switches th
    *Status:* the platform-independent core is in `src/gpu/edram.{h,cpp}` and is tested by `tools/edramtest`.
    It covers register decode, pitch and height in tiles, the window/screen scissor, the rows a draw can reach
    (scissor and viewport), the per-target tile ranges for MRT and depth, and the ownership map that
-   produces transfers. Still to do, with a Windows run to check each step:
-   1. A host render-target cache keyed by `SurfaceKey`.
-   2. Transfer shaders: colour to colour across MSAA modes and formats, depth to colour and colour to depth,
-      with the stencil reference.
+   produces transfers. The wiring steps:
+   1. *Written, not yet run on Windows.* A host render-target cache keyed by `SurfaceKey`
+      (`src/gpu/edram_targets.{h,cpp}`).
+      - Each target is one typeless resource at guest MSAA and the resolution scale, with a typed view
+        for draws and a `_UINT` view for transfers.
+      - Host formats: 8888 as RGBA8, 2_10_10_10 as RGB10A2, 7e3 as RGBA16F (exact), 16_16(_16_16) as snorm16,
+        the float formats as themselves, depth as D32_FLOAT_S8X24.
+   2. *Written, not yet run on Windows.* The transfer shader (`src/gpu/edram_transfer_hlsl.h`). Each destination
+      sample finds its EDRAM dwords and the source sample holding each one. It converts source host value ->
+      guest bits -> destination host value. That covers any pair of colour/depth formats, 32/64 bpp and MSAA
+      modes, and the resolution scale.
+      - Stencil goes through `SV_StencilRef` where the device supports it, otherwise one pass per bit.
+      - Transfers run only for tiles that another layout wrote last, so a layout redrawing its own tiles
+        costs nothing.
+      - `tools/edramtest` runs it on lavapipe and checks the sample mapping against an EDRAM filled forwards
+        (5 layout pairs, including wrap and scale 2). It also checks that every format keeps its bits: all 2^24
+        depths in both encodings, every 7e3 value, and the raw formats. All 60 shader variants compile with dxc;
+        fxc is still to be checked on Windows.
+      - With `REGPU_EDRAM_TARGETS=1` the renderer runs the cache beside its screen-space surfaces. Draws still
+        go to the old surfaces; each draw's targets are created and claimed and its transfers recorded.
+        Statistics are logged as `edram: ...`. The default path is unchanged. Draw workers are off while it runs,
+        because ownership follows draw order.
+      - Known gaps: depth reinterpreted between D24S8 and D24FS8 loses precision (Xenia keeps a second host depth
+        for that). Host sample positions are the standard D3D ones, not the Xenos ones.
    3. Draws bound to the pass's targets, with the viewport and scissor in EDRAM space.
    4. Resolves that read the owner of the source tiles.
    5. Clears that claim tiles.
@@ -121,5 +141,9 @@ change behaviour. Most of the remaining ~111 `FM2_*` names are debug switches th
    that return real counts. Handle COND_EXEC and bin predication in general.
 8. **PM4 and EDRAM modes (G7, D2, G5).** Log each unhandled opcode once and implement the ones FM4 uses.
    Support EDRAM modes other than 4, 5 and 6.
-9. **Display mode and present (S9-S11).** Take the front buffer size and format from the swap packet,
+9. **Never drop a draw when the upload ring is full (D3).** Today `RingAlloc` failing drops the draw (logged as
+   `ring full`), which breaks 1:1. Grow the frame's ring: allocate the next buffer and continue there; the views
+   that address the ring (`gmem`, root CBVs) are per draw. The alternative is to submit the list and wait for
+   the GPU before reusing the ring. Either needs a Windows run.
+10. **Display mode and present (S9-S11).** Take the front buffer size and format from the swap packet,
    and the display mode from the title config.
