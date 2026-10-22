@@ -216,11 +216,21 @@ void ResumeGuestThread(GuestThread& thread)
 
 int SuspendGuestThread(GuestThread& thread)
 {
-    // Only threads that have not started yet can be suspended for real;
-    // the title only does this at creation time.
-    std::lock_guard lock(thread.suspendMutex);
-    LOG_ONCE("SuspendGuestThread on a running thread is not implemented");
-    return thread.suspendCount++;
+    std::unique_lock lock(thread.suspendMutex);
+    const int previous = thread.suspendCount++;
+    if (&thread == t_thread)
+    {
+        // A thread suspending itself stops here until another thread resumes it, as on the
+        // console (XMediaFacade's workers park themselves this way between jobs).
+        thread.suspendCv.wait(lock, [&] { return thread.suspendCount <= 0; });
+    }
+    else if (thread.ctx)
+    {
+        // Threads that have not started yet wait for the count in HostThreadMain. Stopping another
+        // running thread at an arbitrary point is not implemented.
+        LOG_ONCE("SuspendGuestThread on another running thread (%u) is not implemented", thread.id);
+    }
+    return previous;
 }
 
 void ExitCurrentGuestThread(uint32_t code)
