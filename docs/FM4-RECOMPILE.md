@@ -32,10 +32,26 @@ bctr`), so XenonAnalyse's fixed patterns found none of its tables. The patch add
 a pass that starts from every remaining `bctr` and traces back through the
 registers that feed it. It resolves absolute, byte-offset, shifted byte-offset
 and halfword-offset tables, and checks that every case is code near the jump.
-Any `bctr` that reads a table it cannot resolve is printed as a warning, to be
+The table's size is the smaller of a `clrlwi` mask on the index and a
+`cmplwi`/`bgt` on the index's value. That value may sit in the register the
+index was copied from, or in the stack slot it was loaded from in unoptimised
+code. Without a bound, an inline table ends where its first case starts, and a
+second dispatch reached from an earlier table takes that table's size. Any
+`bctr` that reads a table it cannot resolve is printed as a warning, to be
 added by hand. The patch also makes the loader allocate the whole image for
 basic-compressed XEX files: before, it allocated only the summed block size,
 which left the zero tail outside the buffer.
+
+`patches/xenonrecomp-fm4-instructions.patch` adds the instructions FM4 uses
+that upstream XenonRecomp does not emit: update-form loads and stores, the
+`bdzf`/`bso` family of branches, CR logic, carry arithmetic, the record (`.`)
+forms of several rotates, multiplies and vector compares, and a set of VMX and
+VMX128 operations. It also decodes primary opcode 4 words with bit 4 set as
+`vsldoi128`; the disassembler otherwise reads them as PPC405 multiply-accumulate
+instructions, which the Xenon does not have. `tools/xenonrecomp-tests` checks
+each added instruction against independently computed results, on a small XEX
+built from hand-encoded instructions (`sh tools/xenonrecomp-tests/run_tests.sh`
+with clang++; `mutate.py` then checks that the harness catches planted bugs).
 
 Each image builds as its own static library with its own `ppc_config.h`.
 `tools/genmodules.py` writes the table the loader uses, declared in
@@ -54,13 +70,14 @@ LLVM (clang-cl), CMake, Ninja, Python 3.11 or newer as `py -3`, and Git Bash for
    mklink /J game E:\Forza-4-compiling-stuff\extracted
    ```
 
-2. Apply the three XenonRecomp patches, in this order, and build the tools:
+2. Apply the four XenonRecomp patches, in this order, and build the tools:
 
    ```
    git submodule update --init --recursive
    git -C thirdparty/XenonRecomp apply ../../patches/xenonrecomp-fm2.patch
    git -C thirdparty/XenonRecomp apply ../../patches/xenonrecomp-modules.patch
    git -C thirdparty/XenonRecomp apply ../../patches/xenonrecomp-fm4.patch
+   git -C thirdparty/XenonRecomp apply ../../patches/xenonrecomp-fm4-instructions.patch
    tools\vcenv.cmd cmake -S tools/xexdump -B build/tools -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
    ```
 

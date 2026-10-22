@@ -1,0 +1,55 @@
+#pragma once
+// Force-included into the recompiled test code; stand-ins for the port's ppc_hooks.h.
+#include <cstdint>
+
+struct PPCContext;
+
+inline void PPCMsrChanged(PPCContext&, uint64_t) {}
+#define PPC_MSR_CHANGED(ctx, oldMsr)                       \
+    do                                                     \
+    {                                                      \
+        if (((oldMsr) ^ (ctx).msr) & 0x8000)               \
+            PPCMsrChanged((ctx), (oldMsr));                \
+    } while (0)
+
+inline float ppc_half_to_float(uint16_t h)
+{
+    uint32_t sign = uint32_t(h & 0x8000) << 16;
+    uint32_t exp = (h >> 10) & 0x1F, man = h & 0x3FF, bits;
+    if (exp == 0)
+    {
+        if (man == 0) bits = sign;
+        else
+        {
+            exp = 113;
+            while (!(man & 0x400)) { man <<= 1; exp--; }
+            bits = sign | (exp << 23) | ((man & 0x3FF) << 13);
+        }
+    }
+    else if (exp == 31) bits = sign | 0x7F800000 | (man << 13);
+    else bits = sign | ((exp + 112) << 23) | (man << 13);
+    float f;
+    __builtin_memcpy(&f, &bits, 4);
+    return f;
+}
+
+inline uint16_t ppc_float_to_half(float f)
+{
+    uint32_t bits;
+    __builtin_memcpy(&bits, &f, 4);
+    uint16_t sign = uint16_t((bits >> 16) & 0x8000);
+    uint32_t a = bits & 0x7FFFFFFF;
+    if (a > 0x477FE000) return sign | 0x7FFF;
+    if (a < 0x38800000)
+    {
+        uint32_t e = a >> 23;
+        if (e < 103) return sign;
+        return sign | uint16_t(((a & 0x7FFFFF) | 0x800000) >> (126 - e));
+    }
+    return sign | uint16_t((a - 0x38000000) >> 13);
+}
+
+// bsoctr/bnsctr: the harness maps guest addresses to recompiled functions.
+using PPCHostFunc = void(PPCContext&, uint8_t*);
+PPCHostFunc* TestLookupIndirect(uint32_t address);
+#define PPC_CALL_INDIRECT_FUNC(x) (TestLookupIndirect(uint32_t(x)))(ctx, base)
