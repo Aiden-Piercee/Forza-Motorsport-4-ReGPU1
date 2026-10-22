@@ -112,10 +112,14 @@ LLVM (clang-cl), CMake, Ninja, Python 3.11 or newer as `py -3`, and Git Bash for
    ```
 
    Read `out/<name>.recomp.log` for "Unrecognized instruction" and jump-table
-   messages, and `out/<name>.fallthrough.txt` for functions whose last instruction
-   can run into the next function. Each real case goes into the config's
-   `functions` list with its reason, or, for an unhandled instruction, into a new
-   XenonRecomp patch. This step also regenerates `src/kernel/stubs.cpp` from all
+   messages. A function whose last instruction can run into the next function
+   calls that function and returns, as the guest continues there; the log counts
+   them. `out/<name>.fallthrough.txt` lists the functions that run off their end
+   into something that is not a function, such as padding after a call that
+   never returns. Each real case goes into the config's `functions` list with its
+   reason, or, for an unhandled instruction, into a new XenonRecomp patch.
+   "Unable to decode instruction" lines at the very end of a code section are the
+   section's data trailer (it starts with the bytes `EVH\0`), not code. This step also regenerates `src/kernel/stubs.cpp` from all
    three import lists.
 
 6. Cross-check the boundaries against the earlier function list. This step reads

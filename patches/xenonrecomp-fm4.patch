@@ -522,7 +522,7 @@ index c9f9a85..b64eaac 100644
  #include <xbox.h>
  #include <xxhash.h>
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index 94d68ba..e3d3fcc 100644
+index 94d68ba..b04275b 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
 @@ -252,6 +252,47 @@ void Recompiler::Analyse()
@@ -601,10 +601,31 @@ index 94d68ba..e3d3fcc 100644
          }
  
          auto switchTable = config.switchTables.find(addr);
-@@ -2543,6 +2596,17 @@ bool Recompiler::Recompile(const Function& fn)
+@@ -2543,6 +2596,38 @@ bool Recompiler::Recompile(const Function& fn)
          ++data;
      }
  
++    // A function whose last instruction can fall through continues in the next
++    // function (FM4 has bodies that XenonAnalyse splits at a .pdata or bl-target
++    // boundary). Continue there, as the guest does. A trap ends the function: the
++    // recompiled trap is a no-op, and running on into the next function would
++    // make it run code the guest never reaches.
++    if (insn.opcode != nullptr)
++    {
++        const uint32_t id = insn.opcode->id;
++        const std::string_view lastName = insn.opcode->name;
++        const bool ends = id == PPC_INST_B || id == PPC_INST_BLR || id == PPC_INST_BCTR || id == PPC_INST_RFI ||
++            lastName.substr(0, 2) == "tw" || lastName.substr(0, 4) == "trap";
++        auto next = image.symbols.find(base);
++        if (!ends && next != image.symbols.end() && next->address == base && next->type == Symbol_Function)
++        {
++            println("	// falls through into {}", next->name);
++            println("	{}(ctx, base);", next->name);
++            println("	return;");
++            fallthroughCount++;
++        }
++    }
++
 +    for (size_t target : outsideCtrTargets)
 +    {
 +        println("loc_{:X}:", target);
@@ -619,6 +640,26 @@ index 94d68ba..e3d3fcc 100644
  #if 0
      if (insn.opcode == nullptr || (insn.opcode->id != PPC_INST_B && insn.opcode->id != PPC_INST_BCTR && insn.opcode->id != PPC_INST_BLR))
          fmt::println("Function at {:X} ends prematurely with instruction {} at {:X}", fn.base, insn.opcode != nullptr ? insn.opcode->name : "INVALID", base - 4);
+@@ -2722,6 +2807,7 @@ void Recompiler::Recompile(const std::filesystem::path& headerFilePath)
+     }
+ 
+     SaveCurrentOutData();
++    fmt::println("{} functions fall through into the next function and continue there", fallthroughCount);
+ }
+ 
+ void Recompiler::SaveCurrentOutData(const std::string_view& name)
+diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
+index 8242db5..17a53e9 100644
+--- a/XenonRecomp/recompiler.h
++++ b/XenonRecomp/recompiler.h
+@@ -33,6 +33,7 @@ struct Recompiler
+     std::vector<Function> functions;
+     std::string out;
+     size_t cppFileIndex = 0;
++    size_t fallthroughCount = 0;
+     RecompilerConfig config;
+ 
+     bool LoadConfig(const std::string_view& configFilePath);
 diff --git a/XenonUtils/xex.cpp b/XenonUtils/xex.cpp
 index e6ff10f..e4a5c13 100644
 --- a/XenonUtils/xex.cpp
