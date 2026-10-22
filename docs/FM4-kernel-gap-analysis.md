@@ -140,8 +140,8 @@ hijack FM4 functions:
 - `src/hooks/common/` - title-independent code the runtime calls: `mem_scan.cpp`, and
   `diagnostics.cpp` (`StartWatch`, an empty `D3DDebugLog`, no-op easter-egg entry points, and
   the idle `g_patchConfig` / `g_cameraAspectWidened` the renderer reads).
-- `src/hooks/fm4/` - FM4 hooks. `fibers.cpp` is FM2's host-fiber implementation behind the
-  macros in `addresses.h`; it is **optional and off** until those six addresses are filled in. The ReXGlue fork
-  runs FM4 without fiber replacement, so FM4 may never reach the swap routine; add the hooks
-  if the register-swap routine ever runs (it is the only thing that Fatals).
-
+- `src/hooks/fm4/` - FM4 hooks. `fibers.cpp` is FM2's host-fiber implementation at FM4's
+  addresses (`addresses.h`: 0x82C829F0, 0x82C82A80, 0x82C82AD0, 0x82C82BB0, 0x82C85380). FM4's
+  SwitchToFiber contains the register swap, so there is no separate routine to hook. The
+  ReXGlue fork configures no fiber replacement for FM4, so these hooks are unproven: if the
+  first boot behaves without them, `FM4_XAPI_FIBER_ADDRESSES` can be turned off.

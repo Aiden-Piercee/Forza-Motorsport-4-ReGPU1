@@ -180,14 +180,6 @@ PPC_FUNC(FM4_XAPI_SWITCH_TO_FIBER)
     SwitchToFiber(target->host);
 }
 
-// The hand-written register swap SwitchToFiber jumps to; nothing should
-// reach it now.
-PPC_FUNC(FM4_XAPI_FIBER_SWAP_ROUTINE)
-{
-    Fatal("XAPI fiber switch routine reached (lr %08llX)", ctx.lr);
-}
-
 #else
-// Optional: the ReXGlue fork plays FM4 without fiber replacement (no [rexcrt] table), so FM4
-// may never reach the swap routine. Fill in src/hooks/fm4/addresses.h if it does.
+// Define FM4_XAPI_FIBER_ADDRESSES in src/hooks/fm4/addresses.h to build the fiber hooks.
 #endif
