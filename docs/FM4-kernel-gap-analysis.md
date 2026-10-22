@@ -39,17 +39,25 @@ Things that are single-title assumptions and matter for FM4:
    - `RtlImageXexHeaderField` and `XexGetModuleSection` keyed by the handle, not by
      `g_title`;
    - running the module entry point (DLL_PROCESS_ATTACH) with the module's TLS set up.
-   Blocker outside this thread: the recompiled facade code must not collide with
-   `default.xex` (global `sub_XXXXXXXX` names, one mapping table, one image base). Sent to the
-   XenonRecomp thread.
-2. **Import list and kernel variables.** `KernelVariable` knows a fixed set of ordinals and
+   Agreed with the XenonRecomp thread: each XEX is recompiled into its own directory with a
+   `symbol_prefix` (`xmf_`, `sph_`) and built as its own static library, `__imp__` names stay
+   shared so one kernel serves all three, and `tools/genmodules.py` emits a registry of
+   {guest path, image base/size, code base/size, mappings} for the loader. The indirect-call
+   table moves out of guest space (host base + 4 GB + (guest - 0x80000000) * 2) behind a
+   `GuestFuncSlot(addr)` helper, so module load/unload only commits or decommits pages.
+   `loader.cpp` and `thread.cpp` switch from `PPC_LOOKUP_FUNC` to that helper.
+2. **Non-kernel import libraries.** XenonUtils resolves import names only for `xam.xex` and
+   `xboxkrnl.exe`; an import from any other library becomes a silent no-op thunk. The raw
+   `xexheader.py` output for all three XEXs shows whether FM4 or a facade imports from
+   anything else (for example `xbdm.xex`), which would be a silent gap.
+3. **Import list and kernel variables.** `KernelVariable` knows a fixed set of ordinals and
    gives anything else zeroed storage with a log line. Check FM4's variable imports against it.
-3. **Stub review.** Run `tools/importgap.py` on the three import lists; every `stub` row in
+4. **Stub review.** Run `tools/importgap.py` on the three import lists; every `stub` row in
    M1 is a candidate boot blocker until shown otherwise.
-4. **Title update.** ReGPU can apply a `default.xexp` (`FM2_TITLE_UPDATE`). Decide which FM4
+5. **Title update.** ReGPU can apply a `default.xexp` (`FM2_TITLE_UPDATE`). Decide which FM4
    executable is the baseline (the existing fork targets the Europe GOTY Disc 1 XEX with its
    documented hashes) and keep the patch path only if that build needs it.
-5. **Memory map.** `memory.cpp` hands out the virtual heap first-fit. Module images need
+6. **Memory map.** `memory.cpp` hands out the virtual heap first-fit. Module images need
    their ranges reserved before the allocator starts, and the ranges depend on the facade
    image bases *(verify)*.
 
