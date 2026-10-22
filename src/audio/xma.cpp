@@ -61,6 +61,23 @@ void SetField(uint32_t ctx, int dword, int lo, int bits, uint32_t value)
     StoreBE32(a, (LoadBE32(a) & ~mask) | ((value << lo) & mask));
 }
 
+// A buffer address in a context, as guest memory. The decoder takes physical addresses (29 bits),
+// as titles that write contexts themselves store them (FM4's FMOD: MmGetPhysicalAddress of its
+// buffers); they are read through the 0xA0000000 physical view.
+uint32_t ContextBuffer(uint32_t address)
+{
+    return 0xA0000000 + (address & 0x1FFFFFFF);
+}
+
+// XMAInitializeContext takes the title's (virtual) addresses and stores physical ones, as the
+// kernel does. XMA buffers are physical allocations, so they are in a physical view.
+uint32_t ToContextBuffer(uint32_t address)
+{
+    if (address && address < 0xA0000000)
+        LOG_ONCE("xma: buffer %08X is not in a physical view", address);
+    return address & 0x1FFFFFFF;
+}
+
 std::mutex g_mutex;
 
 // Music packets, by a hash of their first 64 bytes: the title reads its music files (Media/Audio/Music/*.xma)
@@ -116,6 +133,9 @@ struct Decoder
     size_t pcmRead = 0;
     bool flush = true; // start of a stream or a jump: reset before the next packet
     bool starved = false;
+    // When both input buffers ran out with audio still in the codec. A stream the title feeds a
+    // buffer at a time is refilled within milliseconds; only a longer wait is the stream's end.
+    Clock::time_point dryAt{};
     size_t packetsDecoded = 0, framesWritten = 0, framesDecoded = 0;
     // An input buffer whose packets are all decoded stays valid for the title until their audio
     // has reached the output ring (the hardware has no backlog, so the title takes "consumed"
@@ -182,7 +202,12 @@ struct Decoder
         if (const size_t rest = (pcm.size() - pcmRead) % block)
             pcm.resize(pcm.size() + (block - rest), 0);
         if (g_traceXma)
-            Log("xma: drained %zu frames at the end of a stream", (pcm.size() - pcmBefore) / channels);
+        {
+            int peak = 0;
+            for (size_t i = pcmBefore; i < pcm.size(); i++)
+                peak = std::max(peak, std::abs(int(pcm[i])));
+            Log("xma: drained %zu frames at the end of a stream (peak %d, %u ch %u Hz)", (pcm.size() - pcmBefore) / channels, peak, channels, rate);
+        }
         flush = true;
         holdsTail = false;
     }
@@ -224,7 +249,12 @@ struct Decoder
         framesDecoded += (pcm.size() - pcmBefore) / channels;
         holdsTail = true;
         if (g_traceXma)
-            Log("xma: decoded a packet: %zu frames (flush %d)", (pcm.size() - pcmBefore) / channels, int(wasFlush));
+        {
+            int peak = 0;
+            for (size_t i = pcmBefore; i < pcm.size(); i++)
+                peak = std::max(peak, std::abs(int(pcm[i])));
+            Log("xma: decoded a packet: %zu frames (flush %d, peak %d)", (pcm.size() - pcmBefore) / channels, int(wasFlush), peak);
+        }
     }
 };
 
@@ -247,7 +277,7 @@ bool WriteBlock(uint32_t ctx, Decoder& d)
     if (d.pcm.size() - d.pcmRead < perBlock)
         return false;
     const uint32_t blocks = Field(ctx, 0, 22, 5), write = Field(ctx, 0, 27, 5);
-    uint16_t* out = GuestPtr<uint16_t>(LoadBE32(ctx + 7 * 4) + write * kBlockBytes);
+    uint16_t* out = GuestPtr<uint16_t>(ContextBuffer(LoadBE32(ctx + 7 * 4)) + write * kBlockBytes);
     const bool mute = d.music && DealerMutesMusic();
     for (size_t i = 0; i < perBlock; i++)
         out[i] = mute ? 0 : __builtin_bswap16(uint16_t(d.pcm[d.pcmRead + i]));
@@ -288,12 +318,27 @@ bool Step(uint32_t ctx)
     // Everything decoded so far has been handed over. If no input is waiting, this is the end of
     // the stream: deliver what the codec still holds first.
     auto valid = [&](uint32_t index) { return Field(ctx, 0, 20 + index, 1) && !d.consumed[index]; };
-    if (d.holdsTail && !valid(0) && !valid(1))
+    // With both input buffers used up the decoder waits, its state intact, for the title to mark
+    // one valid again, as the hardware does; the context's state resets only when the title
+    // clears or re-initialises it. (Draining and resetting the codec the moment the input ran
+    // dry gave every packet of a stream fed one buffer at a time a cold decoder.)
+    // FM2_XMA_DRAIN_MS=<ms> (debug only): drain a stream left dry that long.
+    static const int drainMs = getenv("FM2_XMA_DRAIN_MS") ? atoi(getenv("FM2_XMA_DRAIN_MS")) : 0;
+    if (drainMs > 0 && d.holdsTail && !valid(0) && !valid(1))
     {
-        d.Drain(kBlockBytes / 2);
-        if (WriteBlock(ctx, d))
-            return true;
+        const auto now = Clock::now();
+        if (d.dryAt == Clock::time_point{})
+            d.dryAt = now;
+        if (now - d.dryAt >= std::chrono::milliseconds(drainMs))
+        {
+            d.dryAt = {};
+            d.Drain(kBlockBytes / 2);
+            if (WriteBlock(ctx, d))
+                return true;
+        }
     }
+    else
+        d.dryAt = {};
     for (uint32_t i = 0; i < 2; i++)
         if (d.consumed[i])
         {
@@ -317,7 +362,7 @@ bool Step(uint32_t ctx)
         SetField(ctx, 2, 0, 26, 32);
     }
     const uint32_t packets = current ? Field(ctx, 1, 0, 12) : Field(ctx, 0, 0, 12);
-    const uint32_t buffer = LoadBE32(ctx + (5 + current) * 4);
+    const uint32_t buffer = ContextBuffer(LoadBE32(ctx + (5 + current) * 4));
     const uint32_t packet = Field(ctx, 2, 0, 26) / kPacketBits;
     if (packet < packets)
     {
@@ -340,6 +385,8 @@ bool Step(uint32_t ctx)
     const uint32_t loops = Field(ctx, 0, 12, 8), loopEnd = Field(ctx, 4, 0, 26);
     if (loops && loopEnd / kPacketBits == packet)
     {
+        if (g_traceXma)
+            Log("xma: %08X loops back: packet %u, loop %u-%u, %u loops left", ctx, packet, Field(ctx, 3, 0, 26), loopEnd, loops);
         if (loops != 255)
             SetField(ctx, 0, 12, 8, loops - 1);
         SetField(ctx, 2, 0, 26, Field(ctx, 3, 0, 26));
@@ -494,12 +541,12 @@ GUEST_EXPORT(XMAInitializeContext)
     std::lock_guard lock(g_mutex);
     memset(GuestPtr(c), 0, kContextSize);
     auto in = [&](uint32_t off) { return LoadBE32(init + off); };
-    StoreBE32(c + 5 * 4, in(0x00));
+    StoreBE32(c + 5 * 4, ToContextBuffer(in(0x00)));
     SetField(c, 0, 0, 12, in(0x04));
-    StoreBE32(c + 6 * 4, in(0x08));
+    StoreBE32(c + 6 * 4, ToContextBuffer(in(0x08)));
     SetField(c, 1, 0, 12, in(0x0C));
     SetField(c, 2, 0, 26, in(0x10));
-    StoreBE32(c + 7 * 4, in(0x14));
+    StoreBE32(c + 7 * 4, ToContextBuffer(in(0x14)));
     SetField(c, 0, 22, 5, in(0x18));
     StoreBE32(c + 8 * 4, in(0x1C));
     SetField(c, 1, 20, 4, in(0x20));
