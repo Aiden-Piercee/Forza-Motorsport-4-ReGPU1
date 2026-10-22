@@ -369,9 +369,8 @@ LoadedModule* LoadModule(const std::string& name)
     if (LoadedModule* loaded = FindModuleByName(name))
         return loaded;
     const std::string wanted = BaseName(name);
-    size_t count = 0;
-    const RecompiledModule* descs = ModuleDescs(&count);
-    for (size_t i = 0; i < count; i++)
+    const RecompiledModule* descs = g_recompiledModules;
+    for (size_t i = 0; i < g_recompiledModuleCount; i++)
     {
         if (BaseName(descs[i].guestPath) != wanted)
             continue;
