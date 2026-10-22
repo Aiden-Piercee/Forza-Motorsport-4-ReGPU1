@@ -1,4 +1,6 @@
 // Memory management and module (XEX) queries.
+#include <mutex>
+
 #include "kernel/imports.h"
 #include "live_switch.h"
 #include "loader.h"
@@ -11,6 +13,10 @@ constexpr uint32_t MEM_DECOMMIT_ = 0x4000;
 constexpr uint32_t MEM_RELEASE_ = 0x8000;
 constexpr uint32_t MEM_LARGE_PAGES_ = 0x20000000;
 constexpr uint32_t PAGE_READWRITE_ = 0x04;
+
+// The console's loader lock: one module load or unload at a time, DllMain included (which may itself
+// load modules or ask for handles).
+std::recursive_mutex g_loaderLock;
 }
 
 GUEST_EXPORT(NtAllocateVirtualMemory)
@@ -162,9 +168,10 @@ GUEST_EXPORT(XexGetModuleHandle)
 
 GUEST_EXPORT(XexLoadImage)
 {
-    // (name, flags, minimumVersion, handle*): modules load on first use and are reference counted.
+    // (name, flags, minimumVersion, handle*): modules are reference counted. The first reference
+    // runs a DLL's DllMain(DLL_PROCESS_ATTACH) on this thread, under the loader lock, as the console does.
     const std::string name = GuestString(ctx.r3.u32);
-    const bool loaded = FindModuleByName(name) != nullptr;
+    std::lock_guard lock(g_loaderLock);
     LoadedModule* module = LoadModule(name);
     if (!module)
     {
@@ -173,23 +180,31 @@ GUEST_EXPORT(XexLoadImage)
         Return(ctx, X_STATUS_NO_SUCH_FILE);
         return;
     }
-    if (loaded)
-        module->refCount++;
+    if (module->refCount++ == 0 && !CallModuleEntry(ctx, *module, kDllProcessAttach))
+    {
+        module->refCount = 0;
+        Log("XexLoadImage(\"%s\"): DllMain failed", name.c_str());
+        StoreIfNonNull(ctx.r6.u32, 0);
+        Return(ctx, X_STATUS_DLL_INIT_FAILED);
+        return;
+    }
     StoreIfNonNull(ctx.r6.u32, module->handle);
     Return(ctx, X_STATUS_SUCCESS);
 }
 
 GUEST_EXPORT(XexUnloadImage)
 {
-    // (handle): the image stays resident (recompiled code cannot be unmapped); only the count drops.
+    // (handle): the last reference runs DllMain(DLL_PROCESS_DETACH). The recompiled code stays where it
+    // is; a later XexLoadImage maps the image's data afresh (LoadModule).
+    std::lock_guard lock(g_loaderLock);
     LoadedModule* module = FindModuleByHandle(ctx.r3.u32);
-    if (!module)
+    if (!module || !module->refCount)
     {
         Return(ctx, X_STATUS_INVALID_HANDLE);
         return;
     }
-    if (module->refCount)
-        module->refCount--;
+    if (--module->refCount == 0 && module->attached)
+        CallModuleEntry(ctx, *module, kDllProcessDetach);
     Return(ctx, X_STATUS_SUCCESS);
 }
 
@@ -221,7 +236,7 @@ GUEST_EXPORT(XexGetModuleSection)
 
 GUEST_EXPORT(XexGetProcedureAddress)
 {
-    // (module, ordinal | name*, address*): the module's PE export directory.
+    // (module, ordinal | name*, address*): the module's XEX export table (FindModuleExport).
     const LoadedModule* module = ModuleFromHandle(ctx.r3.u32);
     const uint32_t key = ctx.r4.u32;
     uint32_t address = 0;

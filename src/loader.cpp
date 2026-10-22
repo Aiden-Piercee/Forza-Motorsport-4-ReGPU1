@@ -4,6 +4,7 @@
 
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <windows.h>
 #include <vector>
@@ -17,6 +18,7 @@
 #endif
 
 #include "kernel/runtime.h"
+#include "kernel/thread.h"
 #include "log.h"
 #include "memory.h"
 #include "user_dir.h"
@@ -30,6 +32,8 @@ constexpr uint32_t kXexHeaderStackSize = 0x00020200;
 constexpr uint32_t kXexHeaderImports = 0x000103FF;
 constexpr uint32_t kXexHeaderExecutionId = 0x00040006;
 constexpr uint32_t kXexHeaderSystemFlags = 0x00030000;
+constexpr uint32_t kXexHeaderExportsByName = 0x00E10402;
+constexpr uint32_t kXexModuleDll = 0x8; // XEX module flags (header + 4)
 
 std::vector<uint8_t> ReadFile(const std::filesystem::path& path)
 {
@@ -219,6 +223,7 @@ const std::filesystem::path& TitleUpdateDir()
 namespace
 {
 std::vector<std::unique_ptr<LoadedModule>> g_modules;
+std::mutex g_modulesMutex; // g_modules itself; the records stay where they are
 
 std::string BaseName(std::string name)
 {
@@ -230,9 +235,9 @@ std::string BaseName(std::string name)
     return name;
 }
 
-// Loads one XEX into guest memory. The title (desc == nullptr) uses the main recompiled
-// image's mapping table; a module brings its own descriptor.
-LoadedModule& LoadXex(const std::filesystem::path& xexPath, const RecompiledModule* desc)
+// Reads one XEX and places its image in guest memory, checked against the recompiled code (the
+// title's when desc == nullptr), and binds its variable imports. Returns the XEX file.
+std::vector<uint8_t> MapXex(const std::filesystem::path& xexPath, const RecompiledModule* desc, Image& image)
 {
     std::vector<uint8_t> file = ReadFile(xexPath);
 #ifdef FM2_TITLE_UPDATE
@@ -253,7 +258,7 @@ LoadedModule& LoadXex(const std::filesystem::path& xexPath, const RecompiledModu
         Log("loader: applied the title update %s (%zu bytes)", xexp.string().c_str(), patch.size());
     }
 #endif
-    Image image = Image::ParseImage(file.data(), file.size());
+    image = Image::ParseImage(file.data(), file.size());
     if (!image.data)
         Fatal("%s: could not decrypt/decompress the XEX", xexPath.string().c_str());
     const uint64_t expectedBase = desc ? desc->imageBase : PPC_IMAGE_BASE;
@@ -267,24 +272,41 @@ LoadedModule& LoadXex(const std::filesystem::path& xexPath, const RecompiledModu
     uint32_t textStart = 0, textEnd = 0;
     for (const Section& s : image.sections)
     {
-        // .reloc runs past the end of XenonUtils' buffer and is not needed.
-        if (s.name == ".reloc")
+        // The console maps the security info's image size and nothing after it. The XEX tool leaves
+        // PE sections there that are not loaded (.reloc, and in FM4's modules .edata, .idata and
+        // .XBLD): they are outside XenonUtils' buffer too.
+        const uint64_t offset = s.base - image.base;
+        if (offset >= image.size)
             continue;
-        memcpy(GuestPtr(uint32_t(s.base)), s.data, s.size);
+        memcpy(GuestPtr(uint32_t(s.base)), s.data, size_t(std::min<uint64_t>(s.size, image.size - offset)));
         if (s.name == ".text")
         {
             textStart = uint32_t(s.base);
             textEnd = uint32_t(s.base + s.size);
         }
     }
+    ResolveVariableImports(file.data(), textStart, textEnd);
+    return file;
+}
+
+// Loads one XEX into guest memory. The title (desc == nullptr) uses the main recompiled
+// image's mapping table; a module brings its own descriptor.
+LoadedModule& LoadXex(const std::filesystem::path& xexPath, const RecompiledModule* desc)
+{
+    Image image;
+    const std::vector<uint8_t> file = MapXex(xexPath, desc, image);
 
     // Indirect-call table for every recompiled image, built once with the title.
     if (!desc)
         IndirectInit();
 
-    g_modules.push_back(std::make_unique<LoadedModule>());
-    LoadedModule& module = *g_modules.back();
+    LoadedModule& module = [] () -> LoadedModule& {
+        std::lock_guard lock(g_modulesMutex);
+        return *g_modules.emplace_back(std::make_unique<LoadedModule>());
+    }();
+    module.path = xexPath;
     module.name = BaseName(xexPath.filename().string());
+    module.dll = (Be32(file.data() + 4) & kXexModuleDll) != 0;
     module.desc = desc;
     module.imageBase = uint32_t(image.base);
     module.imageSize = image.size;
@@ -308,6 +330,9 @@ LoadedModule& LoadXex(const std::filesystem::path& xexPath, const RecompiledModu
         module.executionId = module.xexHeader + exec;
         module.titleId = Be32(file.data() + exec + 0xC);
     }
+    module.exportTable = Be32(file.data() + Be32(file.data() + 0x10) + 0x160);
+    if (const uint32_t byName = OptHeader(file.data(), kXexHeaderExportsByName))
+        module.exportsByName = uint32_t(image.base) + Be32(file.data() + byName);
 
     // Module handle: LDR_DATA_TABLE_ENTRY with the fields titles read.
     module.handle = GuestAlloc(Heap::Virtual, 0x100);
@@ -324,8 +349,6 @@ LoadedModule& LoadXex(const std::filesystem::path& xexPath, const RecompiledModu
     StoreBE32(ldr + 0x3C, module.entryPoint);
     StoreBE32(ldr + 0x58, module.xexHeader);
 
-    ResolveVariableImports(file.data(), textStart, textEnd);
-
     Log("loader: %s title %08X entry %08X stack %#x tls %u slots + %#x bytes @%08X", xexPath.string().c_str(),
         module.titleId, module.entryPoint, module.stackSize, module.tlsSlotCount, module.tlsDataSize, module.tlsTemplate);
     return module;
@@ -334,7 +357,8 @@ LoadedModule& LoadXex(const std::filesystem::path& xexPath, const RecompiledModu
 
 void LoadTitle(const std::filesystem::path& xexPath)
 {
-    const LoadedModule& m = LoadXex(xexPath, nullptr);
+    LoadedModule& m = LoadXex(xexPath, nullptr);
+    m.refCount = 1;
     g_title.entryPoint = m.entryPoint;
     g_title.stackSize = m.stackSize;
     g_title.xexHeader = m.xexHeader;
@@ -349,6 +373,7 @@ void LoadTitle(const std::filesystem::path& xexPath)
 
 LoadedModule* FindModuleByHandle(uint32_t handle)
 {
+    std::lock_guard lock(g_modulesMutex);
     for (auto& m : g_modules)
         if (m->handle == handle)
             return m.get();
@@ -358,6 +383,7 @@ LoadedModule* FindModuleByHandle(uint32_t handle)
 LoadedModule* FindModuleByName(const std::string& name)
 {
     const std::string wanted = BaseName(name);
+    std::lock_guard lock(g_modulesMutex);
     for (auto& m : g_modules)
         if (m->name == wanted)
             return m.get();
@@ -367,7 +393,16 @@ LoadedModule* FindModuleByName(const std::string& name)
 LoadedModule* LoadModule(const std::string& name)
 {
     if (LoadedModule* loaded = FindModuleByName(name))
+    {
+        // Unloaded since (DLL_PROCESS_DETACH, or an attach that failed): the console maps the image
+        // afresh, so DllMain starts from the image's initial data again.
+        if (loaded->desc && loaded->refCount == 0)
+        {
+            Image image;
+            MapXex(loaded->path, loaded->desc, image);
+        }
         return loaded;
+    }
     const std::string wanted = BaseName(name);
     const RecompiledModule* descs = g_recompiledModules;
     for (size_t i = 0; i < g_recompiledModuleCount; i++)
@@ -395,51 +430,78 @@ LoadedModule* LoadModule(const std::string& name)
     return nullptr;
 }
 
-// PE export directory of a loaded image (big-endian fields, as on the console).
+bool CallModuleEntry(PPCContext& ctx, LoadedModule& module, uint32_t reason)
+{
+    if (!module.dll || !module.entryPoint)
+        return true;
+    // A nested call on the caller's thread and stack: below r1 is free at an import call. The caller's
+    // registers are put back afterwards.
+    const PPCContext saved = ctx;
+    ctx.r3.u64 = module.handle;
+    ctx.r4.u64 = reason;
+    ctx.r5.u64 = 0;
+    GuestCall(ctx, module.entryPoint);
+    const bool ok = ctx.r3.u32 != 0;
+    ctx = saved;
+    if (reason == kDllProcessAttach || reason == kDllProcessDetach)
+    {
+        module.attached = reason == kDllProcessAttach && ok;
+        Log("loader: %s DllMain(%s) returned %d", module.name.c_str(), reason == kDllProcessAttach ? "PROCESS_ATTACH" : "PROCESS_DETACH", int(ok));
+    }
+    return ok;
+}
+
+void NotifyModulesOfThread(PPCContext& ctx, uint32_t reason)
+{
+    std::vector<LoadedModule*> attached;
+    {
+        std::lock_guard lock(g_modulesMutex);
+        for (auto& m : g_modules)
+            if (m->dll && m->attached)
+                attached.push_back(m.get());
+    }
+    for (LoadedModule* m : attached)
+        CallModuleEntry(ctx, *m, reason);
+}
+
+// Exports as the console's loader finds them (big-endian fields).
 bool FindModuleExport(const LoadedModule& module, uint32_t ordinal, const char* name, uint32_t* address)
 {
     const uint32_t base = module.imageBase;
-    const uint32_t lfanew = LoadBE32(base + 0x3C);
-    if (LoadBE32(base + lfanew) != 0x50450000) // "PE\0\0"
-        return false;
-    const uint32_t optional = base + lfanew + 0x18;
-    const uint32_t dirRva = LoadBE32(optional + 0x60);
-    const uint32_t dirSize = LoadBE32(optional + 0x64);
-    if (!dirRva || !dirSize)
-        return false;
-    const uint32_t dir = base + dirRva;
-    const uint32_t ordinalBase = LoadBE32(dir + 0x10);
-    const uint32_t functionCount = LoadBE32(dir + 0x14);
-    const uint32_t nameCount = LoadBE32(dir + 0x18);
-    const uint32_t functions = base + LoadBE32(dir + 0x1C);
-    const uint32_t names = base + LoadBE32(dir + 0x20);
-    const uint32_t nameOrdinals = base + LoadBE32(dir + 0x24);
-    uint32_t index = 0;
     if (name)
     {
+        // By name: a PE export directory, present only when the XEX header points at one. Its
+        // name ordinals index the ordinal table below.
+        const uint32_t dir = module.exportsByName;
+        if (!dir)
+            return false;
+        const uint32_t nameCount = LoadBE32(dir + 0x18);
+        const uint32_t names = base + LoadBE32(dir + 0x20);
+        const uint32_t nameOrdinals = base + LoadBE32(dir + 0x24);
         bool found = false;
         for (uint32_t i = 0; i < nameCount && !found; i++)
         {
             if (strcmp(GuestPtr<char>(base + LoadBE32(names + i * 4)), name) == 0)
             {
-                index = __builtin_bswap16(*GuestPtr<uint16_t>(nameOrdinals + i * 2));
+                ordinal = LoadBE32(dir + 0x10) + __builtin_bswap16(*GuestPtr<uint16_t>(nameOrdinals + i * 2));
                 found = true;
             }
         }
         if (!found)
             return false;
     }
-    else
-    {
-        if (ordinal < ordinalBase)
-            return false;
-        index = ordinal - ordinalBase;
-    }
-    if (index >= functionCount)
+    // By ordinal: the XEX export table (security info), { magic[3], module number[2], version[3],
+    // image base >> 16, count, ordinal base, offset[count] }; an export is at (image base << 16) + offset.
+    const uint32_t table = module.exportTable;
+    if (!table)
         return false;
-    const uint32_t rva = LoadBE32(functions + index * 4);
-    if (!rva)
+    const uint32_t count = LoadBE32(table + 0x24);
+    const uint32_t ordinalBase = LoadBE32(table + 0x28);
+    if (ordinal < ordinalBase || ordinal - ordinalBase >= count)
         return false;
-    *address = base + rva;
+    const uint32_t offset = LoadBE32(table + 0x2C + (ordinal - ordinalBase) * 4);
+    if (!offset)
+        return false;
+    *address = (LoadBE32(table + 0x20) << 16) + offset;
     return true;
 }

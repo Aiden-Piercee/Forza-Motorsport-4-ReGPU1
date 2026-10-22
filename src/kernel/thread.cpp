@@ -14,6 +14,7 @@
 
 #include "indirect.h"
 #include "live_switch.h"
+#include "loader.h"
 #include "log.h"
 
 namespace
@@ -87,10 +88,15 @@ DWORD WINAPI HostThreadMain(void* param)
     }
 
     uint32_t exitCode = 0;
+    PPCContext ctx{};
+    InitGuestContext(ctx, *thread);
+    // A title thread starts and ends with DllMain(DLL_THREAD_ATTACH / DETACH) of each loaded DLL module, on
+    // itself, as on the console; host-driven threads (the kernel's own) get none.
+    const bool titleThread = !thread->hostEntry;
     try
     {
-        PPCContext ctx{};
-        InitGuestContext(ctx, *thread);
+        if (titleThread)
+            NotifyModulesOfThread(ctx, kDllThreadAttach);
         if (thread->hostEntry)
             thread->hostEntry(ctx);
         else if (thread->xapiStartup)
@@ -109,6 +115,17 @@ DWORD WINAPI HostThreadMain(void* param)
     catch (const ExitThreadSignal& exit)
     {
         exitCode = exit.code;
+    }
+    if (titleThread)
+    {
+        try
+        {
+            ctx.r1.u64 = thread->stackHigh - 0x100;
+            NotifyModulesOfThread(ctx, kDllThreadDetach);
+        }
+        catch (const ExitThreadSignal&)
+        {
+        }
     }
 
     {

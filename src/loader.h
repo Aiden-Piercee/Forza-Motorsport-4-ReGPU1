@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -43,6 +44,9 @@ struct RecompiledModule;
 struct LoadedModule
 {
     std::string name;                 // lower-case file name
+    std::filesystem::path path;       // the XEX on disk
+    bool dll = false;                 // XEX module flag DLL: its entry point gets the DllMain notifications
+    std::atomic<bool> attached = false; // DLL_PROCESS_ATTACH succeeded and no DETACH since
     const RecompiledModule* desc = nullptr; // null for the title
     uint32_t handle = 0;              // LDR_DATA_TABLE_ENTRY
     uint32_t xexHeader = 0;
@@ -50,11 +54,22 @@ struct LoadedModule
     uint32_t entryPoint = 0, stackSize = 0, systemFlags = 0;
     uint32_t tlsTemplate = 0, tlsDataSize = 0, tlsSlotCount = 0;
     uint32_t titleId = 0, executionId = 0;
-    uint32_t refCount = 1;
+    uint32_t exportTable = 0;   // the XEX export table (security info): exports by ordinal, 0 if none
+    uint32_t exportsByName = 0; // PE export directory (XEX_HEADER_EXPORTS_BY_NAME), 0 if none
+    uint32_t refCount = 0;            // XexLoadImage references (the title: 1)
 };
 
 LoadedModule* FindModuleByHandle(uint32_t handle);
 LoadedModule* FindModuleByName(const std::string& nameOrPath); // "game:\\X.xex", "X.xex", case-insensitive
-LoadedModule* LoadModule(const std::string& nameOrPath);       // loads on first use
-// Export by ordinal (name == nullptr) or by name, from the PE export directory.
+LoadedModule* LoadModule(const std::string& nameOrPath);       // loads on first use; maps a detached module's image again
+// Export by ordinal (name == nullptr), from the XEX export table, or by name, from the PE export
+// directory the XEX header points at (XEX_HEADER_EXPORTS_BY_NAME).
 bool FindModuleExport(const LoadedModule& module, uint32_t ordinal, const char* name, uint32_t* address);
+
+// A DLL module's entry point, DllMain(handle, reason, 0), on the calling guest thread with ctx's stack.
+// Returns the entry point's BOOL (true for a module without one).
+constexpr uint32_t kDllProcessDetach = 0, kDllProcessAttach = 1, kDllThreadAttach = 2, kDllThreadDetach = 3;
+bool CallModuleEntry(PPCContext& ctx, LoadedModule& module, uint32_t reason);
+// DLL_THREAD_ATTACH / DLL_THREAD_DETACH to every attached DLL module, as the console's kernel sends them
+// when a title thread starts and ends.
+void NotifyModulesOfThread(PPCContext& ctx, uint32_t reason);
