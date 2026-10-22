@@ -136,19 +136,61 @@ GUEST_EXPORT(XexCheckExecutablePrivilege)
     Return(ctx, privilege < 32 ? (g_title.systemFlags >> privilege) & 1 : 0);
 }
 
+// A null or empty handle means the title; otherwise a module handle from the loader.
+static LoadedModule* ModuleFromHandle(uint32_t handle)
+{
+    if (!handle)
+        handle = g_title.ldrEntry;
+    return FindModuleByHandle(handle);
+}
+
 GUEST_EXPORT(XexGetModuleHandle)
 {
-    // (name, handle*)
+    // (name, handle*): an empty name is the title, the others are modules loaded by XexLoadImage.
     const std::string name = GuestString(ctx.r3.u32);
-    if (name.empty() || name == "default.xex")
+    LoadedModule* module = name.empty() ? FindModuleByHandle(g_title.ldrEntry) : FindModuleByName(name);
+    if (module)
     {
-        StoreBE32(ctx.r4.u32, g_title.ldrEntry);
+        StoreBE32(ctx.r4.u32, module->handle);
         Return(ctx, X_STATUS_SUCCESS);
         return;
     }
-    Log("XexGetModuleHandle(\"%s\"): module not available", name.c_str());
+    Log("XexGetModuleHandle(\"%s\"): module not loaded", name.c_str());
     StoreBE32(ctx.r4.u32, 0);
     Return(ctx, X_STATUS_NO_SUCH_FILE);
+}
+
+GUEST_EXPORT(XexLoadImage)
+{
+    // (name, flags, minimumVersion, handle*): modules load on first use and are reference counted.
+    const std::string name = GuestString(ctx.r3.u32);
+    const bool loaded = FindModuleByName(name) != nullptr;
+    LoadedModule* module = LoadModule(name);
+    if (!module)
+    {
+        Log("XexLoadImage(\"%s\"): not available", name.c_str());
+        StoreIfNonNull(ctx.r6.u32, 0);
+        Return(ctx, X_STATUS_NO_SUCH_FILE);
+        return;
+    }
+    if (loaded)
+        module->refCount++;
+    StoreIfNonNull(ctx.r6.u32, module->handle);
+    Return(ctx, X_STATUS_SUCCESS);
+}
+
+GUEST_EXPORT(XexUnloadImage)
+{
+    // (handle): the image stays resident (recompiled code cannot be unmapped); only the count drops.
+    LoadedModule* module = FindModuleByHandle(ctx.r3.u32);
+    if (!module)
+    {
+        Return(ctx, X_STATUS_INVALID_HANDLE);
+        return;
+    }
+    if (module->refCount)
+        module->refCount--;
+    Return(ctx, X_STATUS_SUCCESS);
 }
 
 GUEST_EXPORT(XexGetModuleSection)
@@ -156,7 +198,8 @@ GUEST_EXPORT(XexGetModuleSection)
     // (module, name, data*, size*) - XEX resources (header 0x000002FF):
     // { u32 size, then { char name[8], u32 address, u32 size } ... }
     const std::string name = GuestString(ctx.r4.u32);
-    const uint32_t resources = XexHeaderField(g_title.xexHeader, 0x000002FF);
+    const LoadedModule* module = ModuleFromHandle(ctx.r3.u32);
+    const uint32_t resources = module ? XexHeaderField(module->xexHeader, 0x000002FF) : 0;
     if (resources)
     {
         const uint32_t count = (LoadBE32(resources) - 4) / 16;
@@ -178,7 +221,18 @@ GUEST_EXPORT(XexGetModuleSection)
 
 GUEST_EXPORT(XexGetProcedureAddress)
 {
-    Log("XexGetProcedureAddress(%08X, %u): not supported", ctx.r3.u32, ctx.r4.u32);
+    // (module, ordinal | name*, address*): the module's PE export directory.
+    const LoadedModule* module = ModuleFromHandle(ctx.r3.u32);
+    const uint32_t key = ctx.r4.u32;
+    uint32_t address = 0;
+    if (module && (key < 0x10000 ? FindModuleExport(*module, key, nullptr, &address)
+                                 : FindModuleExport(*module, 0, GuestPtr<char>(key), &address)))
+    {
+        StoreIfNonNull(ctx.r5.u32, address);
+        Return(ctx, X_STATUS_SUCCESS);
+        return;
+    }
+    Log("XexGetProcedureAddress(%08X, %08X): export not found", ctx.r3.u32, key);
     StoreIfNonNull(ctx.r5.u32, 0);
     Return(ctx, X_STATUS_NOT_SUPPORTED);
 }

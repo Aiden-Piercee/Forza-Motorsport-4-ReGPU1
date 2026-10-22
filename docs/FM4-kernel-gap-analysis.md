@@ -46,6 +46,16 @@ Things that are single-title assumptions and matter for FM4:
    table moves out of guest space (host base + 4 GB + (guest - 0x80000000) * 2) behind a
    `GuestFuncSlot(addr)` helper, so module load/unload only commits or decommits pages.
    `loader.cpp` and `thread.cpp` switch from `PPC_LOOKUP_FUNC` to that helper.
+
+   Status: the runtime side is written but **not yet built or run** (no Windows toolchain or
+   XenonUtils in the authoring environment). `loader.cpp` now has a shared `LoadXex` used by
+   the title and by modules, a `ModuleDesc` registry (`ModuleDescs()`, weak and empty until
+   `tools/genmodules.py` supplies it), and `GuestFuncSlot()` in `loader.h`, which still points
+   at `PPC_LOOKUP_FUNC` until the call-table move lands. `XexLoadImage`, `XexUnloadImage`,
+   `XexGetModuleHandle`, `XexGetModuleSection` and `XexGetProcedureAddress` are keyed by
+   module handle; exports are read from the PE export directory *(verify against the real
+   facade XEX)*. Not done: module TLS (logged, not allocated), running the module entry point
+   (decide once the facades' load sequence is visible), real unload.
 2. **Non-kernel import libraries.** XenonUtils resolves import names only for `xam.xex` and
    `xboxkrnl.exe`; an import from any other library becomes a silent no-op thunk. The raw
    `xexheader.py` output for all three XEXs shows whether FM4 or a facade imports from

@@ -1,7 +1,10 @@
 #include "loader.h"
 #include "indirect.h"
+#include "recomp_modules.h"
 
 #include <fstream>
+#include <memory>
+#include <string>
 #include <windows.h>
 #include <vector>
 
@@ -13,6 +16,7 @@
 #include <xex_patcher.h>
 #endif
 
+#include "kernel/runtime.h"
 #include "log.h"
 #include "memory.h"
 #include "user_dir.h"
@@ -212,10 +216,27 @@ const std::filesystem::path& TitleUpdateDir()
     return dir;
 }
 
-void LoadTitle(const std::filesystem::path& xexPath)
+namespace
+{
+std::vector<std::unique_ptr<LoadedModule>> g_modules;
+
+std::string BaseName(std::string name)
+{
+    const size_t slash = name.find_last_of("\\/:");
+    if (slash != std::string::npos)
+        name.erase(0, slash + 1);
+    for (char& c : name)
+        c = char(tolower((unsigned char)c));
+    return name;
+}
+
+// Loads one XEX into guest memory. The title (desc == nullptr) uses the main recompiled
+// image's mapping table; a module brings its own descriptor.
+LoadedModule& LoadXex(const std::filesystem::path& xexPath, const RecompiledModule* desc)
 {
     std::vector<uint8_t> file = ReadFile(xexPath);
 #ifdef FM2_TITLE_UPDATE
+    if (!desc)
     {
         // This build's recompiled code is the title-updated executable: the update's patch
         // turns the disc's default.xex into it (the same patch XenonRecomp applied).
@@ -235,8 +256,11 @@ void LoadTitle(const std::filesystem::path& xexPath)
     Image image = Image::ParseImage(file.data(), file.size());
     if (!image.data)
         Fatal("%s: could not decrypt/decompress the XEX", xexPath.string().c_str());
-    if (image.base != PPC_IMAGE_BASE)
-        Fatal("%s: image base %08zX does not match the recompiled code (%08llX); wrong default.xex?", xexPath.string().c_str(), image.base, PPC_IMAGE_BASE);
+    const uint64_t expectedBase = desc ? desc->imageBase : PPC_IMAGE_BASE;
+    if (image.base != expectedBase)
+        Fatal("%s: image base %08zX does not match the recompiled code (%08llX); wrong XEX?", xexPath.string().c_str(), image.base, expectedBase);
+    if (desc && image.size != desc->imageSize)
+        Fatal("%s: image size %08X does not match the recompiled code (%08X); wrong XEX?", xexPath.string().c_str(), image.size, desc->imageSize);
 
     // PE headers, then every section.
     memcpy(GuestPtr(image.base), image.data.get(), 0x600);
@@ -254,32 +278,40 @@ void LoadTitle(const std::filesystem::path& xexPath)
         }
     }
 
-    // Indirect-call table: host function for every guest code address of every image.
-    IndirectInit();
+    // Indirect-call table for every recompiled image, built once with the title.
+    if (!desc)
+        IndirectInit();
+
+    g_modules.push_back(std::make_unique<LoadedModule>());
+    LoadedModule& module = *g_modules.back();
+    module.name = BaseName(xexPath.filename().string());
+    module.desc = desc;
+    module.imageBase = uint32_t(image.base);
+    module.imageSize = image.size;
 
     // XEX header, kept in guest memory for RtlImageXexHeaderField and XAM.
     const uint32_t headerSize = Be32(file.data() + 8);
-    g_title.xexHeader = GuestAlloc(Heap::Virtual, headerSize, 0x1000);
-    memcpy(GuestPtr(g_title.xexHeader), file.data(), headerSize);
+    module.xexHeader = GuestAlloc(Heap::Virtual, headerSize, 0x1000);
+    memcpy(GuestPtr(module.xexHeader), file.data(), headerSize);
 
-    g_title.entryPoint = uint32_t(image.entry_point);
-    g_title.stackSize = OptHeader(file.data(), kXexHeaderStackSize);
-    g_title.systemFlags = OptHeader(file.data(), kXexHeaderSystemFlags);
+    module.entryPoint = uint32_t(image.entry_point);
+    module.stackSize = OptHeader(file.data(), kXexHeaderStackSize);
+    module.systemFlags = OptHeader(file.data(), kXexHeaderSystemFlags);
     if (const uint32_t tls = OptHeader(file.data(), kXexHeaderTls))
     {
-        g_title.tlsSlotCount = Be32(file.data() + tls);
-        g_title.tlsTemplate = Be32(file.data() + tls + 4);
-        g_title.tlsDataSize = Be32(file.data() + tls + 8);
+        module.tlsSlotCount = Be32(file.data() + tls);
+        module.tlsTemplate = Be32(file.data() + tls + 4);
+        module.tlsDataSize = Be32(file.data() + tls + 8);
     }
     if (const uint32_t exec = OptHeader(file.data(), kXexHeaderExecutionId))
     {
-        g_title.executionId = g_title.xexHeader + exec;
-        g_title.titleId = Be32(file.data() + exec + 0xC);
+        module.executionId = module.xexHeader + exec;
+        module.titleId = Be32(file.data() + exec + 0xC);
     }
 
     // Module handle: LDR_DATA_TABLE_ENTRY with the fields titles read.
-    g_title.ldrEntry = GuestAlloc(Heap::Virtual, 0x100);
-    const uint32_t ldr = g_title.ldrEntry;
+    module.handle = GuestAlloc(Heap::Virtual, 0x100);
+    const uint32_t ldr = module.handle;
     for (uint32_t list = 0; list < 0x18; list += 8)
     {
         StoreBE32(ldr + list, ldr + list);
@@ -289,11 +321,126 @@ void LoadTitle(const std::filesystem::path& xexPath)
     StoreBE32(ldr + 0x1C, uint32_t(image.base));
     StoreBE32(ldr + 0x20, image.size);
     StoreBE32(ldr + 0x38, image.size);
-    StoreBE32(ldr + 0x3C, g_title.entryPoint);
-    StoreBE32(ldr + 0x58, g_title.xexHeader);
+    StoreBE32(ldr + 0x3C, module.entryPoint);
+    StoreBE32(ldr + 0x58, module.xexHeader);
 
     ResolveVariableImports(file.data(), textStart, textEnd);
 
     Log("loader: %s title %08X entry %08X stack %#x tls %u slots + %#x bytes @%08X", xexPath.string().c_str(),
-        g_title.titleId, g_title.entryPoint, g_title.stackSize, g_title.tlsSlotCount, g_title.tlsDataSize, g_title.tlsTemplate);
+        module.titleId, module.entryPoint, module.stackSize, module.tlsSlotCount, module.tlsDataSize, module.tlsTemplate);
+    return module;
+}
+}
+
+void LoadTitle(const std::filesystem::path& xexPath)
+{
+    const LoadedModule& m = LoadXex(xexPath, nullptr);
+    g_title.entryPoint = m.entryPoint;
+    g_title.stackSize = m.stackSize;
+    g_title.xexHeader = m.xexHeader;
+    g_title.ldrEntry = m.handle;
+    g_title.tlsTemplate = m.tlsTemplate;
+    g_title.tlsDataSize = m.tlsDataSize;
+    g_title.tlsSlotCount = m.tlsSlotCount;
+    g_title.systemFlags = m.systemFlags;
+    g_title.titleId = m.titleId;
+    g_title.executionId = m.executionId;
+}
+
+LoadedModule* FindModuleByHandle(uint32_t handle)
+{
+    for (auto& m : g_modules)
+        if (m->handle == handle)
+            return m.get();
+    return nullptr;
+}
+
+LoadedModule* FindModuleByName(const std::string& name)
+{
+    const std::string wanted = BaseName(name);
+    for (auto& m : g_modules)
+        if (m->name == wanted)
+            return m.get();
+    return nullptr;
+}
+
+LoadedModule* LoadModule(const std::string& name)
+{
+    if (LoadedModule* loaded = FindModuleByName(name))
+        return loaded;
+    const std::string wanted = BaseName(name);
+    size_t count = 0;
+    const RecompiledModule* descs = ModuleDescs(&count);
+    for (size_t i = 0; i < count; i++)
+    {
+        if (BaseName(descs[i].guestPath) != wanted)
+            continue;
+        const std::filesystem::path path = GameDir() / wanted;
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec))
+        {
+            // Case-insensitive on disk? Retry with the descriptor's own spelling.
+            const std::string original = descs[i].guestPath;
+            const size_t slash = original.find_last_of("\\/:");
+            const std::filesystem::path exact = GameDir() / (slash == std::string::npos ? original : original.substr(slash + 1));
+            if (!std::filesystem::exists(exact, ec))
+            {
+                Log("loader: module %s not found in %s", wanted.c_str(), GameDir().string().c_str());
+                return nullptr;
+            }
+            return &LoadXex(exact, &descs[i]);
+        }
+        return &LoadXex(path, &descs[i]);
+    }
+    Log("loader: no recompiled module named %s", name.c_str());
+    return nullptr;
+}
+
+// PE export directory of a loaded image (big-endian fields, as on the console).
+bool FindModuleExport(const LoadedModule& module, uint32_t ordinal, const char* name, uint32_t* address)
+{
+    const uint32_t base = module.imageBase;
+    const uint32_t lfanew = LoadBE32(base + 0x3C);
+    if (LoadBE32(base + lfanew) != 0x50450000) // "PE\0\0"
+        return false;
+    const uint32_t optional = base + lfanew + 0x18;
+    const uint32_t dirRva = LoadBE32(optional + 0x60);
+    const uint32_t dirSize = LoadBE32(optional + 0x64);
+    if (!dirRva || !dirSize)
+        return false;
+    const uint32_t dir = base + dirRva;
+    const uint32_t ordinalBase = LoadBE32(dir + 0x10);
+    const uint32_t functionCount = LoadBE32(dir + 0x14);
+    const uint32_t nameCount = LoadBE32(dir + 0x18);
+    const uint32_t functions = base + LoadBE32(dir + 0x1C);
+    const uint32_t names = base + LoadBE32(dir + 0x20);
+    const uint32_t nameOrdinals = base + LoadBE32(dir + 0x24);
+    uint32_t index = 0;
+    if (name)
+    {
+        bool found = false;
+        for (uint32_t i = 0; i < nameCount && !found; i++)
+        {
+            if (strcmp(GuestPtr<char>(base + LoadBE32(names + i * 4)), name) == 0)
+            {
+                index = __builtin_bswap16(*GuestPtr<uint16_t>(nameOrdinals + i * 2));
+                found = true;
+            }
+        }
+        if (!found)
+            return false;
+    }
+    else
+    {
+        if (ordinal < ordinalBase)
+            return false;
+        index = ordinal - ordinalBase;
+    }
+    if (index >= functionCount)
+        return false;
+    const uint32_t rva = LoadBE32(functions + index * 4);
+    if (!rva)
+        return false;
+    *address = base + rva;
+    return true;
 }

@@ -1,6 +1,10 @@
 #pragma once
 #include <cstdint>
 #include <filesystem>
+#include <string>
+
+#include <ppc_context.h>
+#include "memory.h"
 
 struct LoadedTitle
 {
@@ -29,3 +33,28 @@ const std::filesystem::path& TitleUpdateDir();
 
 // Optional header value (low byte 0x00/0x01) or guest pointer to its data.
 uint32_t XexHeaderField(uint32_t headerBase, uint32_t key);
+
+// Modules ---------------------------------------------------------------------------------
+// Secondary XEXs (XMediaFacade, SpeechFacade) are described by g_recompiledModules
+// (recomp_modules.h); their mapping tables are already in the shared indirect-call table, so
+// loading one only places its image in guest memory.
+struct RecompiledModule;
+
+struct LoadedModule
+{
+    std::string name;                 // lower-case file name
+    const RecompiledModule* desc = nullptr; // null for the title
+    uint32_t handle = 0;              // LDR_DATA_TABLE_ENTRY
+    uint32_t xexHeader = 0;
+    uint32_t imageBase = 0, imageSize = 0;
+    uint32_t entryPoint = 0, stackSize = 0, systemFlags = 0;
+    uint32_t tlsTemplate = 0, tlsDataSize = 0, tlsSlotCount = 0;
+    uint32_t titleId = 0, executionId = 0;
+    uint32_t refCount = 1;
+};
+
+LoadedModule* FindModuleByHandle(uint32_t handle);
+LoadedModule* FindModuleByName(const std::string& nameOrPath); // "game:\\X.xex", "X.xex", case-insensitive
+LoadedModule* LoadModule(const std::string& nameOrPath);       // loads on first use
+// Export by ordinal (name == nullptr) or by name, from the PE export directory.
+bool FindModuleExport(const LoadedModule& module, uint32_t ordinal, const char* name, uint32_t* address);
