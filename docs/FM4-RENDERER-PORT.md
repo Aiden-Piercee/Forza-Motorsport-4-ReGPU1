@@ -62,11 +62,39 @@ change behaviour. Most of the remaining ~111 `FM2_*` names are debug switches th
 
    Also handle vertex fetch constant 96 or higher properly instead of skipping the draw, and grow the ring
    instead of dropping draws when it is full.
+
+   *Status:* done, except the ring. Draws now wait for their shaders and pipeline; the blended/"settled"
+   skip rules and the `FM2_ASYNC_*` switches are removed. Slot 96 (fetch index 31, select 3) has no
+   fetch constant behind it. It now reads as zero and the draw goes ahead; before, the draw was skipped
+   and the CPU wrote past `vf[96]`. Still to do: when the ring is full, draws are dropped (logged).
+   The fix is to chain a second ring buffer or submit and recycle the ring; it needs a Windows run to check.
 2. **Pass and surface descriptor (S1-S5, S13, E1-E5).** Replace the 1280x720 / pitch-1280 model and the
    tall/big pass detection with a descriptor built from `RB_SURFACE_INFO`, `RB_COLOR_INFO`, `RB_DEPTH_INFO`,
    the window scissor and offset, and the resolve rect. Host surfaces get their size from that descriptor.
    EDRAM aliasing is handled by explicit ownership transfers, not by guessing the native MSAA layout.
    FM4 renders its frame as 3 predicated tiles with MSAA, and aliases EDRAM between formats. This is the biggest item.
+
+   *Design:* host render targets in EDRAM space, as Xenia's render target cache does,
+   rather than ReGPU's screen-space surfaces sized to the output.
+   - Each layout (base tile, pitch, MSAA, format, colour or depth) gets a host render target.
+     Its size is `pitch x HeightPixels` times the resolution scale.
+   - A draw claims the tiles it can reach. Tiles another layout wrote last are copied across first
+     (an ownership transfer).
+   - Predicated tiles then need no special handling: each strip is ordinary EDRAM rows at its window offset.
+     That removes the tall/big pass detection, the native-MSAA guess, the clear extension and `PassScale`.
+
+   *Status:* the platform-independent core is in `src/gpu/edram.{h,cpp}` and is tested by `tools/edramtest`.
+   It covers register decode, pitch and height in tiles, the window/screen scissor, the rows a draw can reach
+   (scissor and viewport), the per-target tile ranges for MRT and depth, and the ownership map that
+   produces transfers. Still to do, with a Windows run to check each step:
+   1. A host render-target cache keyed by `SurfaceKey`.
+   2. Transfer shaders: colour to colour across MSAA modes and formats, depth to colour and colour to depth,
+      with the stencil reference.
+   3. Draws bound to the pass's targets, with the viewport and scissor in EDRAM space.
+   4. Resolves that read the owner of the source tiles.
+   5. Clears that claim tiles.
+   6. Present, the upscalers and ultrawide, re-based on the descriptor. The "main view" becomes the pass
+      whose resolve feeds the front buffer, not pitch 1280.
 3. **Resolve/copy decode and texture formats (G1, G2, G3, G4, G9, S6).**
    - Decode all of `RB_COPY_CONTROL` / `RB_COPY_DEST_INFO`: format, number format, endian, swap,
      exponent bias, sample select, and constant fill.
