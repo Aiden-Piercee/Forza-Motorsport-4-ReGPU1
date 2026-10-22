@@ -127,3 +127,20 @@ py -3 tools\importgap.py out\ppc\ppc_recomp_shared.h   # after the recompile
 `importgap.py` merges several lists (default plus both facades), classifies each import as
 implemented, stub-only or missing, and groups the result by the milestone above. It does not
 need the game; it reads names only.
+
+## Build layout (milestone 2)
+
+The top-level `CMakeLists.txt` now builds FM4: one static library per recompiled image
+(`out/ppc`, `out/ppc_xmf`, `out/ppc_sph`), generated `stubs.cpp` and `recomp_modules.cpp`, and
+`patch_mftb.py` over all three. `src/hooks` is split so FM2's address-bound hooks cannot
+hijack FM4 functions:
+
+- `src/hooks/fm2/` - FM2's hooks (they override FM2 `sub_` addresses). Not compiled unless
+  `-DFM4_BUILD_FM2_HOOKS=ON`; kept as the reference for re-addressing.
+- `src/hooks/common/` - title-independent code the runtime calls: `mem_scan.cpp`, and
+  `diagnostics.cpp` (`StartWatch`, an empty `D3DDebugLog`, no-op easter-egg entry points, and
+  the idle `g_patchConfig` / `g_cameraAspectWidened` the renderer reads).
+- `src/hooks/fm4/` - FM4 hooks. `fibers.cpp` is FM2's host-fiber implementation behind the
+  macros in `addresses.h`; **it is not built until those six addresses are filled in** (the
+  build prints a message), and the title will not get past its first fiber without them.
+
