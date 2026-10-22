@@ -1,16 +1,18 @@
 diff --git a/XenonAnalyse/main.cpp b/XenonAnalyse/main.cpp
-index d08371e..0bafcf0 100644
+index d08371e..d6b6794 100644
 --- a/XenonAnalyse/main.cpp
 +++ b/XenonAnalyse/main.cpp
-@@ -1,5 +1,7 @@
+@@ -1,5 +1,9 @@
  #include <cassert>
 +#include <algorithm>
  #include <iterator>
++#include <unordered_map>
++#include <string_view>
 +#include <unordered_set>
  #include <file.h>
  #include <disasm.h>
  #include <image.h>
-@@ -172,6 +174,248 @@ void* SearchMask(const void* source, const uint32_t* compare, size_t compareCoun
+@@ -172,6 +176,342 @@ void* SearchMask(const void* source, const uint32_t* compare, size_t compareCoun
      return nullptr;
  }
  
@@ -37,8 +39,50 @@ index d08371e..0bafcf0 100644
 +    }
 +}
 +
-+// The nearest instruction before `address` (at most `window` back) that writes
-+// `reg` with one of the instructions jump-table code uses.
++static bool StartsWith(std::string_view text, std::string_view prefix)
++{
++    return text.substr(0, prefix.size()) == prefix;
++}
++
++static bool EndsWith(std::string_view text, std::string_view suffix)
++{
++    return text.size() >= suffix.size() && text.substr(text.size() - suffix.size()) == suffix;
++}
++
++// Whether the instruction writes general-purpose register `reg`. Loads and
++// stores with update also write their base register; floating-point and vector
++// instructions number their own registers, and stores, compares, moves to
++// special registers and branches only read theirs.
++static bool WritesGpr(const ppc_insn& insn, uint32_t reg)
++{
++    const std::string_view name = insn.opcode->name;
++    const bool update = (StartsWith(name, "l") || StartsWith(name, "st")) && (EndsWith(name, "u") || EndsWith(name, "ux"));
++    if (update && insn.operands[1] == reg)
++        return true;
++    for (const std::string_view reader : { "st", "cmp", "mt", "b", "dcb", "icb", "tw", "td", "sync", "isync", "eieio", "nop",
++        "f", "lf", "v", "lv", "mffs", "mfvscr", "cr", "mcrf" })
++    {
++        if (StartsWith(name, reader))
++            return false;
++    }
++    return insn.operands[0] == reg;
++}
++
++static bool IsCall(const ppc_insn& insn)
++{
++    switch (insn.opcode->id)
++    {
++    case PPC_INST_BL:
++    case PPC_INST_BCTRL:
++    case PPC_INST_BLRL:
++        return true;
++    default:
++        return false;
++    }
++}
++
++// The nearest instruction before `address` (at most `window` back, within the
++// straight-line code) that writes `reg`.
 +static bool FindWriter(const Image& image, size_t address, uint32_t reg, TracedInsn& out, int window = 16)
 +{
 +    for (int i = 1; i <= window; i++)
@@ -49,28 +93,12 @@ index d08371e..0bafcf0 100644
 +            return false;
 +        ppc_insn insn;
 +        ppc::Disassemble(code, a, insn);
-+        if (insn.opcode == nullptr || EndsBlock(insn))
++        if (insn.opcode == nullptr || EndsBlock(insn) || IsCall(insn))
 +            return false;
-+        switch (insn.opcode->id)
++        if (WritesGpr(insn, reg))
 +        {
-+        case PPC_INST_LIS:
-+        case PPC_INST_LI:
-+        case PPC_INST_ADDI:
-+        case PPC_INST_ORI:
-+        case PPC_INST_RLWINM:
-+        case PPC_INST_LWZX:
-+        case PPC_INST_LBZX:
-+        case PPC_INST_LHZX:
-+        case PPC_INST_ADD:
-+        case PPC_INST_MR:
-+            if (insn.operands[0] == reg)
-+            {
-+                out = { insn, a };
-+                return true;
-+            }
-+            break;
-+        default:
-+            break;
++            out = { insn, a };
++            return true;
 +        }
 +    }
 +    return false;
@@ -142,6 +170,68 @@ index d08371e..0bafcf0 100644
 +    return false;
 +}
 +
++// The number of entries a table indexed by `index` has, seen from `first`, the
++// table code's first instruction. Tries, in order:
++//  - a mask on the index (clrlwi rI, rS, n: 2^(32-n) entries);
++//  - cmplwi crN, rI, count - 1 with a bgt/ble on crN, up to 160 instructions back
++//    in address order, as long as nothing on the way writes rI and no call
++//    passes while rI is a volatile register;
++//  - an earlier table on the same index that has `first` as a case: a second
++//    dispatch reached only from that table shares its bound.
++static bool FindBound(const Image& image, size_t sectionBase, size_t first, uint32_t index, const std::vector<SwitchTable>& known, size_t& count)
++{
++    TracedInsn w;
++    if (FindWriter(image, first, index, w) && w.insn.opcode->id == PPC_INST_CLRLWI && w.insn.operands[2] >= 24)
++    {
++        count = size_t(1) << (32 - w.insn.operands[2]);
++        return true;
++    }
++
++    const bool volatileIndex = index == 0 || (index >= 3 && index <= 12);
++    std::unordered_map<uint32_t, bool> branchOnCr;
++    for (int i = 1; i <= 160 && first - 4 * i >= sectionBase; i++)
++    {
++        const size_t a = first - 4 * i;
++        const auto* code = (const uint32_t*)image.Find(a);
++        if (code == nullptr)
++            break;
++        ppc_insn insn;
++        ppc::Disassemble(code, a, insn);
++        if (insn.opcode == nullptr)
++            continue; // padding or an inline table
++        switch (insn.opcode->id)
++        {
++        case PPC_INST_BGT:
++        case PPC_INST_BGTLR:
++        case PPC_INST_BLE:
++        case PPC_INST_BLELR:
++            branchOnCr[insn.operands[0]] = true;
++            continue;
++        case PPC_INST_CMPLWI:
++            if (insn.operands[1] == index && branchOnCr.count(insn.operands[0]))
++            {
++                count = size_t(insn.operands[2]) + 1;
++                return true;
++            }
++            continue;
++        default:
++            break;
++        }
++        if (WritesGpr(insn, index) || (volatileIndex && IsCall(insn)) || insn.opcode->id == PPC_INST_BLR)
++            break;
++    }
++
++    for (const auto& table : known)
++    {
++        if (table.r == index && std::find(table.labels.begin(), table.labels.end(), first) != table.labels.end())
++        {
++            count = table.labels.size();
++            return true;
++        }
++    }
++    return false;
++}
++
 +enum class TraceResult
 +{
 +    NotATable,
@@ -149,7 +239,7 @@ index d08371e..0bafcf0 100644
 +    Found,
 +};
 +
-+static TraceResult TraceBctr(const Image& image, size_t bctr, SwitchTable& table)
++static TraceResult TraceBctr(const Image& image, size_t sectionBase, size_t bctr, const std::vector<SwitchTable>& known, SwitchTable& table)
 +{
 +    TracedInsn mtctr{};
 +    bool foundMtctr = false;
@@ -178,7 +268,16 @@ index d08371e..0bafcf0 100644
 +    {
 +        table.type = SWITCH_ABSOLUTE;
 +        if (!TableLoad(image, target, 2, tableAddress, index, first))
-+            return TraceResult::Unresolved;
++        {
++            // A word-indexed load from a constant table that fails is worth a
++            // warning; a load with another stride (a table of structs holding
++            // function pointers) is an indirect call.
++            uint32_t ignored = 0;
++            size_t f = first;
++            const bool wordIndexed = ScaledIndex(image, target.address, target.insn.operands[1], 2, ignored, f) ||
++                ScaledIndex(image, target.address, target.insn.operands[2], 2, ignored, f);
++            return wordIndexed ? TraceResult::Unresolved : TraceResult::NotATable;
++        }
 +    }
 +    else if (target.insn.opcode->id == PPC_INST_ADD)
 +    {
@@ -223,13 +322,11 @@ index d08371e..0bafcf0 100644
 +        return TraceResult::NotATable;
 +    }
 +
-+    // The bounds check before the table: cmplwi crN, rX, count - 1 and bgt/ble crN.
-+    SwitchTable bounds{};
-+    ScanTable((const uint32_t*)image.Find(first), first, bounds);
-+    if (bounds.base == 0)
++    size_t count = 0;
++    if (!FindBound(image, sectionBase, first, index, known, count))
 +        return TraceResult::Unresolved;
 +
-+    table.labels.resize(bounds.labels.size());
++    table.labels.resize(count);
 +    for (size_t i = 0; i < table.labels.size(); i++)
 +    {
 +        switch (table.type)
@@ -252,14 +349,13 @@ index d08371e..0bafcf0 100644
 +    }
 +    table.base = first;
 +    table.r = index;
-+    table.defaultLabel = bounds.defaultLabel;
 +    return TraceResult::Found;
 +}
 +
  static std::string out;
  
  template<class... Args>
-@@ -305,6 +549,53 @@ int main(int argc, char** argv)
+@@ -305,6 +645,62 @@ int main(int argc, char** argv)
      scanPattern(offsetSwitch, std::size(offsetSwitch), SWITCH_BYTEOFFSET);
      scanPattern(wordOffsetSwitch, std::size(wordOffsetSwitch), SWITCH_SHORTOFFSET);
  
@@ -281,28 +377,37 @@ index d08371e..0bafcf0 100644
 +    size_t traced = 0;
 +    std::vector<size_t> unresolved;
 +    println("# ---- TRACED JUMPTABLE ----");
-+    for (const auto& section : image.sections)
++    // A table bounded by an earlier one is found once that one is known, so
++    // repeat until a pass finds nothing new.
++    for (bool found = true; found;)
 +    {
-+        if (!(section.flags & SectionFlags_Code))
-+            continue;
-+        // Traces look up to 0x80 bytes back; no table sits at a section's start.
-+        for (size_t a = section.base + 0x100; a < section.base + section.size; a += 4)
++        found = false;
++        unresolved.clear();
++        for (const auto& section : image.sections)
 +        {
-+            if (ByteSwap(*(const uint32_t*)(section.data + (a - section.base))) != 0x4E800420 || covered.count(a))
++            if (!(section.flags & SectionFlags_Code))
 +                continue;
-+            SwitchTable table{};
-+            switch (TraceBctr(image, a, table))
++            // Traces look up to 0x80 bytes back; no table sits at a section's start.
++            for (size_t a = section.base + 0x100; a < section.base + section.size; a += 4)
 +            {
-+            case TraceResult::Found:
-+                printTable(table);
-+                switches.emplace_back(std::move(table));
-+                traced++;
-+                break;
-+            case TraceResult::Unresolved:
-+                unresolved.push_back(a);
-+                break;
-+            case TraceResult::NotATable:
-+                break;
++                if (ByteSwap(*(const uint32_t*)(section.data + (a - section.base))) != 0x4E800420 || covered.count(a))
++                    continue;
++                SwitchTable table{};
++                switch (TraceBctr(image, section.base, a, switches, table))
++                {
++                case TraceResult::Found:
++                    printTable(table);
++                    switches.emplace_back(std::move(table));
++                    covered.insert(a);
++                    traced++;
++                    found = true;
++                    break;
++                case TraceResult::Unresolved:
++                    unresolved.push_back(a);
++                    break;
++                case TraceResult::NotATable:
++                    break;
++                }
 +            }
 +        }
 +    }
