@@ -1,5 +1,5 @@
 diff --git a/XenonAnalyse/main.cpp b/XenonAnalyse/main.cpp
-index d08371e..d6b6794 100644
+index d08371e..7ce2cdd 100644
 --- a/XenonAnalyse/main.cpp
 +++ b/XenonAnalyse/main.cpp
 @@ -1,5 +1,9 @@
@@ -12,7 +12,7 @@ index d08371e..d6b6794 100644
  #include <file.h>
  #include <disasm.h>
  #include <image.h>
-@@ -172,6 +176,342 @@ void* SearchMask(const void* source, const uint32_t* compare, size_t compareCoun
+@@ -172,6 +176,358 @@ void* SearchMask(const void* source, const uint32_t* compare, size_t compareCoun
      return nullptr;
  }
  
@@ -171,24 +171,27 @@ index d08371e..d6b6794 100644
 +}
 +
 +// The number of entries a table indexed by `index` has, seen from `first`, the
-+// table code's first instruction. Tries, in order:
++// table code's first instruction. Uses the smaller of:
 +//  - a mask on the index (clrlwi rI, rS, n: 2^(32-n) entries);
 +//  - cmplwi crN, rI, count - 1 with a bgt/ble on crN, up to 160 instructions back
 +//    in address order, as long as nothing on the way writes rI and no call
-+//    passes while rI is a volatile register;
-+//  - an earlier table on the same index that has `first` as a case: a second
-+//    dispatch reached only from that table shares its bound.
-+static bool FindBound(const Image& image, size_t sectionBase, size_t first, uint32_t index, const std::vector<SwitchTable>& known, size_t& count)
++//    passes while rI is a volatile register (a compare after the mask is
++//    reached before the mask).
++// FM4 often masks a byte index and then compares it, so the mask alone would
++// read past the table. Without either, an earlier table on the same index that
++// has `first` as a case gives the bound: a second dispatch reached only from
++// that table shares it.
++static bool FindBound(const Image& image, size_t sectionBase, size_t first, uint32_t index, const std::vector<SwitchTable>& known,
++    size_t& count, uint32_t& defaultLabel)
 +{
 +    TracedInsn w;
++    size_t maskCount = 0;
 +    if (FindWriter(image, first, index, w) && w.insn.opcode->id == PPC_INST_CLRLWI && w.insn.operands[2] >= 24)
-+    {
-+        count = size_t(1) << (32 - w.insn.operands[2]);
-+        return true;
-+    }
++        maskCount = size_t(1) << (32 - w.insn.operands[2]);
 +
 +    const bool volatileIndex = index == 0 || (index >= 3 && index <= 12);
-+    std::unordered_map<uint32_t, bool> branchOnCr;
++    // The target of the bgt/ble on each condition register: the default case.
++    std::unordered_map<uint32_t, uint32_t> branchOnCr;
 +    for (int i = 1; i <= 160 && first - 4 * i >= sectionBase; i++)
 +    {
 +        const size_t a = first - 4 * i;
@@ -202,15 +205,20 @@ index d08371e..d6b6794 100644
 +        switch (insn.opcode->id)
 +        {
 +        case PPC_INST_BGT:
-+        case PPC_INST_BGTLR:
 +        case PPC_INST_BLE:
++            branchOnCr[insn.operands[0]] = insn.operands[1];
++            continue;
++        case PPC_INST_BGTLR:
 +        case PPC_INST_BLELR:
-+            branchOnCr[insn.operands[0]] = true;
++            branchOnCr[insn.operands[0]] = 0;
 +            continue;
 +        case PPC_INST_CMPLWI:
 +            if (insn.operands[1] == index && branchOnCr.count(insn.operands[0]))
 +            {
 +                count = size_t(insn.operands[2]) + 1;
++                defaultLabel = branchOnCr[insn.operands[0]];
++                if (maskCount != 0)
++                    count = (std::min)(count, maskCount);
 +                return true;
 +            }
 +            continue;
@@ -219,6 +227,12 @@ index d08371e..d6b6794 100644
 +        }
 +        if (WritesGpr(insn, index) || (volatileIndex && IsCall(insn)) || insn.opcode->id == PPC_INST_BLR)
 +            break;
++    }
++
++    if (maskCount != 0)
++    {
++        count = maskCount;
++        return true;
 +    }
 +
 +    for (const auto& table : known)
@@ -323,7 +337,8 @@ index d08371e..d6b6794 100644
 +    }
 +
 +    size_t count = 0;
-+    if (!FindBound(image, sectionBase, first, index, known, count))
++    uint32_t defaultLabel = 0;
++    if (!FindBound(image, sectionBase, first, index, known, count, defaultLabel))
 +        return TraceResult::Unresolved;
 +
 +    table.labels.resize(count);
@@ -349,13 +364,14 @@ index d08371e..d6b6794 100644
 +    }
 +    table.base = first;
 +    table.r = index;
++    table.defaultLabel = defaultLabel;
 +    return TraceResult::Found;
 +}
 +
  static std::string out;
  
  template<class... Args>
-@@ -305,6 +645,62 @@ int main(int argc, char** argv)
+@@ -305,6 +661,62 @@ int main(int argc, char** argv)
      scanPattern(offsetSwitch, std::size(offsetSwitch), SWITCH_BYTEOFFSET);
      scanPattern(wordOffsetSwitch, std::size(wordOffsetSwitch), SWITCH_SHORTOFFSET);
  
@@ -431,7 +447,7 @@ index c9f9a85..b64eaac 100644
  #include <xbox.h>
  #include <xxhash.h>
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index 94d68ba..ca3bc23 100644
+index 94d68ba..e3d3fcc 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
 @@ -252,6 +252,47 @@ void Recompiler::Analyse()
@@ -462,7 +478,7 @@ index 94d68ba..ca3bc23 100644
 +                if (label < fn->base || label < end)
 +                    continue;
 +                auto target = holder(label);
-+                end = std::max({ end, label + 4, target->base + target->size });
++                end = (std::max)({ end, label + 4, target->base + target->size });
 +            }
 +            if (end - (fn->base + fn->size) > 0x10000)
 +            {
