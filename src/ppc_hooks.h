@@ -51,3 +51,21 @@ inline uint16_t ppc_float_to_half(float f)
     }
     return sign | uint16_t((a - 0x38000000) >> 13);
 }
+
+// Indirect calls (bctrl, function pointers, vtables) go through one table for every
+// recompiled image, so default.xex and the modules it loads can call into each other.
+// XenonRecomp's own PPC_LOOKUP_FUNC keeps a table after each image, indexed from that
+// image's code base, which cannot resolve a call into another image. See indirect.cpp.
+using PPCHostFunc = void(PPCContext&, uint8_t*);
+constexpr uint32_t kIndirectLow = 0x82000000;  // lowest guest code address of any image
+constexpr uint32_t kIndirectHigh = 0x8C000000; // end of the range the table covers
+extern PPCHostFunc** g_indirectTable;          // one entry per instruction; only image code is committed
+[[noreturn]] void PPCIndirectMiss(uint32_t address);
+inline PPCHostFunc* PPCLookupIndirect(uint32_t address)
+{
+    PPCHostFunc* f = address - kIndirectLow < kIndirectHigh - kIndirectLow ? g_indirectTable[(address - kIndirectLow) >> 2] : nullptr;
+    if (!f) [[unlikely]]
+        PPCIndirectMiss(address);
+    return f;
+}
+#define PPC_CALL_INDIRECT_FUNC(x) (PPCLookupIndirect(uint32_t(x)))(ctx, base)

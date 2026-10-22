@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <dbghelp.h>
 
+#include "indirect.h"
 #include "live_switch.h"
 #include "log.h"
 
@@ -263,7 +264,7 @@ uint32_t CurrentGuestThreadId()
 
 void GuestCall(PPCContext& ctx, uint32_t address)
 {
-    PPCFunc* func = PPC_LOOKUP_FUNC(g_base, address);
+    PPCHostFunc* func = IndirectFind(address);
     if (!func)
         Fatal("call to unmapped guest function %08X (lr %08llX)", address, ctx.lr);
     func(ctx, g_base);

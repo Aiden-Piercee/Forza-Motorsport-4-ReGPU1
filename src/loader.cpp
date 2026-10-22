@@ -1,4 +1,5 @@
 #include "loader.h"
+#include "indirect.h"
 
 #include <fstream>
 #include <windows.h>
@@ -253,11 +254,8 @@ void LoadTitle(const std::filesystem::path& xexPath)
         }
     }
 
-    // Indirect-call table: host function for every guest code address.
-    size_t mapped = 0;
-    for (const PPCFuncMapping* m = PPCFuncMappings; m->host; m++, mapped++)
-        PPC_LOOKUP_FUNC(g_base, m->guest) = m->host;
-    Log("loader: %zu recompiled functions mapped", mapped);
+    // Indirect-call table: host function for every guest code address of every image.
+    IndirectInit();
 
     // XEX header, kept in guest memory for RtlImageXexHeaderField and XAM.
     const uint32_t headerSize = Be32(file.data() + 8);

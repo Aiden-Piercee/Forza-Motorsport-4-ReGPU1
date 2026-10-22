@@ -1,6 +1,7 @@
 // Link check for the recompiled FM4 images: every image's code, the import stubs
 // and the image table link into one program. Running it checks the table: each
-// mapping is inside its image's code range, and no guest address is mapped twice.
+// mapping is inside its image's code range, no guest address is mapped twice, and
+// every image's code fits the shared indirect-call table.
 #include <cstdio>
 #include <unordered_set>
 
@@ -12,6 +13,11 @@
 void PPCMsrChanged(PPCContext&, uint64_t)
 {
 }
+PPCHostFunc** g_indirectTable = nullptr;
+void PPCIndirectMiss(uint32_t)
+{
+    __builtin_trap();
+}
 
 int main()
 {
@@ -20,6 +26,13 @@ int main()
     for (size_t i = 0; i < g_recompiledModuleCount; i++)
     {
         const RecompiledModule& m = g_recompiledModules[i];
+        // The shared indirect-call table (src/indirect.cpp) covers only this range.
+        if (m.codeBase < kIndirectLow || m.codeBase + uint64_t(m.codeSize) > kIndirectHigh)
+        {
+            std::printf("%s: code %08X+%X is outside the indirect-call range %08X-%08X\n", m.guestPath, m.codeBase, m.codeSize,
+                kIndirectLow, kIndirectHigh);
+            errors++;
+        }
         size_t count = 0;
         for (const PPCFuncMapping* f = m.mappings; f->host; f++, count++)
         {
