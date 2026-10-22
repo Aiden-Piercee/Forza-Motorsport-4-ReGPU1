@@ -14,7 +14,24 @@
 // containing one of those).
 void TraceImport(const char* name, PPCContext& ctx);
 void TraceImportReturn(const char* name, PPCContext& ctx);
-#define GUEST_EXPORT(name)                                         static void Impl_##name(PPCContext& __restrict ctx, uint8_t* base);     PPC_FUNC(__imp__##name)                                        {                                                                  TraceImport(#name, ctx);                                       Impl_##name(ctx, base);                                        TraceImportReturn(#name, ctx);                             }                                                              static void Impl_##name(PPCContext& __restrict ctx, uint8_t* base)
+// FM4_TRACE_XAM=1 logs every XAM/XNotify/XUser/XMsg import with its arguments and result
+// (FM4_TRACE_XAM_LIMIT calls per name, default 300; trace_xam.cpp).
+extern bool g_traceXam;
+void TraceXamBegin(const char* name, PPCContext& ctx);
+void TraceXamEnd(const char* name, PPCContext& ctx);
+#define GUEST_EXPORT(name)                                          \
+    static void Impl_##name(PPCContext& __restrict ctx, uint8_t* base); \
+    PPC_FUNC(__imp__##name)                                         \
+    {                                                               \
+        TraceImport(#name, ctx);                                    \
+        if (g_traceXam)                                             \
+            TraceXamBegin(#name, ctx);                              \
+        Impl_##name(ctx, base);                                     \
+        if (g_traceXam)                                             \
+            TraceXamEnd(#name, ctx);                                \
+        TraceImportReturn(#name, ctx);                              \
+    }                                                               \
+    static void Impl_##name(PPCContext& __restrict ctx, uint8_t* base)
 
 inline uint32_t StackArg(PPCContext& ctx, int index) // index 8 = 9th argument
 {

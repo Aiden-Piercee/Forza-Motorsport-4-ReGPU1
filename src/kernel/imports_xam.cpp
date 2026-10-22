@@ -52,6 +52,12 @@ uint64_t Xuid()
     return xuid;
 }
 
+// The profile is signed in on the controller that last pressed Start or A when the sign-in guide
+// opens (user 0 until then).
+std::atomic<uint32_t> g_signedInUser{ 0 }, g_lastActiveUser{ 0 };
+bool IsSignedIn(uint32_t u) { return u == g_signedInUser.load(); }
+uint32_t SignInMask() { return 1u << g_signedInUser.load(); }
+
 constexpr uint32_t kContentDataSize = 0x134;
 
 // XCONTENT_DATA: deviceId, contentType, displayName[128] (UTF-16 BE), fileName[42].
@@ -93,13 +99,13 @@ std::mutex g_listenerMutex;
 
 GUEST_EXPORT(XamUserGetSigninState)
 {
-    Return(ctx, ctx.r3.u32 == 0 ? 1 : 0); // signed in locally
+    Return(ctx, IsSignedIn(ctx.r3.u32) ? 1 : 0); // signed in locally
 }
 
 GUEST_EXPORT(XamUserGetXUID)
 {
     // (user, type, xuid*)
-    if (ctx.r3.u32 != 0)
+    if (!IsSignedIn(ctx.r3.u32))
     {
         Return(ctx, X_ERROR_NO_SUCH_USER);
         return;
@@ -111,7 +117,7 @@ GUEST_EXPORT(XamUserGetXUID)
 GUEST_EXPORT(XamUserGetName)
 {
     // (user, buffer, size)
-    if (ctx.r3.u32 != 0)
+    if (!IsSignedIn(ctx.r3.u32))
     {
         Return(ctx, X_ERROR_NO_SUCH_USER);
         return;
@@ -129,7 +135,35 @@ GUEST_EXPORT(XamUserGetName)
 GUEST_EXPORT(XamUserCheckPrivilege)
 {
     // (user, mask, result*)
+    if (!IsSignedIn(ctx.r3.u32))
+    {
+        StoreIfNonNull(ctx.r5.u32, 0);
+        Return(ctx, X_ERROR_NO_SUCH_USER);
+        return;
+    }
     StoreIfNonNull(ctx.r5.u32, 1);
+    Return(ctx, X_ERROR_SUCCESS);
+}
+
+GUEST_EXPORT(XamUserGetSigninInfo)
+{
+    // (user, flags, info*): XUSER_SIGNIN_INFO { u64 xuid, u32 flags, u32 state, u32 guest number,
+    // u32 sponsor index, char name[16] }.
+    const uint32_t info = ctx.r5.u32;
+    if (info)
+        memset(GuestPtr(info), 0, 0x20);
+    if (!IsSignedIn(ctx.r3.u32))
+    {
+        Return(ctx, X_ERROR_NO_SUCH_USER);
+        return;
+    }
+    if (info)
+    {
+        StoreBE64(info, Xuid());
+        StoreBE32(info + 8, 0);
+        StoreBE32(info + 12, 1); // signed in locally
+        strncpy(GuestPtr<char>(info + 16), GetSettings().profile.c_str(), 15);
+    }
     Return(ctx, X_ERROR_SUCCESS);
 }
 
@@ -246,7 +280,7 @@ GUEST_EXPORT(XamNotifyCreateListener)
     auto listener = std::make_shared<ListenerObject>();
     listener->mask = ctx.r3.u64;
     // Startup state as a fresh console reports it.
-    listener->queue.push_back({ 0x0000000A, 1 }); // XN_SYS_SIGNINCHANGED: user 0
+    listener->queue.push_back({ 0x0000000A, SignInMask() }); // XN_SYS_SIGNINCHANGED: the signed-in user
     listener->queue.push_back({ 0x00000009, 0 }); // XN_SYS_UI: hidden
     {
         std::lock_guard lock(g_listenerMutex);
@@ -298,13 +332,16 @@ void FinishUi(PPCContext& ctx, uint32_t overlapped, uint32_t result = X_ERROR_SU
 
 GUEST_EXPORT(XamShowSigninUI)
 {
-    // The sign-in guide opens and closes at once, with the profile signed in.
+    // The sign-in guide opens and closes at once, with the profile signed in on the controller that
+    // pressed Start or A last.
+    g_signedInUser = g_lastActiveUser.load();
+    Log("signin: profile signed in on user %u", g_signedInUser.load());
     std::lock_guard lock(g_listenerMutex);
     for (auto& weak : g_listeners)
         if (auto l = weak.lock())
         {
             l->queue.push_back({ 0x00000009, 1 }); // XN_SYS_UI: shown
-            l->queue.push_back({ 0x0000000A, 1 }); // XN_SYS_SIGNINCHANGED: user 0
+            l->queue.push_back({ 0x0000000A, SignInMask() }); // XN_SYS_SIGNINCHANGED: the signed-in user
             l->queue.push_back({ 0x00000009, 0 }); // XN_SYS_UI: hidden
         }
     Return(ctx, X_ERROR_SUCCESS);
@@ -664,6 +701,8 @@ bool ReadPad(uint32_t user, PadState& s)
         if (d.sticks)
             s.lx = d.lx, s.ly = d.ly, s.rx = d.rx, s.ry = d.ry;
     }
+    if (connected && (s.buttons & (XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_A)))
+        g_lastActiveUser = user;
     return connected;
 }
 }
