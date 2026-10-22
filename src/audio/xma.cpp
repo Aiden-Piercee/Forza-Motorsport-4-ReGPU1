@@ -83,6 +83,29 @@ bool MusicPacket(const uint8_t* p)
 std::set<uint32_t> g_enabled;
 std::once_flag g_started;
 
+// The hardware's contexts: one array of 320 in physical memory, whose physical address the APU
+// register ContextArrayAddress holds. XMACreateContext hands them out; a context's hardware ID is
+// its index, and the Kick/Lock/Clear registers take one bit per ID (32 per register).
+constexpr uint32_t kContextCount = 320;
+uint32_t g_contextArray = 0;
+bool g_contextUsed[kContextCount] = {};
+
+// APU registers (guest 0x7FEA0000, register r at + r * 4), as titles that drive the decoder
+// directly use them (FM4's FMOD and XAudio code: they import no XMAEnableContext).
+constexpr uint32_t kApuBase = 0x7FEA0000;
+constexpr uint32_t kRegContextArrayAddress = 0x600;
+constexpr uint32_t kRegNextContextIndex = 0x607;
+constexpr uint32_t kRegKick = 0x650, kRegLock = 0x690, kRegClear = 0x6A0; // 10 registers each
+uint32_t g_registers[0x10000 / 4] = {};
+
+// Registers are little-endian: a register's value sits in guest memory as the title reads it
+// with lwbrx. Titles read these with plain loads, so the memory copy is what they see.
+void SetRegister(uint32_t r, uint32_t value)
+{
+    g_registers[r] = value;
+    *GuestPtr<uint32_t>(kApuBase + r * 4) = value;
+}
+
 struct Decoder
 {
     AVCodecContext* av = nullptr;
@@ -351,29 +374,114 @@ void DecoderLoop()
 }
 }
 
-GUEST_EXPORT(XMACreateContext)
+namespace
 {
-    const uint32_t context = GuestAlloc(Heap::Physical, kContextSize, 0x100);
-    StoreIfNonNull(ctx.r3.u32, context);
+// The context with a hardware ID (Kick/Lock/Clear bit).
+uint32_t ContextById(uint32_t id)
+{
+    return g_contextArray + id * kContextSize;
+}
+
+// A context's state reset, as the Clear register and a re-used context do: no valid buffers, reading
+// from the first packet's first frame, an empty output ring, and a fresh decoder.
+void ResetDecoder(uint32_t ctx)
+{
+    if (auto it = g_decoders.find(ctx); it != g_decoders.end())
+    {
+        it->second.Close();
+        g_decoders.erase(it);
+    }
+}
+
+void ClearContext(uint32_t ctx)
+{
+    SetField(ctx, 0, 20, 2, 0);  // input buffers 0 and 1 not valid
+    SetField(ctx, 1, 31, 1, 0);  // output buffer not valid
+    SetField(ctx, 2, 0, 26, 32); // read offset: past the first packet's header
+    SetField(ctx, 9, 0, 5, 0);   // output read offset
+    SetField(ctx, 0, 27, 5, 0);  // output write offset
+    ResetDecoder(ctx);
+}
+
+void StartDecoder()
+{
     std::call_once(g_started, [] {
         av_log_set_level(AV_LOG_ERROR);
         std::thread(DecoderLoop).detach();
     });
+}
+}
+
+void XmaInit()
+{
+    g_contextArray = GuestAlloc(Heap::Physical, kContextCount * kContextSize, 0x100);
+    memset(GuestPtr(g_contextArray), 0, kContextCount * kContextSize);
+    SetRegister(kRegContextArrayAddress, g_contextArray & 0x1FFFFFFF);
+    SetRegister(kRegNextContextIndex, 1);
+}
+
+// A store to an APU register (PPCMmioStore32): value as the register takes it.
+void XmaWriteRegister(uint32_t address, uint32_t value)
+{
+    const uint32_t r = (address & 0xFFFF) / 4;
+    std::lock_guard lock(g_mutex);
+    SetRegister(r, value);
+    auto forEach = [&](uint32_t group, auto&& fn) {
+        for (uint32_t bit = 0; bit < 32; bit++)
+            if (value & (1u << bit))
+                if (const uint32_t id = (r - group) * 32 + bit; id < kContextCount)
+                    fn(ContextById(id));
+    };
+    if (r >= kRegKick && r < kRegKick + 10)
+    {
+        // Kick: start (or continue) decoding these contexts, as XMAEnableContext does.
+        StartDecoder();
+        forEach(kRegKick, [](uint32_t c) {
+            g_enabled.insert(c);
+            while (Step(c))
+                ;
+        });
+    }
+    else if (r >= kRegLock && r < kRegLock + 10)
+    {
+        // Lock: stop decoding them, as XMADisableContext does. Taking g_mutex above means no Step is
+        // under way, so the title may edit them once this store returns.
+        forEach(kRegLock, [](uint32_t c) { g_enabled.erase(c); });
+    }
+    else if (r >= kRegClear && r < kRegClear + 10)
+        forEach(kRegClear, [](uint32_t c) { ClearContext(c); });
+    else
+        LOG_ONCE("xma: write %08X to APU register %03X", value, r);
+}
+
+GUEST_EXPORT(XMACreateContext)
+{
+    uint32_t context = 0;
+    {
+        std::lock_guard lock(g_mutex);
+        for (uint32_t id = 0; id < kContextCount && !context; id++)
+            if (!g_contextUsed[id])
+            {
+                g_contextUsed[id] = true;
+                context = ContextById(id);
+            }
+    }
+    StoreIfNonNull(ctx.r3.u32, context);
+    StartDecoder();
     Return(ctx, context ? X_STATUS_SUCCESS : X_STATUS_NO_MEMORY);
 }
 
 GUEST_EXPORT(XMAReleaseContext)
 {
+    const uint32_t c = ctx.r3.u32;
+    std::lock_guard lock(g_mutex);
+    if (c >= g_contextArray && c < g_contextArray + kContextCount * kContextSize)
     {
-        std::lock_guard lock(g_mutex);
-        g_enabled.erase(ctx.r3.u32);
-        if (auto it = g_decoders.find(ctx.r3.u32); it != g_decoders.end())
-        {
-            it->second.Close();
-            g_decoders.erase(it);
-        }
+        g_enabled.erase(c);
+        ResetDecoder(c);
+        memset(GuestPtr(c), 0, kContextSize);
+        g_contextUsed[(c - g_contextArray) / kContextSize] = false;
     }
-    GuestFree(ctx.r3.u32);
     Return(ctx, 0);
 }
 

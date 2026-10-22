@@ -169,7 +169,10 @@ void AudioLoop(PPCContext& ctx)
 }
 }
 
-void AudioInit() {}
+void XmaInit(); // xma.cpp
+
+// Before the title runs: it reads the XMA context array's address from the APU at start.
+void AudioInit() { XmaInit(); }
 
 GUEST_EXPORT(XAudioRegisterRenderDriverClient)
 {

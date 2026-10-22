@@ -13,6 +13,12 @@ void PPCMsrChanged(PPCContext& ctx, uint64_t oldMsr);
             PPCMsrChanged((ctx), (oldMsr));                \
     } while (0)
 
+// Stores XenonRecomp marks as hardware register writes (a store followed by eieio). The APU's
+// registers (0x7FEA0000) drive the XMA decoder (audio/xma.cpp); any other address is ordinary
+// memory, as an unmarked store would be. y is the value as PPC_STORE_U32 takes it. See mmio.cpp.
+void PPCMmioStore32(uint8_t* base, uint32_t address, uint32_t y);
+#define PPC_MM_STORE_U32(x, y) PPCMmioStore32(base, (x), (y))
+
 // IEEE half -> float (vupkd3d128 FLOAT16 variants).
 inline float ppc_half_to_float(uint16_t h)
 {
