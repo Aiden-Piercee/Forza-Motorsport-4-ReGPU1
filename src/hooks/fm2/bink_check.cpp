@@ -15,7 +15,7 @@
 #include "log.h"
 #include "memory.h"
 
-uint32_t g_binkRingBase = 0;
+extern uint32_t g_binkRingBase; // kernel/imports_io.cpp
 uint32_t g_binkPlane[3];
 
 namespace

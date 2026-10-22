@@ -81,6 +81,11 @@ if(EXISTS "${FM4_DLSS}/include/nvsdk_ngx.h")
     set(REGPU_DLSS ON)
     set(REGPU_DLSS_DIR "${FM4_DLSS}")
 endif()
+# Windows SDKs before 10.0.26100 lack ID3D12Device13: ReGPU then takes d3d12.h from Microsoft's
+# DirectX-Headers (MIT) in thirdparty/directx-headers, if it is there (see README).
+if(EXISTS "${CMAKE_SOURCE_DIR}/thirdparty/directx-headers/include/directx/d3d12.h")
+    set(REGPU_DIRECTX_HEADERS "${CMAKE_SOURCE_DIR}/thirdparty/directx-headers")
+endif()
 add_subdirectory(thirdparty/ReGPU)
 
 add_executable(fm4 ${FM4_SOURCES} "${CMAKE_SOURCE_DIR}/src/fm2.rc")

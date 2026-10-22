@@ -17,6 +17,10 @@ namespace fs = std::filesystem;
 
 void AudioNoteMusicRead(const std::filesystem::path& file, uint64_t offset, const uint8_t* data, uint32_t bytes); // audio/xma.cpp
 
+// The guest address of the Bink player's 2 MB file ring, from its 128 KB .bik reads (FM2's
+// hooks/fm2/bink_check.cpp and perf_probe.cpp read it).
+uint32_t g_binkRingBase = 0;
+
 namespace
 {
 struct FileObject : KernelObject
@@ -394,7 +398,6 @@ GUEST_EXPORT(NtReadFile)
             (unsigned long long)offset, length, buffer, ctx.lr);
     if (length == 0x20000 && strstr(file->path.string().c_str(), ".bik"))
     {
-        extern uint32_t g_binkRingBase;
         g_binkRingBase = buffer - uint32_t(offset % 0x200000);
     }
     const BOOL ok = ReadFile(file->host, GuestPtr(buffer), length, &read, &ov);
