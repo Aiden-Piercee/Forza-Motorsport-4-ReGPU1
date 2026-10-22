@@ -175,11 +175,12 @@ GUEST_EXPORT(XamUserAreUsersFriends)
 GUEST_EXPORT(XamUserReadProfileSettings)
 {
     // (titleId, user, xuidCount, xuids, settingCount, settingIds*, bufferSize*, buffer, overlapped)
-    // Answer every setting as "not set": the title then uses its defaults.
+    // Every setting answers its default (the profile has never saved one).
     const uint32_t settingCount = ctx.r7.u32, settingIds = ctx.r8.u32, sizePtr = ctx.r9.u32, buffer = ctx.r10.u32;
     const uint32_t overlapped = StackArg(ctx, 8);
     // XUSER_READ_PROFILE_SETTING_RESULT { u32 count, u32 settings* } then
-    // XUSER_PROFILE_SETTING { u32 source, u32 user, u64 xuid? ..., u32 id, XUSER_DATA (0x10) } of 0x28 bytes.
+    // XUSER_PROFILE_SETTING of 0x28 bytes: { u32 source, (pad), u32 user at +8, u32 id at +0x10,
+    // XUSER_DATA at +0x18: { u8 type, pad, 8-byte value } }.
     const uint32_t needed = 8 + settingCount * 0x28;
     if (!buffer || LoadBE32(sizePtr) < needed)
     {
@@ -193,9 +194,15 @@ GUEST_EXPORT(XamUserReadProfileSettings)
     for (uint32_t i = 0; i < settingCount; i++)
     {
         const uint32_t s = buffer + 8 + i * 0x28;
-        StoreBE32(s + 0x00, 0); // source: not set (default)
-        StoreBE32(s + 0x04, ctx.r4.u32);
-        StoreBE32(s + 0x10, LoadBE32(settingIds + i * 4));
+        const uint32_t id = LoadBE32(settingIds + i * 4);
+        // A profile that has never saved a setting answers its default: source 1
+        // (X_USER_PROFILE_SETTING_SOURCE_DEFAULT; 0 is "not found"),
+        // the type the id's high nibble names (1 int32, 2 int64, 3 double, 4 wstring, 5 float,
+        // 6 binary, 7 datetime) and a zero value.
+        StoreBE32(s + 0x00, 1);
+        StoreBE32(s + 0x08, ctx.r4.u32);
+        StoreBE32(s + 0x10, id);
+        *GuestPtr<uint8_t>(s + 0x18) = uint8_t((id >> 28) & 0xF);
     }
     if (overlapped)
     {
