@@ -7,13 +7,15 @@
 // rectangles). Rectangle corners are marked and computed as v1 + v2 - v0.
 //
 // Bindings (one root signature for everything):
-//   b0  per-draw constants for the vertex shader: c[256], bool constants,
+//   b0  per-draw constants for the vertex shader: c[256], bool and loop constants,
 //       vertex fetch table, index list offset, viewport mode
-//   b1  per-draw constants for the pixel shader: c[256], bool constants,
+//   b1  per-draw constants for the pixel shader: c[256], bool and loop constants,
 //       alpha test, texture sizes / sampler modes
 //   t0  guest data (vertex buffers and index lists) as a raw buffer
 //   t1+ textures for fetch slots 0-31
 //   s0 linear wrap, s1 linear clamp, s2 point clamp, s3 point wrap
+//   u0  guest physical memory, writable: only shaders with memory export
+//       (TranslatedShader::memExport) declare it
 #include <cstdint>
 #include <string>
 #include <array>
@@ -32,6 +34,12 @@ struct TranslatedShader
     // Float constants the code reads: c[0] up to this (exclusive), 256 with relative
     // addressing. Only these are uploaded per draw.
     uint32_t constantsUsed = 0;
+    // Pixel shaders: colour targets written (bit per oC#; main() returns oC[0] only), and whether
+    // it writes oDepth (main() then has an SV_Depth output).
+    uint32_t colorTargetsWritten = 0;
+    bool writesDepth = false;
+    // eM# registers the shader exports to memory (bit per eM0-eM4); needs u0 bound.
+    uint32_t memExport = 0;
 };
 
 TranslatedShader TranslateShader(const ucode::Shader& shader);

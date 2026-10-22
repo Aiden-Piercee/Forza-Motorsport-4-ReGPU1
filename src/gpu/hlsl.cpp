@@ -10,10 +10,14 @@ namespace
 using namespace ucode;
 
 const char kPreamble[] = R"(
+#ifndef GUEST_PIXEL
+#define GUEST_PIXEL 0
+#endif
 cbuffer VSConstants : register(b0)
 {
     float4 vc[256];
     uint4 vb[2];      // 256 bool constants
+    uint4 vl[8];      // 32 loop constants (see LoopAddress)
     uint4 vf[96];     // vertex fetch: x byte offset (gmem, or gphys if z), y endian
     uint4 vinfo;      // x index list byte offset, y position mode (0 clip, 1 screen) | 2 points, z/w target size
     float4 vpoint;    // xy constant point diameter (pixels), z/w min/max diameter
@@ -33,6 +37,7 @@ cbuffer PSConstants : register(b1)
 {
     float4 pc[256];
     uint4 pb[2];
+    uint4 pl[8];
     uint4 pinfo;      // x alpha test function (7 = always), y generated-parameter register (0xFF none)
     float4 pinfo2;    // x alpha reference, y/z 1 / render scale (pixel positions back to game pixels), w colour ceiling (0 none)
     uint4 tinfo[32];  // x sampler (0 lin wrap, 1 lin clamp, 2 point clamp, 3 point wrap), y/z size, w dimension (3 cube)
@@ -86,7 +91,14 @@ float XHalf(uint h)
     return f16tof32(h);
 }
 
-float4 Unpack(uint w0, uint w1, uint w2, uint w3, uint format, bool isSigned, bool norm)
+// Signed normalised components, half = 2^(n-1) - 1 per component: by default -2^(n-1) and
+// -half both give -1; the no-zero mode maps the codes evenly onto [-1, 1] with no exact zero.
+float4 SNorm(float4 v, float4 half, bool noZero)
+{
+    return noZero ? (v * 2.0 + 1.0) / (half * 2.0 + 1.0) : max(v / half, -1.0);
+}
+
+float4 Unpack(uint w0, uint w1, uint w2, uint w3, uint format, bool isSigned, bool norm, bool noZero)
 {
     float4 r = float4(0, 0, 0, 1);
     switch (format)
@@ -94,14 +106,14 @@ float4 Unpack(uint w0, uint w1, uint w2, uint w3, uint format, bool isSigned, bo
     case 6: // 8_8_8_8
     {
         uint4 u = uint4(w0 & 0xFF, (w0 >> 8) & 0xFF, (w0 >> 16) & 0xFF, w0 >> 24);
-        if (isSigned) { r = float4(SignExtend(u.x, 8), SignExtend(u.y, 8), SignExtend(u.z, 8), SignExtend(u.w, 8)); if (norm) r = max(r / 127.0, -1.0); }
+        if (isSigned) { r = float4(SignExtend(u.x, 8), SignExtend(u.y, 8), SignExtend(u.z, 8), SignExtend(u.w, 8)); if (norm) r = SNorm(r, 127.0, noZero); }
         else { r = float4(u); if (norm) r /= 255.0; }
         break;
     }
     case 7: // 2_10_10_10
     {
         uint4 u = uint4(w0 & 0x3FF, (w0 >> 10) & 0x3FF, (w0 >> 20) & 0x3FF, w0 >> 30);
-        if (isSigned) { r = float4(SignExtend(u.x, 10), SignExtend(u.y, 10), SignExtend(u.z, 10), SignExtend(u.w, 2)); if (norm) r = max(r / float4(511, 511, 511, 1), -1.0); }
+        if (isSigned) { r = float4(SignExtend(u.x, 10), SignExtend(u.y, 10), SignExtend(u.z, 10), SignExtend(u.w, 2)); if (norm) r = SNorm(r, float4(511, 511, 511, 1), noZero); }
         else { r = float4(u); if (norm) r /= float4(1023, 1023, 1023, 3); }
         break;
     }
@@ -109,16 +121,24 @@ float4 Unpack(uint w0, uint w1, uint w2, uint w3, uint format, bool isSigned, bo
     case 26: // 16_16_16_16
     {
         uint4 u = uint4(w0 & 0xFFFF, w0 >> 16, w1 & 0xFFFF, w1 >> 16);
-        if (isSigned) { r = float4(SignExtend(u.x, 16), SignExtend(u.y, 16), SignExtend(u.z, 16), SignExtend(u.w, 16)); if (norm) r = max(r / 32767.0, -1.0); }
+        if (isSigned) { r = float4(SignExtend(u.x, 16), SignExtend(u.y, 16), SignExtend(u.z, 16), SignExtend(u.w, 16)); if (norm) r = SNorm(r, 32767.0, noZero); }
         else { r = float4(u); if (norm) r /= 65535.0; }
         if (format == 25) r.zw = float2(0, 1);
         break;
     }
     case 31: r = float4(XHalf(w0), XHalf(w0 >> 16), 0, 1); break;
     case 32: r = float4(XHalf(w0), XHalf(w0 >> 16), XHalf(w1), XHalf(w1 >> 16)); break;
-    case 33: r = float4(isSigned ? float(int(w0)) : float(w0), 0, 0, 1); break;
-    case 34: r = float4(isSigned ? float2(int2(w0, w1)) : float2(w0, w1), 0, 1); break;
-    case 35: r = isSigned ? float4(int4(w0, w1, w2, w3)) : float4(w0, w1, w2, w3); break;
+    case 33: // 32
+    case 34: // 32_32
+    case 35: // 32_32_32_32
+    {
+        uint4 u = uint4(w0, format >= 34 ? w1 : 0u, format == 35 ? w2 : 0u, format == 35 ? w3 : 0u);
+        r = isSigned ? float4(int4(u)) : float4(u);
+        if (norm) r = isSigned ? (noZero ? (r * 2.0 + 1.0) / 4294967295.0 : r / 2147483647.0) : r / 4294967295.0;
+        if (format == 33) r.yzw = float3(0, 0, 1);
+        else if (format == 34) r.zw = float2(0, 1);
+        break;
+    }
     case 36: r = float4(asfloat(w0), 0, 0, 1); break;
     case 37: r = float4(asfloat(w0), asfloat(w1), 0, 1); break;
     case 57: r = float4(asfloat(w0), asfloat(w1), asfloat(w2), 1); break;
@@ -144,10 +164,10 @@ float4 Unpack(uint w0, uint w1, uint w2, uint w3, uint format, bool isSigned, bo
     return r;
 }
 
-float4 VFetch(uint fetch, float index, uint stride, uint offset, uint format, bool isSigned, bool norm)
+float4 VFetch(uint fetch, float index, uint stride, uint offset, uint format, bool isSigned, bool norm, bool noZero)
 {
-    uint d = uint(max(index, 0.0)) * stride + offset; // index already rounded or floored
-    return Unpack(LoadGuest(fetch, d), LoadGuest(fetch, d + 1), LoadGuest(fetch, d + 2), LoadGuest(fetch, d + 3), format, isSigned, norm);
+    uint d = uint(max(index, 0.0)) * stride + offset; // index already rounded or floored; offset may be negative (wraps)
+    return Unpack(LoadGuest(fetch, d), LoadGuest(fetch, d + 1), LoadGuest(fetch, d + 2), LoadGuest(fetch, d + 3), format, isSigned, norm, noZero);
 }
 
 // The title binds each vertex shader to the vertex layout it draws by patching its fetch
@@ -157,8 +177,9 @@ float4 VFetch(uint fetch, float index, uint stride, uint offset, uint format, bo
 float4 VFetchK(uint k, float i)
 {
     uint4 p = vfl[k];
-    float idx = (p.x & 0x10000u) ? round(i) : floor(i);
-    return VFetch(p.x & 0x7Fu, idx, p.y, p.z, (p.x >> 8) & 0x3Fu, (p.x & 0x4000u) != 0, (p.x & 0x8000u) != 0) * exp2(float(int(p.w << 10) >> 26));
+    float idx = (p.x & 0x10000u) ? floor(i + 0.5) : floor(i);
+    return VFetch(p.x & 0x7Fu, idx, p.y, p.z, (p.x >> 8) & 0x3Fu, (p.x & 0x4000u) != 0, (p.x & 0x8000u) != 0, (p.x & 0x20000u) != 0) *
+        exp2(float(int(p.w << 10) >> 26));
 }
 
 float4 VMerge(uint k, float4 old, float4 t)
@@ -190,14 +211,27 @@ float3 CubeDirection(float3 stf)
     }
 }
 
-float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel);
+// Texture fetch LOD selection (lodMode): 0 the hardware's own LOD plus lod as a bias (pixel
+// shaders), 1 lod as the level, 2 the given gradients scaled by 2^lod. lod already includes the
+// fetch constant's and the instruction's biases and, for register LOD, setTextureLod's value.
+float4 SampleWith(Texture2D<float4> t, SamplerState s, float2 uv, uint lodMode, float lod, float2 gh, float2 gv)
+{
+#if GUEST_PIXEL
+    [branch] if (lodMode == 0u) return t.SampleBias(s, uv, lod);
+#endif
+    [branch] if (lodMode == 2u) return t.SampleGrad(s, uv, gh, gv);
+    return t.SampleLevel(s, uv, lod);
+}
+
+float4 TFetchRaw(uint slot, float3 coord, bool denorm, uint lodMode, float lod, float3 gh, float3 gv, float2 texel, uint filter);
 
 // Fetch swizzle (3 bits per channel: 0-3 component, 4 zero, 5 one) for
 // textures that live on the GPU; CPU-decoded textures are swizzled already.
 // texel: the instruction's texel offset (PCF taps in shadow filters), in texels.
-float4 TFetch(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel)
+// filter: the instruction's min/mag filter override (0 the fetch constant's, 1 point, 2 linear).
+float4 TFetch(uint slot, float3 coord, bool denorm, uint lodMode, float lod, float3 gh, float3 gv, float2 texel, uint filter)
 {
-    float4 v = TFetchRaw(slot, coord, denorm, vertexStage, bias, texel);
+    float4 v = TFetchRaw(slot, coord, denorm, lodMode, lod, gh, gv, texel, filter);
     // Exponent adjust (fetch constant): texels scaled by 2^n, n in tinfo.x bits 8-13.
     int expAdjust = int(tinfo[slot].x << 18) >> 26;
     if (expAdjust != 0) v *= exp2(float(expAdjust));
@@ -213,18 +247,32 @@ float4 TFetch(uint slot, float3 coord, bool denorm, bool vertexStage, float bias
     return r;
 }
 
-float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float bias, float2 texel)
+float4 TFetchRaw(uint slot, float3 coord, bool denorm, uint lodMode, float lod, float3 gh, float3 gv, float2 texel, uint filter)
 {
     uint index = asuint(tbias[slot].y);
     Texture2D<float4> t = gtex[index];
     TextureCube<float4> tc = gcube[index];
+    const float2 texelSize = float2(max(tinfo[slot].yz & 0xFFFFu, uint2(1, 1)));
     if ((tinfo[slot].w & 0xFFu) == 3)
     {
         float3 dir = CubeDirection(coord);
-        return vertexStage ? tc.SampleLevel(sLinearClamp, dir, max(bias, 0)) : tc.SampleBias(sLinearClamp, dir, bias);
+#if GUEST_PIXEL
+        [branch] if (lodMode == 0u) return tc.SampleBias(sLinearClamp, dir, lod);
+#endif
+        // Register gradients are in face (s, t) space, where a face is one unit wide: the
+        // level the hardware picks for them (the larger footprint, as an isotropic fetch).
+        if (lodMode == 2u)
+            lod += log2(max(max(length(gh.xy), length(gv.xy)) * texelSize.x, 1e-6));
+        return tc.SampleLevel(sLinearClamp, dir, lod);
     }
     float2 uv = coord.xy;
-    const float2 texelSize = float2(max(tinfo[slot].yz & 0xFFFFu, uint2(1, 1)));
+    if (lodMode == 2u)
+    {
+        const float scale = exp2(lod);
+        gh *= scale;
+        gv *= scale;
+        if (denorm) { gh.xy /= texelSize; gv.xy /= texelSize; }
+    }
     if (denorm) uv = (uv + texel) / texelSize;
     else uv += texel / texelSize;
     // Clamp to border (tinfo.x bit 16; bit 17 white): outside the image the border colour, as
@@ -235,15 +283,45 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     // the edge texels' centres; the sampler wraps.
     if ((tinfo[slot].x >> 18) & 1u) uv.x = clamp(uv.x, 0.5 / texelSize.x, 1.0 - 0.5 / texelSize.x);
     if ((tinfo[slot].x >> 19) & 1u) uv.y = clamp(uv.y, 0.5 / texelSize.y, 1.0 - 0.5 / texelSize.y);
-    if (tbias[slot].z > 0.0) uv *= tbias[slot].zw; // declared image inside a wider resolved texture (renderer.cpp)
+    if (tbias[slot].z > 0.0) // declared image inside a wider resolved texture (renderer.cpp)
+    {
+        uv *= tbias[slot].zw;
+        gh.xy *= tbias[slot].zw;
+        gv.xy *= tbias[slot].zw;
+    }
     uint mode = tinfo[slot].x & 3u;
-    if (vertexStage)
-        return t.SampleLevel(sLinearClamp, uv, max(bias, 0));
-    if (mode == 1) return t.SampleBias(sLinearClamp, uv, bias);
-    if (mode == 2) return t.SampleBias(sPointClamp, uv, bias);
-    if (mode == 3) return t.SampleBias(sPointWrap, uv, bias);
-    return t.SampleBias(sLinearWrap, uv, bias);
+    if (filter != 0u)
+    {
+        const bool wrap = mode == 0u || mode == 3u;
+        mode = filter == 1u ? (wrap ? 3u : 2u) : (wrap ? 0u : 1u);
+    }
+    if (mode == 1u) return SampleWith(t, sLinearClamp, uv, lodMode, lod, gh.xy, gv.xy);
+    if (mode == 2u) return SampleWith(t, sPointClamp, uv, lodMode, lod, gh.xy, gv.xy);
+    if (mode == 3u) return SampleWith(t, sPointWrap, uv, lodMode, lod, gh.xy, gv.xy);
+    return SampleWith(t, sLinearWrap, uv, lodMode, lod, gh.xy, gv.xy);
 }
+
+// getTextureWeights: the bilinear lerp factors of a fetch at coord (x, y). The LOD lerp factor
+// (w) and the level the factors are taken at are not modelled: level 0 (shadow-map PCF, the
+// usual reader, has no mips).
+float4 TWeights(uint slot, float3 coord, bool denorm, float2 texel)
+{
+    const float2 size = float2(max(tinfo[slot].yz & 0xFFFFu, uint2(1, 1)));
+    return float4(frac((denorm ? coord.xy : coord.xy * size) + texel - 0.5), 0, 0);
+}
+
+#if GUEST_PIXEL
+// getTextureComputedLod: the level the hardware would sample at, with the biases.
+float TComputedLod(uint slot, float3 coord, bool denorm, float bias)
+{
+    uint index = asuint(tbias[slot].y);
+    if ((tinfo[slot].w & 0xFFu) == 3)
+        return gcube[index].CalculateLevelOfDetailUnclamped(sLinearClamp, CubeDirection(coord)) + bias;
+    float2 uv = denorm ? coord.xy / float2(max(tinfo[slot].yz & 0xFFFFu, uint2(1, 1))) : coord.xy;
+    if (tbias[slot].z > 0.0) uv *= tbias[slot].zw;
+    return gtex[index].CalculateLevelOfDetailUnclamped(sLinearWrap, uv) + bias;
+}
+#endif
 
 float4 CubeOp(float4 a, float4 b)
 {
@@ -263,7 +341,193 @@ float Mul9(float a, float b) { return (a == 0 || b == 0) ? 0 : a * b; }
 float Dot9(float4 a, float4 b) { float4 m = Mul9(a, b); return m.x + m.y + m.z + m.w; }
 
 bool BoolConstant(uint4 b[2], uint index) { return (b[index >> 7][(index >> 5) & 3] >> (index & 31)) & 1; }
+uint LoopConstant(uint4 l[8], uint index) { return l[index >> 2][index & 3]; }
+// aL in a loop: iteration * step + start (count bits 0-7, start 8-15, signed step 16-23),
+// within the hardware's range of [-256, 256].
+int LoopAddress(uint constant, uint iteration)
+{
+    return clamp(int(iteration) * (int(constant << 8) >> 24) + int((constant >> 8) & 0xFFu), -256, 256);
+}
 )";
+
+// Memory export (eA / eM#), declared only by shaders that use it. eA is a stream constant the
+// shader completes: x the base physical address in dwords (bits 0-29, 0b01 above), y 2^23 plus
+// the element index, z 2^23 plus the format (endian 0-2, colour format 8-13, signed 16,
+// integer 17, red/blue swap 19), w 2^23 plus the element count. The eM# written since the last
+// export go to elements index + #. Packing follows the Direct3D conversion rules.
+const char kMemExportPreamble[] = R"(
+RWByteAddressBuffer gexport : register(u0); // guest physical memory
+
+// Up to four components of the given bit widths (low first) into one dword.
+uint MxPack(float4 v, uint4 bits, bool isSigned, bool isInteger)
+{
+    uint packed = 0u, offset = 0u;
+    [unroll] for (uint c = 0u; c < 4u; c++)
+    {
+        const uint n = bits[c];
+        if (n != 0u)
+        {
+            float x = v[c] != v[c] ? 0.0 : v[c];
+            uint u;
+            if (isSigned)
+            {
+                const float m = float((1u << (n - 1u)) - 1u);
+                if (isInteger) x = clamp(x, -1.0 - m, m);
+                else { x = clamp(x, -1.0, 1.0); if (n > 2u) x *= m; }
+                u = uint(int(x + (x < 0.0 ? -0.5 : 0.5)));
+            }
+            else
+            {
+                const float m = float((1u << n) - 1u);
+                x = isInteger ? clamp(x, 0.0, m) : (n > 1u ? saturate(x) * m : saturate(x));
+                u = uint(x + 0.5);
+            }
+            packed |= (u & ((1u << n) - 1u)) << offset;
+            offset += n;
+        }
+    }
+    return packed;
+}
+
+// One element in the colour format; false for formats memory export can't write.
+bool MxEncode(float4 v, uint format, bool isSigned, bool isInteger, out uint4 d, out uint sizeLog2)
+{
+    d = 0u;
+    sizeLog2 = 2u;
+    switch (format)
+    {
+    case 2: case 8: case 9: d.x = MxPack(v, uint4(8, 0, 0, 0), isSigned, isInteger); sizeLog2 = 0u; return true; // 8, 8_A, 8_B
+    case 3: d.x = MxPack(v, uint4(5, 5, 5, 1), isSigned, isInteger); sizeLog2 = 1u; return true;  // 1_5_5_5
+    case 4: d.x = MxPack(v, uint4(5, 6, 5, 0), isSigned, isInteger); sizeLog2 = 1u; return true;  // 5_6_5
+    case 5: d.x = MxPack(v, uint4(5, 5, 6, 0), isSigned, isInteger); sizeLog2 = 1u; return true;  // 6_5_5
+    case 6: case 14: case 50: d.x = MxPack(v, uint4(8, 8, 8, 8), isSigned, isInteger); return true; // 8_8_8_8 (_A, _AS_16_16_16_16)
+    case 7: case 54: d.x = MxPack(v, uint4(10, 10, 10, 2), isSigned, isInteger); return true;    // 2_10_10_10
+    case 10: d.x = MxPack(v, uint4(8, 8, 0, 0), isSigned, isInteger); sizeLog2 = 1u; return true; // 8_8
+    case 15: d.x = MxPack(v, uint4(4, 4, 4, 4), isSigned, isInteger); sizeLog2 = 1u; return true; // 4_4_4_4
+    case 16: case 55: d.x = MxPack(v, uint4(11, 11, 10, 0), isSigned, isInteger); return true;   // 10_11_11
+    case 17: case 56: d.x = MxPack(v, uint4(10, 11, 11, 0), isSigned, isInteger); return true;   // 11_11_10
+    case 24: d.x = MxPack(v, uint4(16, 0, 0, 0), isSigned, isInteger); sizeLog2 = 1u; return true; // 16
+    case 25: d.x = MxPack(v, uint4(16, 16, 0, 0), isSigned, isInteger); return true;              // 16_16
+    case 26: // 16_16_16_16
+        d.x = MxPack(float4(v.xy, 0, 0), uint4(16, 16, 0, 0), isSigned, isInteger);
+        d.y = MxPack(float4(v.zw, 0, 0), uint4(16, 16, 0, 0), isSigned, isInteger);
+        sizeLog2 = 3u;
+        return true;
+    case 30: d.x = f32tof16(v.x); sizeLog2 = 1u; return true;                                   // 16_FLOAT
+    case 31: d.x = f32tof16(v.x) | (f32tof16(v.y) << 16); return true;                          // 16_16_FLOAT
+    case 32: // 16_16_16_16_FLOAT
+        d.xy = f32tof16(v.xz) | (f32tof16(v.yw) << 16);
+        sizeLog2 = 3u;
+        return true;
+    case 36: d.x = asuint(v.x); return true;                                                    // 32_FLOAT
+    case 37: d.xy = asuint(v.xy); sizeLog2 = 3u; return true;                                   // 32_32_FLOAT
+    case 38: d = asuint(v); sizeLog2 = 4u; return true;                                         // 32_32_32_32_FLOAT
+    default: return false;
+    }
+}
+
+uint4 MxSwap(uint4 d, uint endian)
+{
+    if (endian == 4u) { d = d.yxwz; endian = 2u; }      // 8-in-64
+    else if (endian == 5u) { d = d.wzyx; endian = 2u; } // 8-in-128
+    if (endian == 1u || endian == 2u) d = ((d & 0x00FF00FFu) << 8) | ((d >> 8) & 0x00FF00FFu);
+    if (endian == 2u || endian == 3u) d = (d << 16) | (d >> 16);
+    return d;
+}
+
+void MemExport(float4 eA, inout float4 eM[5], inout uint eMw)
+{
+    const uint4 a = asuint(eA);
+    if (eMw != 0u && (a.x >> 30) == 1u && (a.y >> 23) == 0x96u && (a.z >> 23) == 0x96u && (a.w >> 23) == 0x96u)
+    {
+        const uint format = (a.z >> 8) & 63u, endian = a.z & 7u;
+        const bool isSigned = ((a.z >> 16) & 1u) != 0u, isInteger = ((a.z >> 17) & 1u) != 0u, swapRB = ((a.z >> 19) & 1u) != 0u;
+        const uint index = a.y & 0x7FFFFFu, count = a.w & 0x7FFFFFu, base = (a.x & 0x3FFFFFFFu) << 2;
+        [unroll] for (uint k = 0u; k < 5u; k++)
+        {
+            uint4 d;
+            uint sizeLog2;
+            if (((eMw >> k) & 1u) != 0u && index + k < count &&
+                MxEncode(swapRB ? eM[k].zyxw : eM[k], format, isSigned, isInteger, d, sizeLog2))
+            {
+                d = MxSwap(d, endian);
+                const uint at = base + ((index + k) << sizeLog2);
+                if (sizeLog2 == 4u) gexport.Store4(at, d);
+                else if (sizeLog2 == 3u) gexport.Store2(at, d.xy);
+                else if (sizeLog2 == 2u) gexport.Store(at, d.x);
+                else
+                {
+                    // 8 and 16 bits: within the dword (memory exports don't overlap in practice).
+                    const uint shift = (at & 3u) * 8u, mask = (sizeLog2 == 0u ? 0xFFu : 0xFFFFu) << shift;
+                    gexport.InterlockedAnd(at & ~3u, ~mask);
+                    gexport.InterlockedOr(at & ~3u, (d.x << shift) & mask);
+                }
+            }
+        }
+    }
+    eMw = 0u;
+    [unroll] for (uint i = 0u; i < 5u; i++) eM[i] = 0;
+}
+)";
+
+// The shape of a program's control flow, which decides how it is emitted.
+struct ControlFlowShape
+{
+    size_t end = 0;         // index of the first ending CF instruction
+    bool linear = true;     // no jumps, loops, calls or returns before it
+    bool structured = false; // only properly nested loops: emitted as HLSL loops
+    bool hasLoops = false, hasCalls = false;
+};
+
+ControlFlowShape AnalyzeControlFlow(const Shader& shader)
+{
+    ControlFlowShape shape;
+    shape.end = shader.cf.size();
+    for (size_t i = 0; i < shader.cf.size(); i++)
+        if (shader.cf[i].IsEnd())
+        {
+            shape.end = i;
+            break;
+        }
+    bool jumps = false;
+    for (size_t i = 0; i < shader.cf.size() && i <= shape.end; i++)
+    {
+        const CfOp op = shader.cf[i].op();
+        shape.hasLoops = shape.hasLoops || op == CfOp::LoopStart || op == CfOp::LoopEnd;
+        shape.hasCalls = shape.hasCalls || op == CfOp::CondCall || op == CfOp::Return;
+        jumps = jumps || op == CfOp::CondJmp;
+    }
+    shape.linear = !shape.hasLoops && !shape.hasCalls && !jumps;
+    if (shape.linear || shape.hasCalls || jumps)
+        return shape;
+    // Loops only: structured if each loop start skips to just after its own loop end, that end
+    // goes back to just after the start, they share the loop constant, nesting is at most four
+    // deep, no loop repeats the previous iterator and the program doesn't end inside a loop.
+    std::vector<size_t> open;
+    for (size_t i = 0; i <= shape.end; i++)
+    {
+        const Cf& cf = shader.cf[i];
+        if (cf.op() == CfOp::LoopStart)
+        {
+            if (cf.isRepeat() || open.size() == 4)
+                return shape;
+            open.push_back(i);
+        }
+        else if (cf.op() == CfOp::LoopEnd)
+        {
+            if (open.empty())
+                return shape;
+            const Cf& start = shader.cf[open.back()];
+            if (cf.target() != open.back() + 1 || start.target() != i + 1 || cf.loopId() != start.loopId())
+                return shape;
+            open.pop_back();
+        }
+        else if (cf.IsEnd() && !open.empty())
+            return shape;
+    }
+    shape.structured = open.empty();
+    return shape;
+}
 
 struct Emitter
 {
@@ -276,7 +540,9 @@ struct Emitter
     bool literalFetch = false; // a fetch had to be baked into the code
     uint32_t lastStride = 0;
     uint32_t lastSrc = 0, lastSrcSwizzle = 0; // mini fetches reuse the full fetch's index
+    bool lastSrcRelative = false;
     bool lastRound = false;
+    bool memExport = false;    // the program writes eA / eM#
     int indent = 1;
 
     void Line(const std::string& s)
@@ -284,6 +550,12 @@ struct Emitter
         out.append(size_t(indent) * 4, ' ');
         out += s;
         out += '\n';
+    }
+
+    // Temporary register n, or n + aL.
+    static std::string Reg(uint32_t n, bool relative)
+    {
+        return relative ? "r[(" + std::to_string(n) + " + aL) & 63]" : "r[" + std::to_string(n) + "]";
     }
 
     std::string Constant(uint32_t index, uint32_t relative = 0) const
@@ -300,7 +572,7 @@ struct Emitter
     std::string Src(const Source& s) const
     {
         static const char comp[] = "xyzw";
-        std::string base = s.isConstant ? Constant(s.reg, s.relative) : "r[" + std::to_string(s.reg) + "]";
+        std::string base = s.isConstant ? Constant(s.reg, s.relative) : Reg(s.reg, s.tempRelative);
         if (s.abs)
             base = "abs(" + base + ")";
         std::string swz = ".";
@@ -312,8 +584,16 @@ struct Emitter
     // Export register to an HLSL lvalue, or empty if the write is ignored.
     std::string ExportTarget(uint32_t reg) const
     {
+        if (reg == 32)
+            return "eA";
+        if (reg >= 33 && reg <= 37)
+            return "eM[" + std::to_string(reg - 33) + "]";
         if (pixel)
+        {
+            if (reg == 61)
+                return "oDep";
             return reg < 4 ? "oC[" + std::to_string(reg) + "]" : "";
+        }
         if (reg == 63)
             return "opts";
         if (reg == 62)
@@ -321,6 +601,39 @@ struct Emitter
         if (reg < 16)
             return "o[" + std::to_string(reg) + "]";
         return "";
+    }
+
+    // Before emitting: what the program exports (colour targets, depth, memory), so the
+    // declarations and kills can be set up for it.
+    void ScanExports()
+    {
+        for (const Cf& cf : shader.cf)
+        {
+            if (!cf.IsExec())
+                continue;
+            for (uint32_t k = 0; k < cf.count(); k++)
+            {
+                const uint32_t index = cf.address() + k;
+                if ((index + 1) * 3 > shader.words.size() || ((cf.sequence() >> (2 * k)) & 1))
+                    continue;
+                const Alu a = DecodeAlu(&shader.words[index * 3]);
+                if (!a.exportData || !(a.vectorMask | a.scalarMask | (a.scalarDestRelative ? 15u : 0u)))
+                    continue;
+                if (a.vectorDest >= 33 && a.vectorDest <= 37)
+                    result.memExport |= 1u << (a.vectorDest - 33);
+                else if (pixel && a.vectorDest < 4)
+                    result.colorTargetsWritten |= 1u << a.vectorDest;
+                else if (pixel && a.vectorDest == 61)
+                    result.writesDepth = true;
+            }
+        }
+        memExport = result.memExport != 0;
+    }
+
+    // Pending memory exports are written at allocs, before a pixel is killed and at the end.
+    std::string MemExportFlush() const
+    {
+        return memExport ? "MemExport(eA, eM, eMw); " : "";
     }
 
     static std::string Masked(const std::string& target, const std::string& value, uint32_t mask)
@@ -415,25 +728,28 @@ struct Emitter
         {
             static const char* cmp[] = { "== 0.0", "> 0.0", ">= 0.0", "!= 0.0", "== 1.0" };
             const std::string c = A + " " + cmp[a.scalarOp - 35];
-            return std::string(pixel ? "if (" + c + ") discard; " : "") + "s = float(" + c + ");";
+            return std::string(pixel ? "if (" + c + ") { " + MemExportFlush() + "discard; } " : "") + "s = float(" + c + ");";
         }
         case 40: return set("sqrt(" + A + ")");
         case 42: case 43: case 44: case 45: case 46: case 47:
         {
             // Constant operand (component W of src3's swizzle) with a temp
-            // whose index is spread over the opcode and swizzle bits.
+            // whose index is spread over the opcode and swizzle bits. The
+            // instruction's abs_constants and src3 negation apply to both.
             const uint32_t temp = (a.scalarOp & 1) | (uint32_t(a.src3IsTemp) << 1) | (a.src3RawSwizzle & 0x3C);
             static const char comp[] = "xyzw";
-            const std::string ca = Constant(a.src3RawReg) + "." + comp[((a.src3RawSwizzle >> 6) + 3) & 3];
-            const std::string tb = "r[" + std::to_string(temp) + "]." + comp[a.src3RawSwizzle & 3];
+            std::string ca = Constant(a.src3RawReg, a.scalarConstRelative) + "." + comp[((a.src3RawSwizzle >> 6) + 3) & 3];
+            std::string tb = "r[" + std::to_string(temp) + "]." + comp[a.src3RawSwizzle & 3];
+            if (a.absConstants)
+            {
+                ca = "abs(" + ca + ")";
+                tb = "abs(" + tb + ")";
+            }
             const char* op = a.scalarOp <= 43 ? " * " : (a.scalarOp <= 45 ? " + " : " - ");
             const char* neg = a.src[2].negate ? "-" : "";
             if (a.scalarOp <= 43)
                 return set(std::string("Mul9(") + neg + ca + ", " + neg + tb + ")");
-            static const int negMode = getenv("FM2_SC_NEG") ? atoi(getenv("FM2_SC_NEG")) : 0; // 0 both, 1 constant, 2 temp
-            const char* negC = negMode == 2 ? "" : neg;
-            const char* negT = negMode == 1 ? "" : neg;
-            return set(std::string("(") + negC + ca + ")" + op + "(" + negT + tb + ")");
+            return set(std::string("(") + neg + ca + ")" + op + "(" + neg + tb + ")");
         }
         case 48: return set("sin(" + A + ")");
         case 49: return set("cos(" + A + ")");
@@ -459,7 +775,7 @@ struct Emitter
             static const char* cmp[] = { "==", ">", ">=", "!=" };
             body += "{ bool k = any(" + A + " " + cmp[a.vectorOp - 24] + " " + B + "); v = float(k).xxxx; ";
             if (pixel)
-                body += "if (k) discard; ";
+                body += "if (k) { " + MemExportFlush() + "discard; } ";
             body += "} ";
         }
         else
@@ -483,12 +799,14 @@ struct Emitter
                 const uint32_t zero = a.scalarDestRelative ? (~(a.vectorMask | a.scalarMask) & 15) : 0;
                 body += Masked(target, "v", vm) + Masked(target, "s.xxxx", sm) + Masked(target, "float4(1, 1, 1, 1)", one) +
                     Masked(target, "float4(0, 0, 0, 0)", zero);
+                if (a.vectorDest >= 33 && a.vectorDest <= 37 && (vm | sm | one | zero))
+                    body += "eMw |= " + std::to_string(1u << (a.vectorDest - 33)) + "u; ";
             }
         }
         else
         {
-            body += Masked("r[" + std::to_string(a.vectorDest) + "]", "v", a.vectorMask);
-            body += Masked("r[" + std::to_string(a.scalarDest) + "]", "s.xxxx", a.scalarMask);
+            body += Masked(Reg(a.vectorDest, a.vectorDestRelative), "v", a.vectorMask);
+            body += Masked(Reg(a.scalarDest, a.scalarDestRelative), "s.xxxx", a.scalarMask);
         }
         body += "}";
         if (a.predicated)
@@ -496,10 +814,10 @@ struct Emitter
         Line(body);
     }
 
-    static std::string DestSwizzleWrite(uint32_t dest, uint32_t swizzle, const std::string& value)
+    static std::string DestSwizzleWrite(uint32_t dest, bool relative, uint32_t swizzle, const std::string& value)
     {
         std::string s;
-        const std::string target = "r[" + std::to_string(dest) + "]";
+        const std::string target = Reg(dest, relative);
         for (int c = 0; c < 4; c++)
         {
             const uint32_t sel = (swizzle >> (3 * c)) & 7;
@@ -512,6 +830,15 @@ struct Emitter
                 s += target + "." + comp + " = 1.0; ";
         }
         return s;
+    }
+
+    // The texture fetch source operand: three components by the 6-bit swizzle.
+    static std::string TexCoord(const Fetch& f)
+    {
+        static const char comp[] = "xyzw";
+        const std::string reg = Reg(f.src, f.srcRelative) + ".";
+        return "float3(" + reg + comp[f.srcSwizzle & 3] + ", " + reg + comp[(f.srcSwizzle >> 2) & 3] + ", " + reg +
+            comp[(f.srcSwizzle >> 4) & 3] + ")";
     }
 
     void EmitFetch(const Fetch& f)
@@ -529,44 +856,47 @@ struct Emitter
                 lastStride = f.stride;
                 lastSrc = f.src;
                 lastSrcSwizzle = f.srcSwizzle;
+                lastSrcRelative = f.srcRelative;
                 lastRound = f.roundIndex;
             }
             if (getenv("FM2_TRACE_VFETCH"))
-                fprintf(stderr, "vfetch: fmt %u signed %d norm %d exp %d stride %u offset %u mini %d round %d\n", f.format, f.isSigned, f.isNormalized,
+                fprintf(stderr, "vfetch: fmt %u signed %d norm %d exp %d stride %u offset %d mini %d round %d\n", f.format, f.isSigned, f.isNormalized,
                     f.expAdjust, lastStride, f.offset, f.isMini, lastRound);
             const uint32_t k = uint32_t(result.vertexFetchLayout.size());
             static LiveSwitch bakedFetch("FM2_BAKED_VFETCH");
-            const bool dynamic = !bakedFetch && k < 32 && f.src == lastSrc && f.srcSwizzle == lastSrcSwizzle;
+            const bool dynamic = !bakedFetch && k < 32 && f.src == lastSrc && f.srcSwizzle == lastSrcSwizzle && f.srcRelative == lastSrcRelative;
             literalFetch = literalFetch || !dynamic;
+            const std::array<uint32_t, 4> layout = { f.constIndex | (f.format << 8) | (f.isSigned ? 0x4000u : 0) | (f.isNormalized ? 0x8000u : 0) |
+                    (lastRound ? 0x10000u : 0) | (f.signedNoZero ? 0x20000u : 0),
+                lastStride, uint32_t(f.offset), f.destSwizzle | ((uint32_t(f.expAdjust) & 0x3F) << 16) };
             if (layoutOnly)
             {
                 if (dynamic)
-                    result.vertexFetchLayout.push_back({ f.constIndex | (f.format << 8) | (f.isSigned ? 0x4000u : 0) | (f.isNormalized ? 0x8000u : 0) |
-                            (lastRound ? 0x10000u : 0),
-                        lastStride, f.offset, f.destSwizzle | ((uint32_t(f.expAdjust) & 0x3F) << 16) });
+                    result.vertexFetchLayout.push_back(layout);
                 if (std::find(result.vertexFetchConstants.begin(), result.vertexFetchConstants.end(), f.constIndex) ==
                     result.vertexFetchConstants.end())
                     result.vertexFetchConstants.push_back(f.constIndex);
                 return;
             }
+            const std::string dest = Reg(f.dest, f.destRelative);
             if (dynamic)
             {
                 // Layout from vfl[k]; only the registers stay in the code.
-                result.vertexFetchLayout.push_back({ f.constIndex | (f.format << 8) | (f.isSigned ? 0x4000u : 0) | (f.isNormalized ? 0x8000u : 0) |
-                        (lastRound ? 0x10000u : 0),
-                    lastStride, f.offset, f.destSwizzle | ((uint32_t(f.expAdjust) & 0x3F) << 16) });
-                char call[160];
-                snprintf(call, sizeof(call), "{ float4 t = VFetchK(%u, r[%u].%c); r[%u] = VMerge(%u, r[%u], t); }", k, f.src,
-                    "xyzw"[f.srcSwizzle & 3], f.dest, k, f.dest);
+                result.vertexFetchLayout.push_back(layout);
+                char call[200];
+                snprintf(call, sizeof(call), "{ float4 t = VFetchK(%u, %s.%c); %s = VMerge(%u, %s, t); }", k, Reg(f.src, f.srcRelative).c_str(),
+                    "xyzw"[f.srcSwizzle & 3], dest.c_str(), k, dest.c_str());
                 body = call;
             }
             else
             {
-                char call[320];
-                snprintf(call, sizeof(call), "VFetch(%u, %s(r[%u].%c), %u, %u, %u, %s, %s) * %.9g", f.constIndex, lastRound ? "round" : "floor",
-                    lastSrc, "xyzw"[lastSrcSwizzle & 3], lastStride, f.offset, f.format, f.isSigned ? "true" : "false",
-                    f.isNormalized ? "true" : "false", std::ldexp(1.0, f.expAdjust));
-                body = std::string("{ float4 t = ") + call + "; " + DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
+                char call[360];
+                const std::string index = lastRound ? "floor(" + Reg(lastSrc, lastSrcRelative) + "." + "xyzw"[lastSrcSwizzle & 3] + " + 0.5)"
+                                                    : "floor(" + Reg(lastSrc, lastSrcRelative) + "." + "xyzw"[lastSrcSwizzle & 3] + ")";
+                snprintf(call, sizeof(call), "VFetch(%u, %s, %u, %uu, %u, %s, %s, %s) * %.9g", f.constIndex, index.c_str(), lastStride,
+                    uint32_t(f.offset), f.format, f.isSigned ? "true" : "false", f.isNormalized ? "true" : "false",
+                    f.signedNoZero ? "true" : "false", std::ldexp(1.0, f.expAdjust));
+                body = std::string("{ float4 t = ") + call + "; " + DestSwizzleWrite(f.dest, f.destRelative, f.destSwizzle, "t") + "}";
             }
             bool known = false;
             for (uint32_t c : result.vertexFetchConstants)
@@ -574,16 +904,43 @@ struct Emitter
             if (!known)
                 result.vertexFetchConstants.push_back(f.constIndex);
         }
-        else if (f.opcode == 1)
+        else if (f.opcode == 1 || f.opcode == 17 || f.opcode == 19)
         {
-            static const char comp[] = "xyzw";
-            const std::string reg = "r[" + std::to_string(f.src) + "].";
-            const std::string uv = "float3(" + reg + comp[f.srcSwizzle & 3] + ", " + reg + comp[(f.srcSwizzle >> 2) & 3] + ", " + reg +
-                comp[(f.srcSwizzle >> 4) & 3] + ")";
-            char call[320];
-            snprintf(call, sizeof(call), "TFetch(%u, %s, %s, %s, %.4f + tbias[%u].x, float2(%.1f, %.1f))", f.constIndex, uv.c_str(),
-                f.denormalized ? "true" : "false", pixel ? "false" : "true", f.lodBias, f.constIndex, f.offsetX, f.offsetY);
-            body = std::string("{ float4 t = ") + call + "; " + DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
+            // Texture fetch (1), getTextureComputedLod (17), getTextureWeights (19).
+            const std::string coord = TexCoord(f);
+            char call[400];
+            if (f.opcode == 19)
+                snprintf(call, sizeof(call), "TWeights(%u, %s, %s, float2(%.1f, %.1f))", f.constIndex, coord.c_str(),
+                    f.denormalized ? "true" : "false", f.offsetX, f.offsetY);
+            else if (f.opcode == 17)
+            {
+                if (pixel)
+                    snprintf(call, sizeof(call), "TComputedLod(%u, %s, %s, %.4f + tbias[%u].x).xxxx", f.constIndex, coord.c_str(),
+                        f.denormalized ? "true" : "false", f.lodBias, f.constIndex);
+                else
+                    snprintf(call, sizeof(call), "float4(0, 0, 0, 0)"); // no implicit LOD outside pixel shaders
+            }
+            else
+            {
+                // LOD: the hardware's own (pixel shaders) or the given gradients, else explicit; the
+                // biases of the fetch constant and the instruction, and setTextureLod's value, add up.
+                // A base-map mip filter samples level 0 only.
+                const bool computed = f.useComputedLod && (pixel || f.useRegisterGradients);
+                uint32_t lodMode = computed ? (f.useRegisterGradients ? 2u : 0u) : 1u;
+                char lod[64];
+                if (f.mipFilter == 2)
+                {
+                    lodMode = 1;
+                    snprintf(lod, sizeof(lod), "0.0");
+                }
+                else
+                    snprintf(lod, sizeof(lod), "%.4f + tbias[%u].x%s", f.lodBias, f.constIndex, f.useRegisterLod ? " + tlod" : "");
+                // Instruction min/mag filter override, when both agree on point or linear.
+                const uint32_t filter = (f.magFilter == f.minFilter && f.magFilter < 2) ? f.magFilter + 1 : 0;
+                snprintf(call, sizeof(call), "TFetch(%u, %s, %s, %uu, %s, %s, float2(%.1f, %.1f), %uu)", f.constIndex, coord.c_str(),
+                    f.denormalized ? "true" : "false", lodMode, lod, lodMode == 2 ? "tgh, tgv" : "0, 0", f.offsetX, f.offsetY, filter);
+            }
+            body = std::string("{ float4 t = ") + call + "; " + DestSwizzleWrite(f.dest, f.destRelative, f.destSwizzle, "t") + "}";
             result.usedTextureSlots |= 1u << f.constIndex;
         }
         else if (f.opcode == 18 && pixel)
@@ -592,13 +949,19 @@ struct Emitter
             // (ddx(a), ddy(a), ddx(b), ddy(b)). Vector-font shaders use it for
             // anti-aliased curve edges.
             static const char comp[] = "xyzw";
-            const std::string a = "r[" + std::to_string(f.src) + "]." + comp[f.srcSwizzle & 3];
-            const std::string b = "r[" + std::to_string(f.src) + "]." + comp[(f.srcSwizzle >> 2) & 3];
+            const std::string a = Reg(f.src, f.srcRelative) + "." + comp[f.srcSwizzle & 3];
+            const std::string b = Reg(f.src, f.srcRelative) + "." + comp[(f.srcSwizzle >> 2) & 3];
             body = "{ float4 t = float4(ddx(" + a + "), ddy(" + a + "), ddx(" + b + "), ddy(" + b + ")); " +
-                DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
+                DestSwizzleWrite(f.dest, f.destRelative, f.destSwizzle, "t") + "}";
         }
+        else if (f.opcode == 24)
+            body = "tlod = " + TexCoord(f) + ".x;"; // setTextureLod
+        else if (f.opcode == 25)
+            body = "tgh = " + TexCoord(f) + ";"; // setTextureGradientsHorz
+        else if (f.opcode == 26)
+            body = "tgv = " + TexCoord(f) + ";"; // setTextureGradientsVert
         else
-            body = DestSwizzleWrite(f.dest, f.destSwizzle, "float4(0, 0, 0, 0)"); // other texture queries
+            body = DestSwizzleWrite(f.dest, f.destRelative, f.destSwizzle, "float4(0, 0, 0, 0)"); // getTextureBorderColorFrac, vertex-stage getGradients
         if (f.predicated)
             body = std::string("if (") + (f.predCondition ? "p" : "!p") + ") { " + body + " }";
         Line(body);
@@ -629,100 +992,192 @@ struct Emitter
         }
     }
 
-    // Control flow as a program-counter state machine: one block per CF
-    // instruction, blocks run in order within an iteration, jumps set pc.
-    void EmitProgram()
+    std::string BoolCondition(uint32_t index, bool condition) const
     {
-        bool linear = true;
-        for (const Cf& cf : shader.cf)
-            linear = linear && cf.op() != CfOp::CondJmp && cf.op() != CfOp::LoopStart && cf.op() != CfOp::LoopEnd &&
-                cf.op() != CfOp::CondCall && cf.op() != CfOp::Return;
-        if (!linear)
+        return std::string("BoolConstant(") + (pixel ? "pb" : "vb") + ", " + std::to_string(index) + ") == " + (condition ? "true" : "false");
+    }
+
+    // Jumps and calls: always, on the predicate or on a bool constant.
+    std::string JumpCondition(const Cf& cf) const
+    {
+        if (cf.isUnconditional())
+            return "true";
+        if (cf.isPredicated())
+            return cf.condition() ? "p" : "!p";
+        return BoolCondition(cf.cfBoolAddress(), cf.condition());
+    }
+
+    // An exec-family instruction (and alloc / no-op ones) in place.
+    void EmitStraight(const Cf& cf)
+    {
+        switch (cf.op())
         {
-            Line("uint cfpc = 0;");
-            Line("[loop] for (uint guard = 0; guard < 1024 && cfpc != 0xFFFFu; guard++)");
-            Line("{");
+        case CfOp::Nop:
+        case CfOp::MarkVsFetchDone:
+            break;
+        case CfOp::Alloc:
+            // An alloc ends the open memory export; allocating export memory starts a new one.
+            if (memExport)
+            {
+                Line(MemExportFlush());
+                if (cf.allocType() == 3)
+                    Line("eA = 0;");
+            }
+            break;
+        case CfOp::Exec:
+        case CfOp::ExecEnd:
+            EmitExec(cf);
+            break;
+        case CfOp::CondExec:
+        case CfOp::CondExecEnd:
+        case CfOp::CondExecPredClean:
+        case CfOp::CondExecPredCleanEnd:
+            Line("if (" + BoolCondition((cf.hi >> 2) & 0xFF, cf.condition()) + ") {");
             indent++;
+            EmitExec(cf);
+            indent--;
+            Line("}");
+            break;
+        case CfOp::CondExecPred:
+        case CfOp::CondExecPredEnd:
+            Line(std::string("if (") + (cf.condition() ? "p" : "!p") + ") {");
+            indent++;
+            EmitExec(cf);
+            indent--;
+            Line("}");
+            break;
+        default:
+            error = std::string("control flow op ") + std::to_string(unsigned(cf.op())) + " not supported here";
+            break;
         }
+    }
+
+    // Straight-line programs, and ones whose only control flow is nested loops: in order up to
+    // the end, loops as HLSL loops (aL from the innermost loop's constant and iteration).
+    void EmitStructured(const ControlFlowShape& shape)
+    {
+        const char* loops = pixel ? "pl" : "vl";
+        int depth = 0;
+        for (size_t i = 0; i <= shape.end && i < shader.cf.size(); i++)
+        {
+            const Cf& cf = shader.cf[i];
+            if (cf.op() == CfOp::LoopStart)
+            {
+                const std::string d = std::to_string(depth);
+                Line("{");
+                indent++;
+                Line("const uint lc" + d + " = LoopConstant(" + loops + ", " + std::to_string(cf.loopId()) + ");");
+                Line("[loop] for (uint li" + d + " = 0; li" + d + " < (lc" + d + " & 0xFFu); li" + d + "++)");
+                Line("{");
+                indent++;
+                Line("aL = LoopAddress(lc" + d + ", li" + d + ");");
+                depth++;
+            }
+            else if (cf.op() == CfOp::LoopEnd)
+            {
+                depth--;
+                if (cf.isPredicatedBreak())
+                    Line(std::string("if (") + (cf.condition() ? "p" : "!p") + ") break;");
+                indent--;
+                Line("}");
+                const std::string outer = std::to_string(depth - 1);
+                Line(depth ? "aL = LoopAddress(lc" + outer + ", li" + outer + ");" : "aL = 0;");
+                indent--;
+                Line("}");
+            }
+            else
+                EmitStraight(cf);
+            if (!error.empty())
+                return;
+        }
+    }
+
+    // Anything else (jumps, calls, loops that don't nest): a program-counter state machine, one
+    // block per CF instruction including subroutines after the end; blocks run in order within
+    // an iteration, jumps set the counter. Loops and calls keep the hardware's four-deep stacks.
+    void EmitStateMachine(const ControlFlowShape& shape)
+    {
+        Line("uint cfpc = 0;");
+        if (shape.hasLoops)
+            Line("uint lsp = 0; uint lcs[4] = { 0, 0, 0, 0 }; uint lit[4] = { 0, 0, 0, 0 };");
+        if (shape.hasCalls)
+            Line("uint csp = 0; uint cret[4] = { 0, 0, 0, 0 };");
+        // The guard only stops a runaway program: loops run up to 255 times, four deep.
+        Line(std::string("[loop] for (uint guard = 0; guard < ") + (shape.hasLoops ? "0x100000u" : "1024u") + " && cfpc != 0xFFFFu; guard++)");
+        Line("{");
+        indent++;
+        const char* loops = pixel ? "pl" : "vl";
         for (size_t i = 0; i < shader.cf.size(); i++)
         {
             const Cf& cf = shader.cf[i];
-            const std::string next = cf.IsEnd() ? "0xFFFFu" : std::to_string(i + 1);
-            if (!linear)
-            {
-                Line("if (cfpc == " + std::to_string(i) + "u)");
-                Line("{");
-                indent++;
-            }
+            const std::string next = cf.IsEnd() ? "0xFFFFu" : std::to_string(i + 1) + "u";
+            Line("if (cfpc == " + std::to_string(i) + "u)");
+            Line("{");
+            indent++;
             switch (cf.op())
             {
-            case CfOp::Nop:
-            case CfOp::Alloc:
-            case CfOp::MarkVsFetchDone:
+            case CfOp::CondJmp:
+                Line("cfpc = (" + JumpCondition(cf) + ") ? " + std::to_string(cf.target()) + "u : " + next + ";");
+                Line("continue;");
                 break;
-            case CfOp::Exec:
-            case CfOp::ExecEnd:
-                EmitExec(cf);
+            case CfOp::CondCall:
+                // A fifth nested call is dropped, as on the hardware.
+                Line("if ((" + JumpCondition(cf) + ") && csp < 4u) { cret[csp] = " + next + "; csp++; cfpc = " + std::to_string(cf.target()) +
+                    "u; } else cfpc = " + next + ";");
+                Line("continue;");
                 break;
-            case CfOp::CondExec:
-            case CfOp::CondExecEnd:
-            case CfOp::CondExecPredClean:
-            case CfOp::CondExecPredCleanEnd:
+            case CfOp::Return:
+                // Outside a call, a return does nothing.
+                Line("if (csp == 0u) cfpc = " + next + "; else { csp--; cfpc = cret[csp]; }");
+                Line("continue;");
+                break;
+            case CfOp::LoopStart:
             {
-                char cond[96];
-                snprintf(cond, sizeof(cond), "if (BoolConstant(%s, %u) == %s)", pixel ? "pb" : "vb", (cf.hi >> 2) & 0xFF,
-                    cf.condition() ? "true" : "false");
-                Line(std::string(cond) + " {");
-                indent++;
-                EmitExec(cf);
-                indent--;
-                Line("}");
+                // Iterator 0 (kept from the last loop at this depth when repeating); skip the loop
+                // when it is already at the count.
+                const std::string skip = std::to_string(cf.target()) + "u";
+                Line("if (lsp >= 4u) { cfpc = " + skip + "; continue; }");
+                Line("lcs[lsp] = LoopConstant(" + std::string(loops) + ", " + std::to_string(cf.loopId()) + ");");
+                if (!cf.isRepeat())
+                    Line("lit[lsp] = 0;");
+                Line("if (lit[lsp] >= (lcs[lsp] & 0xFFu)) { cfpc = " + skip + "; continue; }");
+                Line("aL = LoopAddress(lcs[lsp], lit[lsp]); lsp++; cfpc = " + next + ";");
+                Line("continue;");
                 break;
             }
-            case CfOp::CondExecPred:
-            case CfOp::CondExecPredEnd:
-                Line(std::string("if (") + (cf.condition() ? "p" : "!p") + ") {");
-                indent++;
-                EmitExec(cf);
-                indent--;
-                Line("}");
-                break;
-            case CfOp::CondJmp:
+            case CfOp::LoopEnd:
             {
-                const uint32_t target = cf.lo & 0x1FFF;
-                std::string cond;
-                if ((cf.lo >> 13) & 1)
-                    cond = "true";
-                else if ((cf.lo >> 14) & 1)
-                    cond = cf.condition() ? "p" : "!p";
-                else
-                    cond = std::string("BoolConstant(") + (pixel ? "pb" : "vb") + ", " + std::to_string((cf.hi >> 2) & 0xFF) + ") == " +
-                        (cf.condition() ? "true" : "false");
-                Line("cfpc = (" + cond + ") ? " + std::to_string(target) + "u : " + next + "u;");
+                const std::string brk = cf.isPredicatedBreak() ? std::string(" && ") + (cf.condition() ? "!p" : "p") : "";
+                Line("if (lsp == 0u) { cfpc = " + next + "; continue; }");
+                Line("lit[lsp - 1u]++;");
+                Line("if (lit[lsp - 1u] < (lcs[lsp - 1u] & 0xFFu)" + brk + ") { aL = LoopAddress(lcs[lsp - 1u], lit[lsp - 1u]); cfpc = " +
+                    std::to_string(cf.target()) + "u; }");
+                Line("else { lsp--; aL = lsp ? LoopAddress(lcs[lsp - 1u], lit[lsp - 1u]) : 0; cfpc = " + next + "; }");
                 Line("continue;");
                 break;
             }
             default:
-                error = std::string("control flow op ") + std::to_string(unsigned(cf.op())) + " not supported yet";
-                return;
+                EmitStraight(cf);
+                Line("cfpc = " + next + ";");
+                break;
             }
             if (!error.empty())
                 return;
-            if (!linear)
-            {
-                if (cf.op() != CfOp::CondJmp)
-                    Line("cfpc = " + next + (cf.IsEnd() ? ";" : "u;"));
-                indent--;
-                Line("}");
-            }
-            if (cf.IsEnd())
-                break;
-        }
-        if (!linear)
-        {
             indent--;
             Line("}");
         }
+        indent--;
+        Line("}");
+    }
+
+    void EmitProgram()
+    {
+        ScanExports();
+        const ControlFlowShape shape = AnalyzeControlFlow(shader);
+        if (shape.linear || shape.structured)
+            EmitStructured(shape);
+        else
+            EmitStateMachine(shape);
     }
 };
 }
@@ -737,17 +1192,20 @@ bool TranslateVertexFetchLayout(const Shader& shader, TranslatedShader& out)
     TranslatedShader result;
     if (!shader.valid || shader.pixel)
         return false;
+    // The same walk as EmitProgram for programs emitted in CF order up to the end; the state
+    // machine also emits subroutines after it, so those are translated in full.
+    const ControlFlowShape shape = AnalyzeControlFlow(shader);
+    if (!shape.linear && !shape.structured)
+        return false;
     Emitter e{ shader, shader.pixel, {}, {}, result };
     e.layoutOnly = true;
-    // The same walk as EmitProgram: control flow in order, each exec once, up to the end.
-    for (const Cf& cf : shader.cf)
+    for (size_t i = 0; i <= shape.end && i < shader.cf.size(); i++)
     {
+        const Cf& cf = shader.cf[i];
         if (cf.IsExec())
             e.EmitExec(cf);
         if (!e.error.empty() || e.literalFetch)
             return false;
-        if (cf.IsEnd())
-            break;
     }
     out.vertexFetchLayout = std::move(result.vertexFetchLayout);
     out.vertexFetchConstants = std::move(result.vertexFetchConstants);
@@ -770,14 +1228,25 @@ TranslatedShader TranslateShader(const Shader& shader)
         return result;
     }
 
-    std::string h = kPreamble;
+    std::string h = shader.pixel ? "#define GUEST_PIXEL 1\n" : "";
+    h += kPreamble;
+    if (result.memExport)
+        h += kMemExportPreamble;
+    // Shader state beyond the temporaries: texture LOD and gradients from the set* fetches,
+    // and the open memory export.
+    std::string state = "    float tlod = 0; float3 tgh = 0, tgv = 0;\n";
+    if (result.memExport)
+        state += "    float4 eA = 0; float4 eM[5]; [unroll] for (int m = 0; m < 5; m++) eM[m] = 0; uint eMw = 0;\n";
     if (!shader.pixel)
     {
         h += "void GuestVS(uint vindex, out float4 opos, out float4 o[16], out float4 opts)\n{\n"
              "    float4 r[64];\n    [unroll] for (int i = 0; i < 64; i++) r[i] = 0;\n"
              "    [unroll] for (int j = 0; j < 16; j++) o[j] = 0;\n"
              "    r[0].x = float(vindex); opos = float4(0, 0, 0, 1); opts = 0; float ps = 0; bool p = false; int a0 = 0, aL = 0;\n";
+        h += state;
         h += e.out;
+        if (result.memExport)
+            h += "    " + e.MemExportFlush() + "\n";
         h += "}\n"
              "void GuestVS(uint vindex, out float4 opos, out float4 o[16])\n{\n"
              "    float4 opts; GuestVS(vindex, opos, o, opts);\n}\n"
@@ -902,14 +1371,23 @@ TranslatedShader TranslateShader(const Shader& shader)
     }
     else
     {
-        h += "float4 main(VSOut input) : SV_Target0\n{\n"
-             "    float4 r[64];\n    [unroll] for (int i = 0; i < 64; i++) r[i] = 0;\n"
+        // A shader that exports depth always writes SV_Depth: where it doesn't, the rasterised depth.
+        h += result.writesDepth ? "float4 main(VSOut input, out float oDepthOut : SV_Depth) : SV_Target0\n{\n"
+                                : "float4 main(VSOut input) : SV_Target0\n{\n";
+        h += "    float4 r[64];\n    [unroll] for (int i = 0; i < 64; i++) r[i] = 0;\n"
              "    [unroll] for (int j = 0; j < 16; j++) r[j] = input.o[j];\n"
              "    float4 oC[4]; [unroll] for (int k = 0; k < 4; k++) oC[k] = 0;\n"
-             "    float ps = 0; bool p = false; int a0 = 0, aL = 0;\n"
-             "    // Generated parameter: pixel position, point sprite coordinate.\n"
+             "    float ps = 0; bool p = false; int a0 = 0, aL = 0;\n";
+        h += state;
+        if (result.writesDepth)
+            h += "    float4 oDep = input.pos.zzzz;\n";
+        h += "    // Generated parameter: pixel position, point sprite coordinate.\n"
              "    if (pinfo.y < 16u) r[pinfo.y] = float4(input.pos.xy * pinfo2.yz, input.pcoord);\n";
         h += e.out;
+        if (result.memExport)
+            h += "    " + e.MemExportFlush() + "\n";
+        if (result.writesDepth)
+            h += "    oDepthOut = oDep.x;\n";
         h += "    switch (pinfo.x)\n    {\n"
              "    case 0: discard; break;\n"
              "    case 1: if (!(oC[0].a < pinfo2.x)) discard; break;\n"

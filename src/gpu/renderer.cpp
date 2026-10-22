@@ -2170,6 +2170,13 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
     if (canonical && cs.info.ok)
         if (TranslatedShader check; TranslateVertexFetchLayout(parsed, check))
             g_canonical.emplace(canonical, &cs);
+    // Memory export writes guest memory through u0, which the root signature doesn't bind yet
+    // (and the CPU doesn't see the written range): not drawn until that is in place.
+    if (cs.info.ok && cs.info.memExport)
+    {
+        cs.info.ok = false;
+        cs.info.error = "memory export (eM#) needs the u0 guest-memory binding";
+    }
     if (!cs.info.ok)
     {
         Log("renderer: %s %016llx not translated: %s", pixel ? "ps" : "vs", (unsigned long long)hash, cs.info.error.c_str());
@@ -2330,7 +2337,10 @@ std::string MotionVariant(const std::string& hlsl, bool pixel)
     if (pixel)
     {
         if (!replace("float4 main(VSOut input) : SV_Target0\n{", "struct PSMotionOut { float4 c : SV_Target0; float2 mv : SV_Target1; };\n"
-                                                                    "PSMotionOut main(VSOut input)\n{"))
+                                                                    "PSMotionOut main(VSOut input)\n{") &&
+            !replace("float4 main(VSOut input, out float oDepthOut : SV_Depth) : SV_Target0\n{",
+                "struct PSMotionOut { float4 c : SV_Target0; float2 mv : SV_Target1; };\n"
+                "PSMotionOut main(VSOut input, out float oDepthOut : SV_Depth)\n{"))
             return {};
         const size_t at = h.rfind("    return oC[0];\n}");
         if (at == std::string::npos)
@@ -2353,6 +2363,10 @@ std::string MotionVariant(const std::string& hlsl, bool pixel)
     prev.replace(0, std::string("void GuestVS(").size(), "void GuestVSPrev(");
     for (size_t at = 0; (at = prev.find("vc[", at)) != std::string::npos; at += 7)
         prev.replace(at, 3, "vcPrev[");
+    // The second run only computes last frame's position: it must not export to memory again.
+    static const std::string exportCall = "MemExport(eA, eM, eMw);";
+    for (size_t at = 0; (at = prev.find(exportCall, at)) != std::string::npos;)
+        prev.erase(at, exportCall.size());
     h.insert(end + 2, prev);
     // The viewport transform (from the target size to the clip position) as a function.
     const std::string from = "    float2 size = float2(vinfo.zw);\n";
@@ -6154,11 +6168,12 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         return;
     }
 
-    // Vertex constants: c[256], bools, fetch table, info.
+    // Vertex constants: c[256], bools, loop constants, fetch table, info.
     struct VSConstants
     {
         float c[256][4];
         uint32_t b[8];
+        uint32_t l[32];
         uint32_t vf[96][4];
         uint32_t info[4];
         float point[4];
@@ -6172,6 +6187,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     {
         float c[256][4];
         uint32_t b[8];
+        uint32_t l[32];
         uint32_t info[4];
         float info2[4];
         uint32_t tinfo[32][4];
@@ -6225,6 +6241,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     for (uint32_t i = 0; i < 8; i++)
         vc->b[i] = pc->b[i] = gpureg::Get(gpureg::BoolConstants + i);
+    // Loop constants (count, aL start and step), shared by both stages like the bools.
+    for (uint32_t i = 0; i < 32; i++)
+        vc->l[i] = pc->l[i] = gpureg::Get(gpureg::LoopConstants + i);
     // Debug: FM2_FORCE_BOOL=<index>:<0|1> forces one boolean constant for every draw.
     if (static const char* force = getenv("FM2_FORCE_BOOL"); force)
     {

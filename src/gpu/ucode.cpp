@@ -30,6 +30,7 @@ Source DecodeSource(uint32_t reg, bool isTemp, uint32_t swizzle, bool negate, bo
     if (isTemp)
     {
         s.reg = reg & 0x3F;
+        s.tempRelative = (reg & 0x40) != 0;
         s.abs = (reg & 0x80) != 0;
     }
     else
@@ -46,8 +47,10 @@ std::string SourceText(const Source& s)
 {
     static const char comp[] = "xyzw";
     char buf[48];
-    snprintf(buf, sizeof(buf), "%s%s%s%u.%c%c%c%c%s", s.negate ? "-" : "", s.abs ? "|" : "", s.isConstant ? "c" : "r", s.reg,
-        comp[s.swizzle[0]], comp[s.swizzle[1]], comp[s.swizzle[2]], comp[s.swizzle[3]], s.abs ? "|" : "");
+    static const char* rel[] = { "", "[a0]", "[aL]" };
+    snprintf(buf, sizeof(buf), "%s%s%s%u%s.%c%c%c%c%s", s.negate ? "-" : "", s.abs ? "|" : "", s.isConstant ? "c" : "r", s.reg,
+        s.isConstant ? rel[s.relative % 3] : (s.tempRelative ? "[aL]" : ""), comp[s.swizzle[0]], comp[s.swizzle[1]],
+        comp[s.swizzle[2]], comp[s.swizzle[3]], s.abs ? "|" : "");
     return buf;
 }
 
@@ -129,7 +132,8 @@ Shader Parse(const uint32_t* microcodeBE, uint32_t dwords, bool pixel)
         shader.words[i] = __builtin_bswap32(microcodeBE[i]);
 
     // Control flow comes first, two 48-bit instructions per 3 dwords, up to
-    // the lowest instruction address any exec references.
+    // the lowest instruction address any exec references. Not just up to the
+    // first end: subroutines (CondCall targets) are placed after it.
     uint32_t cfEnd = dwords / 3;
     for (uint32_t triple = 0; triple < cfEnd && triple * 3 + 2 < dwords; triple++)
     {
@@ -139,19 +143,13 @@ Shader Parse(const uint32_t* microcodeBE, uint32_t dwords, bool pixel)
         pair[0].hi = w[1] & 0xFFFF;
         pair[1].lo = (w[1] >> 16) | (w[2] << 16);
         pair[1].hi = w[2] >> 16;
-        bool ended = false;
         for (const Cf& cf : pair)
         {
             shader.cf.push_back(cf);
             if (cf.IsExec() && cf.count())
                 cfEnd = std::min(cfEnd, cf.address());
             if (cf.IsEnd())
-                ended = true;
-        }
-        if (ended)
-        {
-            shader.valid = true;
-            break;
+                shader.valid = true;
         }
     }
     return shader;
@@ -161,6 +159,7 @@ Alu DecodeAlu(const uint32_t* w)
 {
     Alu a{};
     a.vectorDest = Bits(w[0], 0, 6);
+    a.vectorDestRelative = Bits(w[0], 6, 1);
     const bool absConstants = Bits(w[0], 7, 1);
     a.scalarDest = Bits(w[0], 8, 6);
     a.scalarDestRelative = Bits(w[0], 14, 1);
@@ -177,26 +176,22 @@ Alu DecodeAlu(const uint32_t* w)
     const uint32_t reg[3] = { Bits(w[2], 16, 8), Bits(w[2], 8, 8), Bits(w[2], 0, 8) };
     a.vectorOp = Bits(w[2], 24, 5);
     const bool temp[3] = { bool(Bits(w[2], 31, 1)), bool(Bits(w[2], 30, 1)), bool(Bits(w[2], 29, 1)) };
-    // Constant sources take the const_0 / const_1 relative bits in order;
-    // address_absolute picks a0 over the loop index.
+    // Constant sources take the const_0 / const_1 relative bits: the first operand const_0,
+    // later ones const_0 if every operand before them is a temporary, else const_1 (the second
+    // and third constant of one instruction share const_1). Which operands the operation
+    // actually reads doesn't matter, only the select bits. address_absolute picks a0 over
+    // the loop index.
     const bool addressAbsolute = Bits(w[1], 29, 1);
     const bool constRelative[2] = { bool(Bits(w[1], 31, 1)), bool(Bits(w[1], 30, 1)) };
-    // Operands in slot order: the vector op's (by arity), then src3 for the scalar op.
-    const uint32_t op = Bits(w[2], 24, 5);
-    const uint32_t vectorArity = (op == 11 || op == 12 || op == 13 || op == 14 || op == 17) ? 3
-        : (op == 8 || op == 9 || op == 10 || op == 19) ? 1 : 2;
-    uint32_t constSlot = 0;
     for (int i = 0; i < 3; i++)
     {
         a.src[i] = DecodeSource(reg[i], temp[i], swz[i], neg[i], absConstants);
-        const bool used = uint32_t(i) < vectorArity || i == 2;
-        if (used && !temp[i] && constSlot < 2)
-        {
-            if (constRelative[constSlot])
-                a.src[i].relative = addressAbsolute ? 1 : 2;
-            constSlot++;
-        }
+        const bool allTempBefore = (i < 1 || temp[0]) && (i < 2 || temp[1]);
+        if (!temp[i] && constRelative[allTempBefore ? 0 : 1])
+            a.src[i].relative = addressAbsolute ? 1 : 2;
     }
+    a.absConstants = absConstants;
+    a.scalarConstRelative = constRelative[temp[0] && temp[1] ? 0 : 1] ? (addressAbsolute ? 1 : 2) : 0;
     a.src3RawReg = reg[2];
     a.src3IsTemp = temp[2];
     a.src3RawSwizzle = swz[2];
@@ -208,7 +203,9 @@ Fetch DecodeFetch(const uint32_t* w)
     Fetch f{};
     f.opcode = Bits(w[0], 0, 5);
     f.src = Bits(w[0], 5, 6);
+    f.srcRelative = Bits(w[0], 11, 1);
     f.dest = Bits(w[0], 12, 6);
+    f.destRelative = Bits(w[0], 18, 1);
     f.destSwizzle = Bits(w[1], 0, 12);
     f.predicated = Bits(w[1], 31, 1);
     f.predCondition = Bits(w[2], 31, 1);
@@ -218,22 +215,31 @@ Fetch DecodeFetch(const uint32_t* w)
         f.srcSwizzle = Bits(w[0], 30, 2);
         f.isSigned = Bits(w[1], 12, 1);
         f.isNormalized = Bits(w[1], 13, 1) == 0;
+        f.signedNoZero = Bits(w[1], 14, 1);
         f.format = Bits(w[1], 16, 6);
         f.isMini = Bits(w[1], 30, 1);
         f.roundIndex = Bits(w[1], 15, 1);
         f.expAdjust = int32_t(Bits(w[1], 24, 6) << 26) >> 26;
         f.stride = Bits(w[2], 0, 8);
-        f.offset = Bits(w[2], 8, 23);
+        f.offset = int32_t(Bits(w[2], 8, 23) << 9) >> 9;
     }
     else
     {
         f.constIndex = Bits(w[0], 20, 5);
         f.denormalized = Bits(w[0], 25, 1);
         f.srcSwizzle = Bits(w[0], 26, 6);
+        f.magFilter = Bits(w[1], 12, 2);
+        f.minFilter = Bits(w[1], 14, 2);
+        f.mipFilter = Bits(w[1], 16, 2);
+        f.anisoFilter = Bits(w[1], 18, 3);
+        f.useComputedLod = Bits(w[1], 28, 1);
+        f.useRegisterLod = Bits(w[1], 29, 1);
+        f.useRegisterGradients = Bits(w[2], 0, 1);
         f.dimension = Bits(w[2], 14, 2);
         f.lodBias = float(int32_t(Bits(w[2], 2, 7) << 25) >> 25) / 16.0f;
         f.offsetX = float(int32_t(Bits(w[2], 16, 5) << 27) >> 27) * 0.5f;
         f.offsetY = float(int32_t(Bits(w[2], 21, 5) << 27) >> 27) * 0.5f;
+        f.offsetZ = float(int32_t(Bits(w[2], 26, 5) << 27) >> 27) * 0.5f;
     }
     return f;
 }
@@ -268,6 +274,27 @@ std::string Disassemble(const Shader& shader)
             out += line;
             continue;
         }
+        if (cf.op() == CfOp::LoopStart || cf.op() == CfOp::LoopEnd)
+        {
+            snprintf(line, sizeof(line), "%2zu  %s i%u  addr %u%s%s\n", i, kCfOps[unsigned(cf.op())], cf.loopId(), cf.target(),
+                cf.op() == CfOp::LoopStart && cf.isRepeat() ? "  repeat" : "",
+                cf.op() == CfOp::LoopEnd && cf.isPredicatedBreak() ? (cf.condition() ? "  break p" : "  break !p") : "");
+            out += line;
+            continue;
+        }
+        if (cf.op() == CfOp::CondCall || cf.op() == CfOp::CondJmp)
+        {
+            char cond[24];
+            if (cf.isUnconditional())
+                snprintf(cond, sizeof(cond), "always");
+            else if (cf.isPredicated())
+                snprintf(cond, sizeof(cond), "%sp", cf.condition() ? "" : "!");
+            else
+                snprintf(cond, sizeof(cond), "b%u==%u", cf.cfBoolAddress(), cf.condition());
+            snprintf(line, sizeof(line), "%2zu  %s %s  addr %u\n", i, kCfOps[unsigned(cf.op())], cond, cf.target());
+            out += line;
+            continue;
+        }
         if (!cf.IsExec())
         {
             snprintf(line, sizeof(line), "%2zu  %s  (raw %04X%08X)\n", i, kCfOps[unsigned(cf.op())], cf.hi, cf.lo);
@@ -294,7 +321,7 @@ std::string Disassemble(const Shader& shader)
             {
                 const Fetch f = DecodeFetch(w);
                 if (f.opcode == 0)
-                    snprintf(line, sizeof(line), "      vfetch r%u.%s, r%u, vf%u  fmt %u stride %u offset %u%s%s\n", f.dest,
+                    snprintf(line, sizeof(line), "      vfetch r%u.%s, r%u, vf%u  fmt %u stride %u offset %d%s%s\n", f.dest,
                         FetchSwizzleText(f.destSwizzle).c_str(), f.src, f.constIndex, f.format, f.stride, f.offset,
                         f.isSigned ? " signed" : "", f.isMini ? " mini" : "");
                 else
