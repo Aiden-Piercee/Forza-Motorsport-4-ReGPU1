@@ -22,14 +22,14 @@ non_volatile_as_local = false
 
 # Register save/restore helpers. tools/fm4_config.py --write fills these in from
 # the xexdump image (0x0: not present in this image).
-restgprlr_14_address = 0x0
-savegprlr_14_address = 0x0
-restfpr_14_address = 0x0
-savefpr_14_address = 0x0
-restvmx_14_address = 0x0
-savevmx_14_address = 0x0
-restvmx_64_address = 0x0
-savevmx_64_address = 0x0
+restgprlr_14_address = 0x890A04B0
+savegprlr_14_address = 0x890A0460
+restfpr_14_address = 0x891F75BC
+savefpr_14_address = 0x891F7570
+restvmx_14_address = 0x891FA6F8
+savevmx_14_address = 0x891FA460
+restvmx_64_address = 0x891FA78C
+savevmx_64_address = 0x891FA4F4
 
 # Functions XenonRecomp's .pdata/branch analysis gets wrong, each with the reason
 # and the check that found it (tools/fallthrough.py, tools/fm4_crosscheck.py, a
@@ -42,5 +42,8 @@ invalid_instructions = [
     # Exception data (handler + scope table) placed before functions with
     # ExceptionFlag set in .pdata.
     # BEGIN fm4_config.py exception data
+    { data = 0x891F6A78, size = 8 }, # handler of 69 functions
+    { data = 0x89205FF8, size = 8 }, # handler of 51 functions
+    { data = 0x89203B90, size = 8 }, # handler of 1 functions
     # END fm4_config.py exception data
 ]

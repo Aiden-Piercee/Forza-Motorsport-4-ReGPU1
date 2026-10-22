@@ -19,14 +19,14 @@ non_volatile_as_local = false
 
 # Register save/restore helpers. tools/fm4_config.py --write fills these in from
 # the xexdump image (0x0: not present in this image).
-restgprlr_14_address = 0x0
-savegprlr_14_address = 0x0
-restfpr_14_address = 0x0
-savefpr_14_address = 0x0
-restvmx_14_address = 0x0
-savevmx_14_address = 0x0
-restvmx_64_address = 0x0
-savevmx_64_address = 0x0
+restgprlr_14_address = 0x82766060
+savegprlr_14_address = 0x82766010
+restfpr_14_address = 0x8276682C
+savefpr_14_address = 0x827667E0
+restvmx_14_address = 0x82765518
+savevmx_14_address = 0x82765280
+restvmx_64_address = 0x827655AC
+savevmx_64_address = 0x82765314
 
 # CRT setjmp/longjmp: mapped to host setjmp/longjmp with the guest context saved
 # and restored around them. Found from tools/fm4_config.py's candidates and
@@ -54,5 +54,8 @@ invalid_instructions = [
     # Exception data (handler + scope table) placed before functions with
     # ExceptionFlag set in .pdata.
     # BEGIN fm4_config.py exception data
+    { data = 0x82C93530, size = 8 }, # handler of 298 functions
+    { data = 0x82D4B274, size = 8 }, # handler of 54 functions
+    { data = 0x82C9A480, size = 8 }, # handler of 1 functions
     # END fm4_config.py exception data
 ]
