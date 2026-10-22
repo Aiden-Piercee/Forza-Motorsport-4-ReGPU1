@@ -77,44 +77,59 @@ LONG WINAPI OnCrash(EXCEPTION_POINTERS* info)
 }
 }
 
-// Host stack of another thread (suspended while walking); names of
-// recompiled frames are the guest functions.
+// Host stack of another thread; names of recompiled frames are the guest functions.
+// While the thread is suspended only its return addresses are collected, with the
+// unwind tables (no allocation, no dbghelp): a thread stopped while it holds the heap
+// lock or dbghelp's lock deadlocked the walker, and with it every thread that
+// allocates or logs (the watchdog froze the game mid-dump). Names are looked up after
+// the thread runs again.
 std::string HostStack(void* threadHandle, int maxFrames)
 {
     std::string out;
     if (GetThreadId(threadHandle) == GetCurrentThreadId())
         return "(this thread)";
+    DWORD64 pcs[64];
+    int count = 0;
+    if (maxFrames > 64)
+        maxFrames = 64;
     if (SuspendThread(threadHandle) == DWORD(-1))
         return out;
     CONTEXT context{};
     context.ContextFlags = CONTEXT_FULL;
     if (GetThreadContext(threadHandle, &context))
     {
-        STACKFRAME64 frame{};
-        frame.AddrPC.Offset = context.Rip;
-        frame.AddrPC.Mode = AddrModeFlat;
-        frame.AddrFrame.Offset = context.Rbp;
-        frame.AddrFrame.Mode = AddrModeFlat;
-        frame.AddrStack.Offset = context.Rsp;
-        frame.AddrStack.Mode = AddrModeFlat;
-        char where[300];
-        for (int i = 0; i < maxFrames; i++)
+        while (count < maxFrames && context.Rip)
         {
-            if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, GetCurrentProcess(), threadHandle, &frame, &context, nullptr,
-                    SymFunctionTableAccess64, SymGetModuleBase64, nullptr) || !frame.AddrPC.Offset)
-                break;
-            Describe(frame.AddrPC.Offset, where, sizeof(where));
-            char* name = where;
-            if (!strncmp(name, "__imp__", 7))
-                name += 7;
-            if (char* plus = strchr(name, '+'))
-                *plus = 0;
-            if (!out.empty())
-                out += " < ";
-            out += name;
+            pcs[count++] = context.Rip;
+            DWORD64 imageBase = 0;
+            auto* function = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
+            if (!function)
+            {
+                // A leaf: the return address is on top of the stack.
+                context.Rip = *reinterpret_cast<DWORD64*>(context.Rsp);
+                context.Rsp += 8;
+                continue;
+            }
+            void* handlerData = nullptr;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, function, &context, &handlerData, &establisher, nullptr);
         }
     }
     ResumeThread(threadHandle);
+    char where[300];
+    for (int i = 0; i < count; i++)
+    {
+        // A return address points after its call: look up the call itself.
+        Describe(i ? pcs[i] - 1 : pcs[i], where, sizeof(where));
+        char* name = where;
+        if (!strncmp(name, "__imp__", 7))
+            name += 7;
+        if (char* plus = strchr(name, '+'))
+            *plus = 0;
+        if (!out.empty())
+            out += " < ";
+        out += name;
+    }
     return out;
 }
 
