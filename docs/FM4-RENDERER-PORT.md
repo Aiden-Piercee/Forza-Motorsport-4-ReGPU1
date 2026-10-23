@@ -27,7 +27,7 @@ That report decides the order of everything below.
 |---|---|---|
 | Loops | `loop_start`/`loop_end` with loop constants `i0`-`i31` (count, start, signed step), `aL` clamped to [-256, 256], predicated break, `repeat`. Properly nested loops become `[loop] for`; anything else goes through a CF state machine | runs on lavapipe |
 | Calls / jumps | `cond_call`/`return` with a 4-deep stack (a return with no caller does nothing), `cond_jmp` taken on a bool constant, predicate or unconditionally, and code after the first `end` (subroutines) | runs on lavapipe |
-| Relative addressing | `aL`-relative temporaries on sources, vector and scalar destinations, and fetch src/dst; Xenia's rule for which constant operands are `a0`/`aL` relative; `abs_constants` and src3 negation on the scalar-constant ops (this replaces the `FM2_SC_NEG` switch) | runs on lavapipe |
+| Relative addressing | `aL`-relative temporaries on sources, vector and scalar destinations, and fetch src/dst; the microcode's rule for which constant operands are `a0`/`aL` relative (the relative bits per source and the const-0/const-1 selects); `abs_constants` and src3 negation on the scalar-constant ops (this replaces the `FM2_SC_NEG` switch) | runs on lavapipe |
 | Texture fetch | explicit, register and computed LOD; register gradients; `setTextureLod`/`setTextureGradientsHorz/Vert`; `getTextureComputedLod`, `getGradients`, `getTextureWeights`; filter overrides; signed offsets; base-map mip mode. Computed LOD is only used in pixel shaders, as on the hardware | dxc; runs on lavapipe |
 | Vertex fetch | signed 23-bit offsets, the no-zero signed mode, normalised 32-bit formats, rounding as on the hardware | runs on lavapipe |
 | Memory export | `eA`/`eM0-4` with every stream format, endian mode and the red/blue swap. Exports are flushed at `alloc`, before `kill` and at the end. Writes go to a `u0` RWByteAddressBuffer | bytes compared on lavapipe |
@@ -49,7 +49,7 @@ translate it, compile it with dxc to SPIR-V, run it and compare the results agai
   a sampler heap whose samplers are created from the fetch constant, keyed by its sampler fields.
 - **Memory export binding.** Shaders that use memory export are marked as not translated
   until the renderer binds `u0` over guest memory and invalidates the matching textures and buffers.
-- **FM2 regression.** The constant-relative rule now follows Xenia. Before merging, check it against
+- **FM2 regression.** The constant-relative rule now follows the microcode bit layout. Before merging, check it against
   an FM2 shader dump with `run.sh survey`, and compare frames if possible.
 
 ## Renderer (src/gpu/renderer.cpp and friends): to do, in order
@@ -77,7 +77,7 @@ change behaviour. Most of the remaining ~111 `FM2_*` names are debug switches th
    EDRAM aliasing is handled by explicit ownership transfers, not by guessing the native MSAA layout.
    FM4 renders its frame as 3 predicated tiles with MSAA, and aliases EDRAM between formats. This is the biggest item.
 
-   *Design:* host render targets in EDRAM space, as Xenia's render target cache does,
+   *Design:* host render targets in EDRAM space (tiles, pitch and base as the hardware addresses them),
    rather than ReGPU's screen-space surfaces sized to the output.
    - Each layout (base tile, pitch, MSAA, format, colour or depth) gets a host render target.
      Its size is `pitch x HeightPixels` times the resolution scale.
@@ -111,8 +111,8 @@ change behaviour. Most of the remaining ~111 `FM2_*` names are debug switches th
         go to the old surfaces; each draw's targets are created and claimed and its transfers recorded.
         Statistics are logged as `edram: ...`. The default path is unchanged. Draw workers are off while it runs,
         because ownership follows draw order.
-      - Known gaps: depth reinterpreted between D24S8 and D24FS8 loses precision (Xenia keeps a second host depth
-        for that). Host sample positions are the standard D3D ones, not the Xenos ones.
+      - Known gaps: depth reinterpreted between D24S8 and D24FS8 loses precision (a second host depth copy per format
+        would keep it). Host sample positions are the standard D3D ones, not the Xenos ones.
    3. Draws bound to the pass's targets, with the viewport and scissor in EDRAM space.
    4. Resolves that read the owner of the source tiles.
    5. Clears that claim tiles.

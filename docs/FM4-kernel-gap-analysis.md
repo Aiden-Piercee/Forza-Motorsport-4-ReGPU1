@@ -35,7 +35,7 @@ Things that are single-title assumptions and matter for FM4:
      `game:\XMediaFacade_default.xex` through the VFS and returning a module handle;
    - `XexGetModuleHandle(name)` for the three modules and `XexGetProcedureAddress(handle,
      ordinal | name)`, which needs the module's export table *(verify the table layout
-     against the real facade XEX before coding; Xenia and the XDK disagree in places)*;
+     against the real facade XEX before coding; the XDK headers and the shipped XEX disagree in places)*;
    - `RtlImageXexHeaderField` and `XexGetModuleSection` keyed by the handle, not by
      `g_title`;
    - running the module entry point (DLL_PROCESS_ATTACH) with the module's TLS set up.
@@ -87,7 +87,7 @@ Things that are single-title assumptions and matter for FM4:
 
 - **Profile writes.** Add `XamUserWriteProfileSettings` backed by a per-profile settings
   store, and make `XamUserReadProfileSettings` return what was written. Exact argument layout
-  to be taken from the XDK headers/Xenia, not guessed.
+  to be taken from the XDK headers and the title's own calls, not guessed.
 - **Saves.** `XamContentCreateEx` already maps save games to profile directories; check the
   FM4 save-device flow (device selector, `XamContentGetDeviceData` capacity, create flags).
 - **Achievements and stats.** FM4's validated build saves achievements. Needs
