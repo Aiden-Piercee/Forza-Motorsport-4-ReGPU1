@@ -6,6 +6,7 @@
 
 #include "kernel/imports.h"
 #include "kernel/thread.h"
+#include "live_switch.h"
 #include "loader.h"
 
 namespace
@@ -16,10 +17,20 @@ namespace
 constexpr uint32_t kCsLockCount = 0x10;
 constexpr uint32_t kCsRecursion = 0x14;
 constexpr uint32_t kCsOwner = 0x18;
+// Threads queued in RtlEnterCriticalSection, kept (host order) in the header's WaitListHead,
+// which the section's own event would use on the console.
+constexpr uint32_t kCsWaiters = 0x08;
+// Owner value while a leaving owner hands the section to a queued thread.
+constexpr uint32_t kHandoff = 0xFFFFFFFF;
 
 std::atomic<uint32_t>& CsOwner(uint32_t cs)
 {
     return *reinterpret_cast<std::atomic<uint32_t>*>(GuestPtr(cs + kCsOwner));
+}
+
+std::atomic<uint32_t>& CsWaiters(uint32_t cs)
+{
+    return *reinterpret_cast<std::atomic<uint32_t>*>(GuestPtr(cs + kCsWaiters));
 }
 
 uint32_t Me()
@@ -70,17 +81,33 @@ GUEST_EXPORT(RtlEnterCriticalSection)
 {
     const uint32_t cs = ctx.r3.u32;
     const uint32_t me = Me();
-    for (int spin = 0; !TryEnterCs(cs, me); spin++)
+    for (int spin = 0; spin < 64; spin++)
     {
-        if (spin < 64)
-            _mm_pause();
-        else
-        {
-            uint32_t seen = CsOwner(cs).load(std::memory_order_relaxed);
-            if (seen)
-                WaitOnAddress(&CsOwner(cs), &seen, 4, 1);
-        }
+        if (TryEnterCs(cs, me))
+            return;
+        _mm_pause();
     }
+    // Queue as a waiter: a leaving owner hands the section to one of us (kHandoff), which a
+    // thread arriving later cannot take.
+    static LiveSwitch noHandoff("FM2_NO_CS_HANDOFF"); // A/B: no handoff (barging)
+    auto& owner = CsOwner(cs);
+    CsWaiters(cs).fetch_add(1, std::memory_order_acq_rel);
+    for (;;)
+    {
+        uint32_t expected = kHandoff;
+        if (owner.compare_exchange_strong(expected, me, std::memory_order_acquire))
+        {
+            StoreBE32(cs + kCsRecursion, 1);
+            StoreBE32(cs + kCsLockCount, 0);
+            break;
+        }
+        if (TryEnterCs(cs, me))
+            break;
+        uint32_t seen = owner.load(std::memory_order_relaxed);
+        if (seen && seen != kHandoff)
+            WaitOnAddress(&owner, &seen, 4, noHandoff ? 1 : 10);
+    }
+    CsWaiters(cs).fetch_sub(1, std::memory_order_acq_rel);
 }
 
 GUEST_EXPORT(RtlTryEnterCriticalSection)
@@ -96,7 +123,11 @@ GUEST_EXPORT(RtlLeaveCriticalSection)
     StoreBE32(cs + kCsLockCount, LoadBE32(cs + kCsLockCount) - 1);
     if (recursion == 0)
     {
-        CsOwner(cs).store(0, std::memory_order_release);
+        // With threads waiting, hand the section to one of them, as the kernel does: releasing it
+        // to anyone let the owner take it straight back in a loop and starve them.
+        static LiveSwitch noHandoff("FM2_NO_CS_HANDOFF");
+        const bool handoff = !noHandoff && CsWaiters(cs).load(std::memory_order_acquire) > 0;
+        CsOwner(cs).store(handoff ? kHandoff : 0, std::memory_order_release);
         WakeByAddressSingle(&CsOwner(cs));
     }
 }
