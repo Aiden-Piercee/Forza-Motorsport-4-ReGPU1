@@ -14,6 +14,8 @@ add_subdirectory(thirdparty/XenonRecomp EXCLUDE_FROM_ALL)
 # Recompiled game code, produced by XenonRecomp from your own XEX files (tools/recomp-fm4.sh;
 # never committed): one static library per image so each keeps its own ppc_config.h. The
 # first image is default.xex, the others are the modules it loads at run time.
+# FM4_OUT_DIR: the folder (in the source tree) holding the recompiled images, default out.
+set(FM4_OUT_DIR "out" CACHE STRING "folder with the recompiled images (out/ppc, out/ppc_xmf, out/ppc_sph)")
 set(FM4_IMAGES "fm4:ppc" "fm4_xmediafacade:ppc_xmf" "fm4_speechfacade:ppc_sph")
 set(FM4_CONFIGS "")
 set(FM4_SHARED_HEADERS "")
@@ -23,10 +25,10 @@ foreach(image ${FM4_IMAGES})
     string(REPLACE ":" ";" parts "${image}")
     list(GET parts 0 name)
     list(GET parts 1 dir)
-    set(ppc_dir "${CMAKE_SOURCE_DIR}/out/${dir}")
+    set(ppc_dir "${CMAKE_SOURCE_DIR}/${FM4_OUT_DIR}/${dir}")
     file(GLOB sources CONFIGURE_DEPENDS "${ppc_dir}/*.cpp")
     if(NOT sources)
-        message(FATAL_ERROR "out/${dir} is empty: run tools/recomp-fm4.sh first (see docs/FM4-RECOMPILE.md)")
+        message(FATAL_ERROR "${FM4_OUT_DIR}/${dir} is empty: run tools/recomp-fm4.sh first (see docs/FM4-RECOMPILE.md)")
     endif()
     add_library(${name}_ppc STATIC ${sources})
     target_include_directories(${name}_ppc PRIVATE "${ppc_dir}" thirdparty/XenonRecomp/thirdparty/simde)
@@ -72,7 +74,7 @@ list(APPEND FM4_SOURCES "${FM4_GENERATED}/stubs.cpp" "${FM4_GENERATED}/recomp_mo
 set(FM4_FFX "${CMAKE_SOURCE_DIR}/thirdparty/fidelityfx/Kits/FidelityFX")
 set(FM4_DLSS "${CMAKE_SOURCE_DIR}/thirdparty/dlss")
 set(REGPU_XENONRECOMP "${CMAKE_SOURCE_DIR}/thirdparty/XenonRecomp")
-set(REGPU_PPC_DIR "${CMAKE_SOURCE_DIR}/out/ppc")
+set(REGPU_PPC_DIR "${CMAKE_SOURCE_DIR}/${FM4_OUT_DIR}/ppc")
 set(REGPU_FFX "${FM4_FFX}")
 if(EXISTS "${FM4_FFX}/signedbin/amd_fidelityfx_upscaler_dx12.dll")
     set(REGPU_FSR3 ON)
@@ -90,7 +92,7 @@ add_subdirectory(thirdparty/ReGPU)
 
 add_executable(fm4 ${FM4_SOURCES} "${CMAKE_SOURCE_DIR}/src/fm2.rc")
 target_include_directories(fm4 PRIVATE src "${FM4_GENERATED}"
-    "${CMAKE_SOURCE_DIR}/out/ppc" thirdparty/XenonRecomp/thirdparty/simde)
+    "${CMAKE_SOURCE_DIR}/${FM4_OUT_DIR}/ppc" thirdparty/XenonRecomp/thirdparty/simde)
 target_link_libraries(fm4 PRIVATE regpu)
 if(REGPU_FSR3)
     add_custom_command(TARGET fm4 POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different

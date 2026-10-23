@@ -1,0 +1,31 @@
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -688,7 +688,9 @@
+     case PPC_INST_BCTR:
+         if (switchTable != config.switchTables.end())
+         {
+-            println("\tswitch ({}.u64) {{", r(switchTable->second.r));
++            // The table index is a 32-bit word (the game scales it with rlwinm): the upper half of the
++            // register can hold leftovers (a wrapping rlwinm mask, a 64-bit add) the real jump never sees.
++            println("\tswitch ({}.u32) {{", r(switchTable->second.r));
+ 
+             for (size_t i = 0; i < switchTable->second.labels.size(); i++)
+             {
+@@ -2246,7 +2248,16 @@
+ 
+     case PPC_INST_VCMPBFP:
+     case PPC_INST_VCMPBFP128:
+-        println("\t__builtin_debugtrap();");
++        // Bounds compare: bit 31 set unless a <= b, bit 30 set unless a >= -b (both set for NaN).
++        // The record form sets CR6[eq] when every element is within bounds.
++        printSetFlushMode(true);
++        println("\tsimde_mm_store_ps({0}.f32, simde_mm_or_ps("
++            "simde_mm_and_ps(simde_mm_cmpnle_ps(simde_mm_load_ps({1}.f32), simde_mm_load_ps({2}.f32)), simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000)))), "
++            "simde_mm_and_ps(simde_mm_cmpnge_ps(simde_mm_load_ps({1}.f32), simde_mm_xor_ps(simde_mm_load_ps({2}.f32), simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000))))), simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x40000000))))));",
++            v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{0}.lt = 0; {0}.gt = 0; {0}.eq = simde_mm_movemask_epi8(simde_mm_cmpeq_epi32(simde_mm_load_si128((simde__m128i*){1}.u32), simde_mm_setzero_si128())) == 0xFFFF; {0}.so = 0;",
++                cr(6), v(insn.operands[0]));
+         break;
+ 
+     case PPC_INST_VCMPEQFP:

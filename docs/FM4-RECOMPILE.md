@@ -42,6 +42,12 @@ added by hand. The patch also makes the loader allocate the whole image for
 basic-compressed XEX files: before, it allocated only the summed block size,
 which left the zero tail outside the buffer.
 
+`patches/xenonrecomp-switch-u32.patch` makes a jump table switch on the low word of its
+index register: the code scales the index with `rlwinm`, so only the low 32 bits matter,
+and a 64-bit switch on leftovers in the upper half fell into `__builtin_unreachable`. It
+also emits `vcmpbfp`/`vcmpbfp128` (bounds compare, NaN out of both bounds) instead of a
+trap. FM4 has none of those; the patch keeps the tool the same for the ports that share it.
+
 `patches/xenonrecomp-fm4-instructions.patch` adds the instructions FM4 uses
 that upstream XenonRecomp does not emit: update-form loads and stores, the
 `bdzf`/`bso` family of branches, CR logic, carry arithmetic, the record (`.`)
@@ -78,6 +84,7 @@ LLVM (clang-cl), CMake, Ninja, Python 3.11 or newer as `py -3`, and Git Bash for
    git -C thirdparty/XenonRecomp apply ../../patches/xenonrecomp-modules.patch
    git -C thirdparty/XenonRecomp apply ../../patches/xenonrecomp-fm4.patch
    git -C thirdparty/XenonRecomp apply ../../patches/xenonrecomp-fm4-instructions.patch
+   git -C thirdparty/XenonRecomp apply ../../patches/xenonrecomp-switch-u32.patch
    tools\vcenv.cmd cmake -S tools/xexdump -B build/tools -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
    ```
 
