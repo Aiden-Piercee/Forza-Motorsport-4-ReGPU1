@@ -844,7 +844,8 @@ GUEST_EXPORT(XamContentOpenFile)
     // (user, rootName, packagePath, flags, disposition*, license*, overlapped): mounts a content package
     // file (STFS) as a root. FM4 mounts its Kinect data this way (Database.xmplr as "stexemplar",
     // NuiIdentity.bin.be as "nuiidentity", HeadPosition.xmplr as "headposition"). Mounting STFS packages
-    // isn't supported yet, so the call fails and FM4 turns Kinect identity off, as it does on Xenia.
+    // isn't supported yet, so the call fails and FM4 turns Kinect identity off, as it does on a
+    // console whose Kinect content is missing.
     LOG_ONCE("XamContentOpenFile: STFS package mounts aren't supported (%s as %s)", GuestString(ctx.r5.u32).c_str(),
         GuestString(ctx.r4.u32).c_str());
     FinishUi(ctx, ctx.r9.u32, X_ERROR_FILE_NOT_FOUND);

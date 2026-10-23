@@ -511,8 +511,9 @@ GUEST_EXPORT(NtQueryInformationFile)
         written = 0x38;
         break;
     case 26: // FileSectorInformation: the disc sector a file starts at. Files here live on the host,
-             // not on a disc, so there is no sector to report: the call fails as on Xenia
-             // (X_STATUS_INVALID_PARAMETER), and titles fall back to reading the file normally.
+             // not on a disc, so there is no sector to report: the call fails as it does for a file
+             // that isn't on the disc (X_STATUS_INVALID_PARAMETER), and titles fall back to reading
+             // the file normally.
         LOG_ONCE("NtQueryInformationFile: no disc sector for %s (FileSectorInformation)", file->path.filename().string().c_str());
         SetIoStatus(iosb, X_STATUS_INVALID_PARAMETER, 0);
         Return(ctx, X_STATUS_INVALID_PARAMETER);

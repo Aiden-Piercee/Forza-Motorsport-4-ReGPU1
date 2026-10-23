@@ -225,7 +225,7 @@ GUEST_EXPORT(XAudioGetSpeakerConfig)
     // (config*): the dashboard's audio output setting. The high word is the digital output
     // (bit 16: Dolby Digital, i.e. 5.1), the low word the analog one (1: stereo). The render
     // driver above always takes 5.1 and the host mixes it down, so report digital 5.1 with
-    // analog stereo: 0x00010001, what Xenia reports as well.
+    // analog stereo: 0x00010001, a console set to Dolby Digital output with its analog pair.
     StoreIfNonNull(ctx.r3.u32, 0x00010001);
     Return(ctx, X_STATUS_SUCCESS);
 }
