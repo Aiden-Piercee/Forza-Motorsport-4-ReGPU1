@@ -31,6 +31,9 @@ void LoadTitle(const std::filesystem::path& xexPath);
 // Where the title update lives (the console's update: device): default.xexp, Media.zip.
 // FM2_TITLE_UPDATE_DIR overrides <user>\fm2\update.
 const std::filesystem::path& TitleUpdateDir();
+// The guest OBJECT_TYPE an xboxkrnl Ex*ObjectType variable export points to, by ordinal
+// (0x00E event, 0x012 mutant, 0x017 semaphore, 0x01B thread, 0x01C timer).
+uint32_t KernelObjectType(uint32_t ordinal);
 
 // Optional header value (low byte 0x00/0x01) or guest pointer to its data.
 uint32_t XexHeaderField(uint32_t headerBase, uint32_t key);

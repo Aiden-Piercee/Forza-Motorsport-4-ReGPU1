@@ -6,6 +6,7 @@
 #include <windows.h>
 
 #include "kernel/thread.h"
+#include "loader.h"
 #include "log.h"
 
 std::mutex g_objectMutex;
@@ -150,8 +151,31 @@ uint32_t GetGuestObject(const std::shared_ptr<KernelObject>& object)
     std::lock_guard lock(g_handleMutex);
     if (!object->guestObject)
     {
-        // A zeroed body big enough for any kernel object the title pokes at.
-        object->guestObject = GuestAlloc(Heap::Virtual, 0x200);
+        // A zeroed body big enough for any kernel object the title pokes at, after the
+        // OBJECT_HEADER the kernel keeps in front of every object: PointerCount, HandleCount,
+        // Type, flags. Code that waits on a referenced object finds the dispatcher header through
+        // Type->DefaultObject (an offset into the body), so Type must be real: with none, a wait
+        // on an object from ObReferenceObjectByHandle read a type at 0 and waited on garbage.
+        uint32_t type = 0;
+        switch (object->kind)
+        {
+        case KernelObject::Kind::Event: type = KernelObjectType(0x00E); break;
+        case KernelObject::Kind::Mutant: type = KernelObjectType(0x012); break;
+        case KernelObject::Kind::Semaphore: type = KernelObjectType(0x017); break;
+        case KernelObject::Kind::Timer: type = KernelObjectType(0x01C); break;
+        default:
+        {
+            // Other objects get a type of their own whose DefaultObject is also offset 0.
+            static const uint32_t generic = GuestAlloc(Heap::Virtual, 0x40);
+            type = generic;
+            break;
+        }
+        }
+        const uint32_t header = GuestAlloc(Heap::Virtual, 0x10 + 0x200);
+        StoreBE32(header + 0, 1); // PointerCount
+        StoreBE32(header + 4, 1); // HandleCount
+        StoreBE32(header + 8, type);
+        object->guestObject = header + 0x10;
         StoreBE32(object->guestObject + 8, kHeaderMagic);
         StoreBE32(object->guestObject + 12, object->handle);
         g_dispatchers[object->guestObject] = object;
