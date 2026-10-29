@@ -87,14 +87,15 @@ def used_dwords(words, start, limit):
     return slot * 3, pixel
 
 
-def scan(data):
+def scan(data, step=4):
+    # step: words between candidates (FM2's meshes align shaders to 16 bytes, FM4's .fxobj to 4).
     out = []
     buf = data[:len(data) // 4 * 4]
     if len(buf) < 48:
         return out
     words = np.frombuffer(buf, dtype='>u4')
     n = len(words)
-    idx = np.arange(0, n - 3, 4)
+    idx = np.arange(0, n - 3, step)
     w0 = words[idx]
     w1 = words[idx + 1]
     op0 = (w1 >> 12) & 0xF
@@ -123,6 +124,15 @@ def scan_zip(path):
     return list(found)
 
 
+def scan_file(path):
+    # Loose files: FM4's .fxobj effects (zipped ones dumped by tools/fxobjdump) and executable images.
+    try:
+        return list({k: None for k in scan(open(path, 'rb').read(), 1)})
+    except Exception as e:
+        print('skip', path, e, file=sys.stderr)
+        return []
+
+
 def normalized_hash(code, pixel):
     """The renderer's shader hash over the used words of a loaded shader file."""
     words = np.frombuffer(code[:len(code) // 4 * 4], dtype='>u4')
@@ -136,9 +146,11 @@ def main():
     game, outdir = sys.argv[1], sys.argv[2]
     os.makedirs(outdir, exist_ok=True)
     zips = glob.glob(os.path.join(game, '**', '*.zip'), recursive=True)
+    loose = [p for ext in ('*.fxobj', '*.bin') for p in glob.glob(os.path.join(game, '**', ext), recursive=True)]
     shaders = {}
     with ProcessPoolExecutor() as pool:
-        for n, result in enumerate(pool.map(scan_zip, zips, chunksize=4)):
+        results = list(pool.map(scan_zip, zips, chunksize=4)) + list(pool.map(scan_file, loose, chunksize=16))
+        for n, result in enumerate(results):
             for pixel, code in result:
                 shaders[fnv1a(code) ^ (1 if pixel else 0)] = (pixel, code)
             if n % 100 == 0:

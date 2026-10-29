@@ -1,6 +1,7 @@
-// The application icon (assets/fm2.ico, built by tools/makeico.py from assets/icon.png):
-// the exe's icon in Explorer and the class icon of the launcher and game windows (id 1).
-1 ICON "../assets/fm2.ico"
+// The application icon (assets/fm4.ico, built by tools/makeico.py from assets/fm4-icon.png: the title image
+// in default.xex's XDBF, id 0x8000, as FM2's came from its own): the exe's icon in
+// Explorer and the class icon of the launcher and game windows (id 1).
+1 ICON "../assets/fm4.ico"
 
 // The version (src/version.h): the launcher's updater reads ProductVersion from it.
 #include "version.h"
@@ -12,8 +13,8 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "ProductName", "Forza Motorsport 2 ReGPU"
-            VALUE "FileDescription", "Forza Motorsport 2 ReGPU"
+            VALUE "ProductName", "Forza Motorsport 4 ReGPU"
+            VALUE "FileDescription", "Forza Motorsport 4 ReGPU"
             VALUE "ProductVersion", FM2_VERSION
             VALUE "FileVersion", FM2_VERSION
         END
