@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The FM4 launcher: a Photino window showing wwwroot (the UI), on WebView2 on Windows and WebKitGTK on Linux.
+       The page talks to Bridge.cs over the window's message channel (no local server). One build per platform:
+       dotnet publish -r win-x64, or -r linux-x64. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>FM4Launcher</AssemblyName>
+    <RootNamespace>FM4Launcher</RootNamespace>
+    <Product>Forza Motorsport 4 ReGPU</Product>
+    <ApplicationIcon>..\..\assets\fm4.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Photino.NET" Version="4.0.16" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="wwwroot\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <!-- The icon: FM4's title image from default.xex's XDBF (id 0x8000), as FM2's came from its own. -->
+    <Content Include="..\..\assets\fm4-icon.png" Link="wwwroot\icon.png" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\assets\fm4.ico" Link="fm4.ico" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
