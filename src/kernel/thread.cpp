@@ -136,6 +136,8 @@ DWORD WINAPI HostThreadMain(void* param)
             StoreBE32(self->guestObject + 4, 1);
     }
     SignalObjectsChanged();
+    if (getenv("FM4_LONG_WAITS"))
+        Log("thread %u exited (code %u)", thread->id, exitCode);
     thread->ctx = nullptr;
     return 0;
 }

@@ -124,6 +124,7 @@ void SignalEventHandle(uint32_t handle)
         return;
     if (auto e = GetHandle(handle); e && e->kind == KernelObject::Kind::Event)
     {
+        NoteSignal(*e, "I/O completion", 0);
         {
             std::lock_guard lock(g_objectMutex);
             static_cast<EventObject&>(*e).signaled = true;
@@ -400,9 +401,18 @@ GUEST_EXPORT(NtReadFile)
     {
         g_binkRingBase = buffer - uint32_t(offset % 0x200000);
     }
+    const auto readStart = std::chrono::steady_clock::now();
     const BOOL ok = ReadFile(file->host, GuestPtr(buffer), length, &read, &ov);
     file->position = offset + read;
     g_readBytes += read;
+    // FM4_LONG_WAITS: reads of 256 KB or more, or that took 10 ms or more.
+    if (static const bool traceSlow = getenv("FM4_LONG_WAITS") != nullptr; traceSlow)
+    {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count();
+        if (ms >= 10.0 || length >= (256u << 10))
+            Log("io: read %s offset %llu length %u took %.1f ms (thread %u, event %08X, %s)", file->path.filename().string().c_str(),
+                (unsigned long long)offset, length, ms, CurrentGuestThreadId(), ctx.r4.u32, file->synchronous ? "sync" : "async");
+    }
     // Music files: their packets are noted, so the audio can tell music from effects (xma.cpp).
     if (read && file->guestPath.size() > 4)
     {

@@ -1019,8 +1019,12 @@ GUEST_EXPORT(XMsgInProcessCall)
         StoreIfNonNull(LoadBE32(args + 4), bits);
         break;
     }
-    case 0x0007001B: // get dashboard init state (client, state*)
+    case 0x0007001B: // XMPGetPlaybackController (client, controller*, locked*)
+        // The title controls playback and the user hasn't taken it over. Leaving `locked` unwritten
+        // handed the title stack garbage: read as the user's own soundtrack playing, the title faded
+        // its music out (Top Spin 4's port found it; FM4's menu music cut in and out).
         StoreIfNonNull(LoadBE32(args + 4), 0);
+        StoreIfNonNull(LoadBE32(args + 8), 0);
         break;
     default:
         LOG_ONCE("XMP message %08X answered with success", message);

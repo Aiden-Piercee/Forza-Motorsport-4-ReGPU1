@@ -52,7 +52,23 @@ uint32_t CreateNamed(uint32_t handleOut, uint32_t attributes, Make make)
 
 std::shared_ptr<ThreadObject> ThreadObjectFromKthread(uint32_t kthreadAddr)
 {
-    return FindThreadByKthread(kthreadAddr);
+    if (auto t = FindThreadByKthread(kthreadAddr))
+        return t;
+    // A thread handle where a KTHREAD pointer belongs (see ObjectFromPointer): the title resumes threads it
+    // created suspended this way, and with the call dropped the thread never ran; the title then waited
+    // 1 s for it to exit (a 1 s hitch in races, every time it restarted that worker).
+    // FM4_NO_HANDLE_AS_POINTER=1: as before.
+    static const bool noHandles = getenv("FM4_NO_HANDLE_AS_POINTER") != nullptr;
+    if (!noHandles && (kthreadAddr & 0xFF000000) == 0xF8000000)
+        if (auto h = GetHandle(kthreadAddr); h && h->kind == KernelObject::Kind::Thread)
+        {
+            static std::atomic<int> logged{ 0 };
+            if (logged++ < 50)
+                Log("objects: thread handle %08X used as a KTHREAD pointer (thread %u): guest thread %u", kthreadAddr, CurrentGuestThreadId(),
+                    std::static_pointer_cast<ThreadObject>(h)->thread->id);
+            return std::static_pointer_cast<ThreadObject>(h);
+        }
+    return nullptr;
 }
 
 std::shared_ptr<KernelObject> ObjectFromHandleOrPseudo(uint32_t handle)
@@ -71,6 +87,19 @@ std::shared_ptr<KernelObject> ObjectFromPointer(uint32_t pointer)
 {
     if (auto t = ThreadObjectFromKthread(pointer))
         return t;
+    // A handle where an object pointer belongs (our handles are F8000004 up; the title's own memory is
+    // not there): the handle's object. Read as a dispatcher header it was a new event nobody signals, and
+    // the waiter sat out its full timeout (1 s hitches in races). FM4_NO_HANDLE_AS_POINTER=1: as before.
+    static const bool noHandles = getenv("FM4_NO_HANDLE_AS_POINTER") != nullptr;
+    if (!noHandles && (pointer & 0xFF000000) == 0xF8000000)
+        if (auto h = GetHandle(pointer))
+        {
+            static std::atomic<int> logged{ 0 };
+            if (logged++ < 50)
+                Log("objects: handle %08X used as an object pointer (thread %u): its object%s", pointer, CurrentGuestThreadId(),
+                    h->kind == KernelObject::Kind::Thread ? (", guest thread " + std::to_string(std::static_pointer_cast<ThreadObject>(h)->thread->id) + (std::static_pointer_cast<ThreadObject>(h)->exited ? " (exited)" : " (running)")).c_str() : "");
+            return h;
+        }
     return GetDispatcherObject(pointer);
 }
 
@@ -185,9 +214,43 @@ GUEST_EXPORT(KeSetBasePriorityThread)
     Return(ctx, 0);
 }
 
+void LogAllHostThreadStacks(const char* why); // hang.cpp
+
+namespace
+{
+// FM4_LONG_WAITS: a thread that keeps yielding or sleeping for 300 ms or more (polling for something other
+// threads are late with: a stall) gets every thread's host stack logged while it lasts, up to 6 times.
+void NotePolling()
+{
+    static const bool on = getenv("FM4_LONG_WAITS") != nullptr;
+    if (!on)
+        return;
+    thread_local Clock::time_point pollStart{}, pollLast{};
+    thread_local bool dumped = false;
+    const auto now = Clock::now();
+    if (now - pollLast > std::chrono::milliseconds(50))
+    {
+        pollStart = now;
+        dumped = false;
+    }
+    pollLast = now;
+    static std::atomic<int> dumps{ 0 };
+    // Only the title's main thread (guest thread 3), and not while loading (the first 30 s): threads poll
+    // there on purpose and used up the dumps.
+    static const auto armed = now + std::chrono::seconds(30);
+    if (!dumped && CurrentGuestThreadId() == 3 && now > armed && now - pollStart > std::chrono::milliseconds(300) && dumps++ < 6)
+    {
+        dumped = true;
+        Log("stall: t%u has been polling for 300 ms", CurrentGuestThreadId());
+        LogAllHostThreadStacks("a thread polled for 300 ms");
+    }
+}
+} // namespace
+
 GUEST_EXPORT(KeDelayExecutionThread)
 {
     // (mode, alertable, interval*)
+    NotePolling();
     static LiveSwitch spikes("FM2_SPIKES");
     const auto start = spikes ? Clock::now() : Clock::time_point{};
     SleepUntil(TimeoutFromGuest(ctx.r5.u32));
@@ -214,8 +277,11 @@ GUEST_EXPORT(KeDelayExecutionThread)
     Return(ctx, X_STATUS_SUCCESS);
 }
 
+
+
 GUEST_EXPORT(NtYieldExecution)
 {
+    NotePolling();
     static LiveSwitch spikes("FM2_SPIKES");
     if (spikes)
     {
@@ -463,6 +529,7 @@ GUEST_EXPORT(KeReleaseSemaphore)
 {
     // (semaphore, increment, adjustment, wait)
     auto object = GetDispatcherObject(ctx.r3.u32);
+    NoteSignal(*object, "KeReleaseSemaphore", uint32_t(ctx.lr));
     int32_t previous = 0;
     {
         std::lock_guard lock(g_objectMutex);
@@ -513,6 +580,8 @@ uint32_t SetEvent(const std::shared_ptr<KernelObject>& object, bool state)
 GUEST_EXPORT(KeSetEvent)
 {
     TraceObject("KeSetEvent", ctx.r3.u32, ctx);
+    if (auto o = GetDispatcherObject(ctx.r3.u32))
+        NoteSignal(*o, "KeSetEvent", uint32_t(ctx.lr));
     Return(ctx, SetEvent(GetDispatcherObject(ctx.r3.u32), true));
 }
 
@@ -605,6 +674,7 @@ GUEST_EXPORT(NtSetEvent)
         Return(ctx, X_STATUS_INVALID_HANDLE);
         return;
     }
+    NoteSignal(*object, "NtSetEvent", uint32_t(ctx.lr));
     StoreIfNonNull(ctx.r4.u32, SetEvent(object, true));
     Return(ctx, X_STATUS_SUCCESS);
 }
@@ -637,6 +707,7 @@ GUEST_EXPORT(NtReleaseSemaphore)
         Return(ctx, X_STATUS_INVALID_HANDLE);
         return;
     }
+    NoteSignal(*object, "NtReleaseSemaphore", uint32_t(ctx.lr));
     uint32_t status = X_STATUS_SUCCESS;
     {
         std::lock_guard lock(g_objectMutex);

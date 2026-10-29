@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -67,6 +68,8 @@ struct KernelObject
 
     const Kind kind;
     uint32_t createdBy = 0; // guest lr of the creating call (debugging)
+    std::atomic<int64_t> waitSinceMs{ 0 }; // FM4_LONG_WAITS: when the oldest current waiter started (steady ms, 0 none)
+    std::atomic<uint32_t> waiter{ 0 };     // and which guest thread it is
     // Guest address of the DISPATCHER_HEADER (or object body) the guest
     // sees, 0 if none yet.
     uint32_t guestObject = 0;
@@ -150,3 +153,7 @@ void SignalObjectsChanged(); // notify after changing state (lock not held)
 void SyncGuestSignalState(KernelObject& object);
 
 uint32_t CurrentGuestThreadId();
+
+// FM4_LONG_WAITS: logs a signal that releases a thread which waited 300 ms or more on the object
+// (who signalled it, from where).
+void NoteSignal(KernelObject& object, const char* how, uint32_t lr);

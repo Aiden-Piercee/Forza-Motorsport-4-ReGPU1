@@ -114,6 +114,24 @@ std::shared_ptr<KernelObject> GetDispatcherObject(uint32_t header)
         if (it != g_dispatchers.end())
             return it->second;
     }
+    else if (auto it = g_dispatchers.find(header); it != g_dispatchers.end())
+    {
+        // Our body of an object, its marker overwritten by the title (it initialised the dispatcher header in
+        // place). Making a new object here split one event in two: signalled through the handle, waited on
+        // through the pointer (the waiter sat out its full timeout, a 1 s hitch in races). The same object is
+        // kept and the marker restored. FM4_SPLIT_DISPATCHERS=1: a new object, as before (A/B).
+        static const bool split = getenv("FM4_SPLIT_DISPATCHERS") != nullptr;
+        static int logged = 0;
+        if (logged++ < 50)
+            Log("objects: dispatcher at %08X (handle %08X) lost its marker (type %u, state %d)%s", header, it->second->handle,
+                *GuestPtr<uint8_t>(header), int32_t(LoadBE32(header + 4)), split ? ": new object" : ": kept");
+        if (!split)
+        {
+            StoreBE32(header + 8, kHeaderMagic);
+            StoreBE32(header + 12, it->second->handle);
+            return it->second;
+        }
+    }
 
     const uint8_t type = *GuestPtr<uint8_t>(header);
     const int32_t signalState = int32_t(LoadBE32(header + 4));
@@ -171,11 +189,18 @@ uint32_t GetGuestObject(const std::shared_ptr<KernelObject>& object)
             break;
         }
         }
-        const uint32_t header = GuestAlloc(Heap::Virtual, 0x10 + 0x200);
-        StoreBE32(header + 0, 1); // PointerCount
-        StoreBE32(header + 4, 1); // HandleCount
-        StoreBE32(header + 8, type);
-        object->guestObject = header + 0x10;
+        // FM4_NO_OBJECT_HEADERS=1 (A/B): the bare body with no header in front, as before.
+        static const bool noHeaders = getenv("FM4_NO_OBJECT_HEADERS") != nullptr;
+        if (noHeaders)
+            object->guestObject = GuestAlloc(Heap::Virtual, 0x200);
+        else
+        {
+            const uint32_t header = GuestAlloc(Heap::Virtual, 0x10 + 0x200);
+            StoreBE32(header + 0, 1); // PointerCount
+            StoreBE32(header + 4, 1); // HandleCount
+            StoreBE32(header + 8, type);
+            object->guestObject = header + 0x10;
+        }
         StoreBE32(object->guestObject + 8, kHeaderMagic);
         StoreBE32(object->guestObject + 12, object->handle);
         g_dispatchers[object->guestObject] = object;
@@ -213,14 +238,100 @@ uint32_t WaitForObjects(const std::vector<std::shared_ptr<KernelObject>>& object
             objects[0]->guestObject, objects[0]->createdBy, objects.size() > 1 ? " (+more)" : "");
         t->waitingOn = text;
     }
+    // FM4_LONG_WAITS=<ms>: a wait that took at least that long is logged with what it waited on, its
+    // timeout and the guest call chain (finding what a stalled frame waits for).
+    static const int longWaitMs = getenv("FM4_LONG_WAITS") ? atoi(getenv("FM4_LONG_WAITS")) : 0;
     struct Clear
     {
+        Clock::time_point start = Clock::now();
+        std::optional<Clock::time_point> deadline;
+        const std::vector<std::shared_ptr<KernelObject>>* objects = nullptr;
         ~Clear()
         {
-            if (GuestThread* t = CurrentGuestThread())
+            GuestThread* t = CurrentGuestThread();
+            if (longWaitMs > 0 && t)
+            {
+                const auto now = Clock::now();
+                const double ms = std::chrono::duration<double, std::milli>(now - start).count();
+                if (ms >= longWaitMs)
+                {
+                    char chain[160] = {};
+                    int n = 0;
+                    if (t->ctx)
+                    {
+                        n += snprintf(chain, sizeof(chain), " lr %08X", uint32_t(t->ctx->lr));
+                        uint32_t sp = t->ctx->r1.u32;
+                        for (int i = 0; i < 10 && sp; i++)
+                        {
+                            const uint32_t next = LoadBE32(sp);
+                            if (!next || next <= sp)
+                                break;
+                            n += snprintf(chain + n, sizeof(chain) - n, " %08X", LoadBE32(next - 8));
+                            sp = next;
+                        }
+                    }
+                    const bool timedOut = deadline && now >= *deadline;
+                    // A wait on another thread that timed out: what that thread is doing now (its wait and
+                    // call chain), so a stall shows why the thread hadn't finished.
+                    if (timedOut && objects && !objects->empty() && (*objects)[0]->kind == KernelObject::Kind::Thread)
+                    {
+                        auto target = std::static_pointer_cast<ThreadObject>((*objects)[0]);
+                        GuestThread* g = target->thread.get();
+                        char tchain[160] = {};
+                        int m = 0;
+                        if (g && g->ctx)
+                        {
+                            m += snprintf(tchain, sizeof(tchain), " lr %08X", uint32_t(g->ctx->lr));
+                            uint32_t sp = g->ctx->r1.u32;
+                            for (int i = 0; i < 10 && sp; i++)
+                            {
+                                const uint32_t next = LoadBE32(sp);
+                                if (!next || next <= sp)
+                                    break;
+                                m += snprintf(tchain + m, sizeof(tchain) - m, " %08X", LoadBE32(next - 8));
+                                sp = next;
+                            }
+                        }
+                        Log("longwait:   target thread %u %s, waiting on: %s,%s", g ? g->id : 0, target->exited ? "exited" : "running",
+                            g && !g->waitingOn.empty() ? g->waitingOn.c_str() : "nothing (running guest code)", tchain);
+                        // And every thread's host stack (where in our runtime the target sits), a few times.
+                        static int stackDumps = 0;
+                        if (stackDumps++ < 4)
+                        {
+                            void LogAllHostThreadStacks(const char* why); // hang.cpp
+                            LogAllHostThreadStacks("a wait on a thread timed out");
+                        }
+                    }
+                    Log("longwait: t%u %.0f ms%s on %s, timeout %s:%s", CurrentGuestThreadId(), ms, timedOut ? " (timed out)" : "",
+                        t->waitingOn.c_str(),
+                        deadline ? std::to_string(int64_t(std::chrono::duration<double, std::milli>(*deadline - start).count())).append(" ms").c_str()
+                                 : "none",
+                        chain);
+                }
+            }
+            if (longWaitMs > 0 && objects)
+                for (auto& o : *objects)
+                    if (o->waiter == CurrentGuestThreadId())
+                    {
+                        o->waitSinceMs = 0;
+                        o->waiter = 0;
+                    }
+            if (t)
                 t->waitingOn.clear();
         }
     } clear;
+    clear.deadline = deadline;
+    clear.objects = &objects;
+    if (longWaitMs > 0)
+    {
+        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+        for (auto& o : objects)
+        {
+            int64_t expected = 0;
+            if (o->waitSinceMs.compare_exchange_strong(expected, nowMs))
+                o->waiter = tid;
+        }
+    }
     std::unique_lock lock(g_objectMutex);
     for (;;)
     {
@@ -301,4 +412,30 @@ void SyncGuestSignalState(KernelObject& object)
         return;
     }
     StoreBE32(object.guestObject + 4, uint32_t(state));
+}
+
+void NoteSignal(KernelObject& object, const char* how, uint32_t lr)
+{
+    const int64_t since = object.waitSinceMs.load();
+    if (!since)
+        return;
+    const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+    if (nowMs - since < 300)
+        return;
+    char chain[160] = {};
+    int n = 0;
+    if (GuestThread* t = CurrentGuestThread(); t && t->ctx)
+    {
+        uint32_t sp = t->ctx->r1.u32;
+        for (int i = 0; i < 10 && sp; i++)
+        {
+            const uint32_t next = LoadBE32(sp);
+            if (!next || next <= sp)
+                break;
+            n += snprintf(chain + n, sizeof(chain) - n, " %08X", LoadBE32(next - 8));
+            sp = next;
+        }
+    }
+    Log("signal: %s handle %08X guest %08X by t%u lr %08X%s releases t%u after %lld ms", how, object.handle, object.guestObject,
+        CurrentGuestThreadId(), lr, chain, object.waiter.load(), (long long)(nowMs - since));
 }

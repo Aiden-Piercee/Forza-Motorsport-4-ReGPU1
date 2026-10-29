@@ -121,21 +121,29 @@ void MemoryInit()
     constexpr uint64_t kTotal = 0x100000000ull;
     auto* base = static_cast<uint8_t*>(VirtualAlloc2(nullptr, nullptr, kTotal, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
     Check(base != nullptr, "reserving 4 GB");
+    // FM4_NO_PHYSICAL_WINDOW=1 (A/B): no window at 0x7F000000; low memory is one ordinary block and
+    // physical allocations start at 64 KB, as before the window.
+    const bool window = !getenv("FM4_NO_PHYSICAL_WINDOW");
 
     // Split into [0, 7F000000), the writeback window, [7FC00000, A0000000) and three 512 MB
     // view slots.
     Check(VirtualFree(base, 0xA0000000, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), "splitting low memory");
-    Check(VirtualFree(base, kWritebackWindow, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), "splitting low memory");
-    Check(VirtualFree(base + kWritebackWindow, kWritebackSize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), "splitting the writeback window");
+    if (window)
+    {
+        Check(VirtualFree(base, kWritebackWindow, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), "splitting low memory");
+        Check(VirtualFree(base + kWritebackWindow, kWritebackSize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), "splitting the writeback window");
+    }
     for (uint32_t view : { 0xA0000000u, 0xC0000000u })
         Check(VirtualFree(base + view, kPhysicalSize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), "splitting a physical view");
 
-    Check(VirtualAlloc2(nullptr, base, kWritebackWindow, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) == base,
+    Check(VirtualAlloc2(nullptr, base, window ? kWritebackWindow : 0xA0000000, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
+              nullptr, 0) == base,
         "committing low memory");
     constexpr uint32_t kRegisterSpace = kWritebackWindow + kWritebackSize;
-    Check(VirtualAlloc2(nullptr, base + kRegisterSpace, 0xA0000000 - kRegisterSpace, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
-              PAGE_READWRITE, nullptr, 0) == base + kRegisterSpace,
-        "committing register space");
+    if (window)
+        Check(VirtualAlloc2(nullptr, base + kRegisterSpace, 0xA0000000 - kRegisterSpace, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                  PAGE_READWRITE, nullptr, 0) == base + kRegisterSpace,
+            "committing register space");
 
     HANDLE section = g_physicalSection = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_READ | FILE_MAP_WRITE, PAGE_READWRITE, SEC_COMMIT,
         kPhysicalSize, nullptr, nullptr, 0);
@@ -148,16 +156,19 @@ void MemoryInit()
     // The CPU sees the start of physical memory at 0x7F000000: the GPU writes there (D3D's XPS
     // read pointers: GPU 0xC0000180 is CPU 0x7F000180) and XPS geometry rings sit above it
     // (0x7F100000). The registers at 0x7FC00000 and up stay ordinary memory.
-    Check(MapViewOfFile3(section, nullptr, base + kWritebackWindow, 0, kWritebackSize, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) ==
-              base + kWritebackWindow,
-        "mapping the writeback window");
+    if (window)
+        Check(MapViewOfFile3(section, nullptr, base + kWritebackWindow, 0, kWritebackSize, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) ==
+                  base + kWritebackWindow,
+            "mapping the writeback window");
+    else
+        Log("memory: no window at 0x7F000000 (FM4_NO_PHYSICAL_WINDOW)");
 
     g_base = base;
     // 0x7F000000 and up is the writeback window and GPU register space (MMIO the title writes to).
     g_virtual.Init(0x40000000, kWritebackWindow);
     // Physical: nothing in the first 16 MB, which the writeback window shows (and so no allocation
     // has address 0).
-    g_physical.Init(0x01000000, kPhysicalSize);
+    g_physical.Init(window ? 0x01000000 : 0x00010000, kPhysicalSize);
 }
 
 uint32_t PhysicalViewBase(uint32_t protect)
