@@ -1,28 +1,29 @@
 using System.IO.Compression;
 using System.Text;
 
-namespace FM2Launcher;
+namespace FM4Launcher;
 
 /// <summary>
-/// Game profiles: Documents\fm2\profiles\&lt;name&gt;, one per profile name in settings.ini. The saves inside are
-/// encrypted and signed for the profile's XUID, which fm2.exe keeps in the folder's xuid file (src/kernel/
+/// Game profiles: Documents\fm4\profiles\&lt;name&gt;, one per profile name in settings.ini. The saves inside are
+/// encrypted and signed for the profile's XUID, which fm4.exe keeps in the folder's xuid file (src/kernel/
 /// imports_xam.cpp), so a copied, renamed or restored folder keeps working. A folder from before that file
-/// existed gets the XUID fm2.exe derives from the name, written here before the folder is copied or renamed.
-/// Backups are zips of the folder in Documents\fm2\backups.
+/// existed gets the XUID fm4.exe derives from the name, written here before the folder is copied or renamed.
+/// Backups are zips of the folder in Documents\fm4\backups.
 /// </summary>
 internal static class Profiles
 {
     public static readonly string Root = Path.Combine(Paths.User, "profiles");
     public static readonly string Backups = Path.Combine(Paths.User, "backups");
 
-    public record Info(string Name, string Xuid, long Bytes, DateTime? LastPlayed, int Photos, bool Active, Cheats Cheats);
+    public record Info(string Name, string Xuid, long Bytes, DateTime? LastPlayed, int Photos, bool Active);
     public record Backup(string File, string Profile, long Bytes, DateTime Made);
 
     public static List<Info> List()
     {
         var active = GameSettings.Load().Profile;
         var list = new List<Info>();
-        if (!Directory.Exists(Root)) return list;
+        // The game plays the active profile (and shows its name) whether or not it has a folder yet, so list it.
+        Directory.CreateDirectory(Path.Combine(Root, FolderName(active)));
         foreach (var dir in new DirectoryInfo(Root).EnumerateDirectories().OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase))
         {
             var content = Path.Combine(dir.FullName, "content");
@@ -30,12 +31,12 @@ internal static class Profiles
             DateTime? last = files.Count > 0 ? files.Max(f => f.LastWriteTime) : null;
             int photos = files.Count(f => f.Directory?.Name == "photos" && f.Directory.Parent?.Name == "SavedPhotos");
             list.Add(new Info(dir.Name, XuidOf(dir.Name), files.Sum(f => f.Length), last, photos,
-                string.Equals(FolderName(active), dir.Name, StringComparison.OrdinalIgnoreCase), Cheats.Load(dir.Name)));
+                string.Equals(FolderName(active), dir.Name, StringComparison.OrdinalIgnoreCase)));
         }
         return list;
     }
 
-    /// <summary>The folder fm2.exe uses for a profile name (runtime.cpp: characters Windows forbids become '_').</summary>
+    /// <summary>The folder fm4.exe uses for a profile name (runtime.cpp: characters Windows forbids become '_').</summary>
     public static string FolderName(string name) =>
         new(name.Select(c => "<>:\"/\\|?*".Contains(c) || c < 32 ? '_' : c).ToArray());
 
@@ -55,7 +56,7 @@ internal static class Profiles
         return name;
     }
 
-    /// <summary>The profile's XUID: its xuid file, else the one fm2.exe derives from the name (FNV-1a of the name's bytes).</summary>
+    /// <summary>The profile's XUID: its xuid file, else the one fm4.exe derives from the name (FNV-1a of the name's bytes).</summary>
     public static string XuidOf(string folder)
     {
         var file = Path.Combine(Root, folder, "xuid");
@@ -131,6 +132,14 @@ internal static class Profiles
         var dir = Dir(name);
         var backup = MakeBackup(name, "deleted");
         Directory.Delete(dir, true);
+        // Deleting the active profile: play another one, so the game doesn't quietly recreate it empty.
+        var s = GameSettings.Load();
+        if (string.Equals(FolderName(s.Profile), Path.GetFileName(dir), StringComparison.OrdinalIgnoreCase))
+        {
+            s.Profile = new DirectoryInfo(Root).EnumerateDirectories().Select(d => d.Name)
+                .OrderBy(n => n, StringComparer.OrdinalIgnoreCase).FirstOrDefault() ?? "Player";
+            s.Save();
+        }
         return backup;
     }
 
@@ -260,52 +269,5 @@ internal static class Profiles
         Directory.CreateDirectory(to);
         foreach (var f in Directory.GetFiles(from, "*", SearchOption.AllDirectories))
             File.Copy(f, Path.Combine(to, Path.GetRelativePath(from, f)));
-    }
-}
-
-/// <summary>A profile's cheats: profiles\&lt;name&gt;\cheats.ini, applied by fm2.exe (src/hooks/cheats.cpp).</summary>
-public sealed class Cheats
-{
-    public bool InfiniteCredits { get; set; }
-    public long GiveCredits { get; set; }
-    public bool MaxLevel { get; set; }
-    public bool AllCars { get; set; }
-
-    static string File_(string folder) => Path.Combine(Profiles.Root, folder, "cheats.ini");
-
-    public static Cheats Load(string folder)
-    {
-        var c = new Cheats();
-        try
-        {
-            foreach (var line in File.ReadAllLines(File_(folder)))
-            {
-                var eq = line.IndexOf('=');
-                if (eq < 0) continue;
-                long.TryParse(line[(eq + 1)..].Trim(), out var v);
-                switch (line[..eq].Trim())
-                {
-                    case "infinite_credits": c.InfiniteCredits = v != 0; break;
-                    case "give_credits": c.GiveCredits = v; break;
-                    case "max_level": c.MaxLevel = v != 0; break;
-                    case "arcade_all_cars": c.AllCars = v != 0; break;
-                }
-            }
-        }
-        catch { }
-        return c;
-    }
-
-    public void Save(string folder)
-    {
-        GiveCredits = Math.Clamp(GiveCredits, 0, 999_999_999);
-        var path = File_(folder);
-        if (!InfiniteCredits && GiveCredits == 0 && !MaxLevel && !AllCars)
-        {
-            if (File.Exists(path)) File.Delete(path);
-            return;
-        }
-        File.WriteAllText(path,
-            $"infinite_credits={(InfiniteCredits ? 1 : 0)}\ngive_credits={GiveCredits}\nmax_level={(MaxLevel ? 1 : 0)}\narcade_all_cars={(AllCars ? 1 : 0)}\n");
     }
 }

@@ -1,22 +1,28 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using Microsoft.Web.WebView2.Core;
+using Photino.NET;
 
-namespace FM2Launcher;
+namespace FM4Launcher;
 
 /// <summary>
-/// The page's calls: { id, cmd, args } over WebView2's message channel, answered with { id, ok, result | error }.
-/// Progress and other pushes go out as { event, ... }.
+/// The page's calls: { id, cmd, args } over the window's message channel (wwwroot/host.js), answered with
+/// { id, ok, result | error }.
 /// </summary>
-public sealed class Bridge(CoreWebView2 web, Form owner)
+public sealed class Bridge
 {
     static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
-    Updater.Release? _latest;
+    readonly PhotinoWindow _window;
 
-    public async void OnMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
+    public Bridge(PhotinoWindow window)
+    {
+        _window = window;
+        window.RegisterWebMessageReceivedHandler((_, text) => OnMessage(text));
+    }
+
+    async void OnMessage(string text)
     {
         JsonNode? msg;
-        try { msg = JsonNode.Parse(e.WebMessageAsJson); } catch { return; }
+        try { msg = JsonNode.Parse(text); } catch { return; }
         var id = msg?["id"]?.GetValue<int>() ?? 0;
         var cmd = msg?["cmd"]?.GetValue<string>() ?? "";
         var args = msg?["args"];
@@ -31,8 +37,10 @@ public sealed class Bridge(CoreWebView2 web, Form owner)
         }
     }
 
-    void Post(object o) => web.PostWebMessageAsJson(JsonSerializer.Serialize(o, Json));
-    void Push(string name, object data) => Post(new { @event = name, data });
+    void Post(object o) => _window.SendWebMessage(JsonSerializer.Serialize(o, Json));
+
+    static readonly (string, string[])[] AnyFile = [("Xbox 360 content packages", ["*.*"])];
+    static readonly (string, string[])[] ZipFilter = [("Profile zip", ["*.zip"])];
 
     async Task<object?> Run(string cmd, JsonNode? a)
     {
@@ -59,15 +67,14 @@ public sealed class Bridge(CoreWebView2 web, Form owner)
                 return State();
             case "dlc.add":
                 {
-                    using var dialog = new OpenFileDialog
-                    {
-                        Title = "Choose DLC packages",
-                        Filter = "Xbox 360 content packages|*.*",
-                        Multiselect = true,
-                    };
-                    int added = dialog.ShowDialog(owner) == DialogResult.OK ? Dlc.Add(dialog.FileNames) : 0;
-                    return new { added, state = State() };
+                    var files = await _window.ShowOpenFileAsync("Choose DLC packages", null, true, AnyFile);
+                    if (files is not { Length: > 0 }) return new { added = 0, errors = Array.Empty<string>(), state = State() };
+                    var (added, errors) = Dlc.Add(files);
+                    return new { added, errors, state = State() };
                 }
+            case "photos.open":
+                PhotosWindow.Show(_window);
+                return null;
             case "open":
                 {
                     var which = a?.GetValue<string>();
@@ -80,7 +87,7 @@ public sealed class Bridge(CoreWebView2 web, Form owner)
                         "log" => Path.Combine(Paths.Root, "out"),
                         _ => throw new ArgumentException("Unknown folder."),
                     };
-                    System.Diagnostics.Process.Start("explorer.exe", $"\"{path}\"");
+                    Platform.OpenFolder(path);
                     return null;
                 }
             case "profiles.list": return ProfilesState();
@@ -113,57 +120,43 @@ public sealed class Bridge(CoreWebView2 web, Form owner)
                 }
             case "profiles.import":
                 {
-                    using var dialog = new OpenFileDialog { Title = "Import a profile", Filter = "Profile zip|*.zip" };
-                    if (dialog.ShowDialog(owner) != DialogResult.OK) return null;
-                    var name = Profiles.Restore(dialog.FileName, a?["asName"]?.GetValue<string>());
+                    var files = await _window.ShowOpenFileAsync("Import a profile", null, false, ZipFilter);
+                    if (files is not { Length: > 0 }) return null;
+                    var name = Profiles.Restore(files[0], a?["asName"]?.GetValue<string>());
                     return new { name, state = ProfilesState() };
                 }
             case "profiles.export":
                 {
                     var name = Str(a, "name");
-                    using var dialog = new SaveFileDialog { Title = "Export profile", FileName = Profiles.FolderName(name) + ".zip", Filter = "Profile zip|*.zip" };
-                    if (dialog.ShowDialog(owner) != DialogResult.OK) return false;
-                    Profiles.Export(name, dialog.FileName);
+                    var file = await _window.ShowSaveFileAsync("Export profile", Profiles.FolderName(name) + ".zip", ZipFilter);
+                    if (string.IsNullOrEmpty(file)) return false;
+                    Profiles.Export(name, file);
                     return true;
                 }
             case "profiles.mergePhotos":
                 return new { copied = Profiles.MergePhotos(Str(a, "from"), Str(a, "into")), state = ProfilesState() };
-            case "profiles.cheats":
-                {
-                    if (Game.Running) throw new InvalidOperationException("Close the game first: cheats are read when it starts.");
-                    a!["cheats"].Deserialize<Cheats>(Json)!.Save(Profiles.FolderName(Str(a, "name")));
-                    return ProfilesState();
-                }
             case "profiles.openBackups":
-                System.Diagnostics.Process.Start("explorer.exe", $"\"{Directory.CreateDirectory(Profiles.Backups).FullName}\"");
+                Platform.OpenFolder(Directory.CreateDirectory(Profiles.Backups).FullName);
                 return null;
             case "photos.list": return Photos.List();
             case "photos.copy":
-                Photos.Copy(a!.GetValue<string>());
+                Platform.CopyPng(Convert.FromBase64String(a!.GetValue<string>()));
                 return null;
-            case "photos.save": return Photos.SaveAs(a!.GetValue<string>(), owner);
-            case "photos.reveal":
-                Photos.Reveal(a?.GetValue<string>());
-                return null;
-            case "url":
+            case "photos.saveAs":
                 {
-                    var url = a?.GetValue<string>() ?? "";
-                    if (!url.StartsWith("https://github.com/", StringComparison.OrdinalIgnoreCase)) throw new ArgumentException("Only GitHub links open from here.");
-                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true });
+                    var id = a!.GetValue<string>();
+                    var file = await _window.ShowSaveFileAsync("Save photo", Path.Combine(Photos.SaveFolder, Path.GetFileName(Photos.PathOf(id)) + ".jpg"),
+                        [("JPEG image", ["*.jpg"]), ("PNG image", ["*.png"])]);
+                    return string.IsNullOrEmpty(file) ? null : file;
+                }
+            case "photos.write":
+                {
+                    var png = a?["png"]?.GetValue<string>();
+                    Photos.Write(Str(a, "id"), Str(a, "file"), png is null ? null : Convert.FromBase64String(png));
                     return null;
                 }
-            case "update.check":
-                _latest = await Updater.LatestAsync();
-                return UpdateInfo();
-            case "update.apply":
-                {
-                    _latest ??= await Updater.LatestAsync();
-                    var applied = await Updater.DownloadAndApplyAsync(_latest, (p, text) => Push("progress", new { p, text }));
-                    return new { applied.Files, applied.LauncherChanged, update = UpdateInfo(), state = State() };
-                }
-            case "restart":
-                System.Diagnostics.Process.Start(Environment.ProcessPath!);
-                owner.BeginInvoke(() => owner.Close());
+            case "photos.reveal":
+                Photos.Reveal(a?.GetValue<string>());
                 return null;
             default:
                 throw new ArgumentException($"Unknown command {cmd}.");
@@ -174,23 +167,6 @@ public sealed class Bridge(CoreWebView2 web, Form owner)
 
     static object ProfilesState() => new { profiles = Profiles.List(), backups = Profiles.ListBackups(), running = Game.Running };
 
-    object UpdateInfo()
-    {
-        var installed = Updater.InstalledVersion();
-        return new
-        {
-            installed,
-            latest = _latest?.Version,
-            name = _latest?.Name,
-            notes = _latest?.Notes,
-            page = _latest?.Page,
-            published = _latest?.Published,
-            patchBytes = _latest?.PatchBytes ?? 0,
-            hasPatch = _latest?.PatchUrl is not null,
-            available = _latest is not null && Updater.IsNewer(_latest.Version, installed),
-        };
-    }
-
     static object State()
     {
         var settings = GameSettings.Load();
@@ -198,7 +174,7 @@ public sealed class Bridge(CoreWebView2 web, Form owner)
         return new
         {
             settings,
-            version = Updater.InstalledVersion(),
+            version = Version(),
             paths = new { root = Paths.Root, user = Paths.User },
             checks = new
             {
@@ -212,7 +188,6 @@ public sealed class Bridge(CoreWebView2 web, Form owner)
                 resolutions = Options.Resolutions(),
                 aspects = Options.Aspects.Select(x => new { value = x.Value, name = x.Name }),
                 fps = Options.Fps,
-                msaa = Options.Msaa.Select(x => new { value = x.Value, name = x.Name }),
                 languages = Options.InstalledLanguages().Select(l => new { id = l.Id, code = l.Code, name = l.Name }),
                 missingLanguages = Directory.Exists(stringTables)
                     ? new[] { "PL", "CZ", "HU" }.Where(c => File.Exists(Path.Combine(stringTables, c + ".zip"))).ToArray() : [],
@@ -220,5 +195,16 @@ public sealed class Bridge(CoreWebView2 web, Form owner)
             shaders = ShaderCache.Get(),
             dlc = Dlc.List(),
         };
+    }
+
+    /// <summary>The game's version, from fm4.exe's version resource.</summary>
+    static string Version()
+    {
+        try
+        {
+            var v = File.Exists(Paths.Exe) ? System.Diagnostics.FileVersionInfo.GetVersionInfo(Paths.Exe).ProductVersion : null;
+            return string.IsNullOrWhiteSpace(v) ? "0.0.0" : v.Trim();
+        }
+        catch { return "0.0.0"; }
     }
 }
