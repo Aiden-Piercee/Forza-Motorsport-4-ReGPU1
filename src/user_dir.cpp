@@ -16,6 +16,9 @@ const std::filesystem::path& DocumentsUserDir()
 {
     static const std::filesystem::path dir = [] {
         std::error_code ec;
+        // FM4_USER_DIR: keep everything in one folder of the caller's choosing (a copy that travels with the game).
+        if (wchar_t custom[MAX_PATH]; GetEnvironmentVariableW(L"FM4_USER_DIR", custom, MAX_PATH) - 1u < MAX_PATH - 1u)
+            return std::filesystem::absolute(std::filesystem::path(custom), ec);
         std::filesystem::path documents;
         PWSTR known = nullptr;
         if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &known)) && known)
