@@ -17,6 +17,7 @@ struct Settings
     bool skipIntro = false;              // straight to the title screen (no legal text or splash videos)
     uint32_t language = 1;               // the console language the game sees (XGetLanguage: 1 English, 3 German, ...)
     uint32_t msaa = 1;                   // anti-aliasing samples per pixel: 1 (off), 2, 4 or 8
+    uint32_t smaa = 0;                   // SMAA 1x on the frame as it is shown: 0 off, 1 low, 2 medium, 3 high, 4 ultra
     // Upscaling: the 3D scene renders smaller and is upscaled before post-processing and
     // the HUD, which stay at full resolution.
     enum class Upscaler : uint32_t { Off, Fsr1, Fsr3, Dlss };

@@ -179,6 +179,7 @@ function render() {
   fill($("maxFps"), [...o.fps.map((f) => ({ value: f, name: f + " fps" })), { value: "custom", name: "Custom…" }], custom ? "custom" : set.maxFps)
   $("customFpsField").hidden = !custom
   if (document.activeElement !== $("customFps")) $("customFps").value = set.maxFps
+  fill($("smaa"), o.smaa, set.smaa)
   fill($("language"), o.languages.map((l) => ({ value: l.id, name: l.name })), set.language)
   $("lang-note").textContent = o.missingLanguages.length
     ? `Your disc also has ${o.missingLanguages.join(", ")} text. Those can't be picked yet.` : ""
@@ -192,6 +193,7 @@ function render() {
   line("Profile", set.profile || "Player")
   line("Display", `${set.resolution.replace("x", " × ")}, ${set.fullscreen ? "fullscreen" : "windowed"}${aspect && set.aspect !== "auto" ? ", " + aspect.name : ""}`)
   line("Frame rate", `${set.maxFps} fps cap, VSync ${set.vsync ? "on" : "off"}`)
+  line("SMAA", (o.smaa.find((m) => m.value === set.smaa) || { name: "Off" }).name)
   line("Language", lang ? lang.name : "English")
   line("Fast mode", set.fastMode ? "on" : "off")
 
@@ -265,6 +267,7 @@ $("customFps").onchange = (e) => {
   e.target.value = f
   change({ maxFps: f })
 }
+$("smaa").onchange = (e) => change({ smaa: +e.target.value })
 $("language").onchange = (e) => change({ language: +e.target.value })
 $("display").onclick = (e) => { const b = e.target.closest("button"); if (b) change({ fullscreen: b.dataset.full === "1" }) }
 for (const k of ["vsync", "fastMode"]) $(k).onclick = () => change({ [k]: !state.settings[k] })

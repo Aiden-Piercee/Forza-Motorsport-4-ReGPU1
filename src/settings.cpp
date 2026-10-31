@@ -72,6 +72,8 @@ void Load()
             g_settings.skipIntro = value == "1";
         else if (key == "msaa")
             g_settings.msaa = uint32_t(atoi(value.c_str()));
+        else if (key == "smaa")
+            g_settings.smaa = uint32_t(atoi(value.c_str()));
         else if (key == "upscaler")
             g_settings.upscaler = ParseUpscaler(value);
         else if (key == "upscale_quality")
@@ -175,6 +177,7 @@ void SaveSettings()
     out << "skip_intro=" << (s.skipIntro ? 1 : 0) << "\n";
     out << "language=" << s.language << "\n";
     out << "msaa=" << s.msaa << "\n";
+    out << "smaa=" << s.smaa << "\n";
     out << "upscaler=" << UpscalerName(s.upscaler) << "\n";
     out << "upscale_quality=" << s.quality << "\n";
     out << "sharpness=" << s.sharpness << "\n";

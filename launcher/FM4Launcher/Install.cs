@@ -58,11 +58,12 @@ public sealed class GameSettings
     public bool Fullscreen { get; set; }
     public bool Vsync { get; set; }
     public int MaxFps { get; set; } = 360;
+    public int Smaa { get; set; }
     public bool FastMode { get; set; } = true; // launcher only: set on the game's environment at launch (Game.Launch)
     public int Language { get; set; } = 1;
 
     // What this launcher writes; every other key in the file is kept as it is. Upscaling is always off here.
-    static readonly string[] Known = ["profile", "resolution", "aspect", "fullscreen", "vsync", "max_fps", "fast_mode", "upscaler", "language"];
+    static readonly string[] Known = ["profile", "resolution", "aspect", "fullscreen", "vsync", "max_fps", "smaa", "fast_mode", "upscaler", "language"];
 
     public static GameSettings Load()
     {
@@ -76,6 +77,7 @@ public sealed class GameSettings
                 case "fullscreen": s.Fullscreen = v == "1"; break;
                 case "vsync": s.Vsync = v == "1"; break;
                 case "max_fps": s.MaxFps = int.TryParse(v, out var f) ? f : 360; break;
+                case "smaa": s.Smaa = int.TryParse(v, out var sm) ? Math.Clamp(sm, 0, 4) : 0; break;
                 case "fast_mode": s.FastMode = v != "0"; break;
                 case "language": s.Language = int.TryParse(v, out var l) && l > 0 ? l : 1; break;
             }
@@ -89,7 +91,7 @@ public sealed class GameSettings
         var sb = new StringBuilder("# Forza Motorsport 4 (fm4) settings; the launcher edits this file.\n");
         sb.Append($"profile={(profile.Length > 0 ? profile : "Player")}\n");
         sb.Append($"resolution={Resolution}\naspect={Aspect}\nfullscreen={B(Fullscreen)}\nvsync={B(Vsync)}\n");
-        sb.Append($"max_fps={Math.Clamp(MaxFps, 30, 360)}\nfast_mode={B(FastMode)}\nupscaler=off\nlanguage={Language}\n");
+        sb.Append($"max_fps={Math.Clamp(MaxFps, 30, 360)}\nsmaa={Math.Clamp(Smaa, 0, 4)}\nfast_mode={B(FastMode)}\nupscaler=off\nlanguage={Language}\n");
         foreach (var (k, v) in keep) sb.Append($"{k}={v}\n");
         Directory.CreateDirectory(Paths.User);
         File.WriteAllText(Paths.SettingsFile, sb.ToString());
@@ -136,6 +138,8 @@ public static class Options
 
     public static readonly int[] Fps = [30, 60, 120, 144, 165, 240, 360];
     public static readonly (string Value, string Name)[] Aspects = [("auto", "Auto (match resolution)"), ("16:9", "16:9"), ("21:9", "21:9 (experimental)"), ("32:9", "32:9 (experimental)")];
+    public static readonly (int Value, string Name)[] Smaa = [(0, "Off"), (1, "Low"), (2, "Medium"), (3, "High"), (4, "Ultra")];
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     struct DEVMODE
     {
