@@ -58,16 +58,25 @@ public sealed class GameSettings
     public bool Fullscreen { get; set; }
     public bool Vsync { get; set; }
     public int MaxFps { get; set; } = 360;
+    public int Msaa { get; set; } = 1;
     public int Smaa { get; set; }
+    public bool Anisotropy { get; set; } = true; // launcher only: off sets REGPU_NO_ANISO at launch (Game.Launch)
+    // FSR 1 on the 3D scene: 0 off, else the game's upscale_quality (1 quality to 4 ultra performance).
+    public int Upscale { get; set; }
+    public int Sharpening { get; set; } = 50; // percent; settings.ini holds 0-1
+    public bool Enhance { get; set; }
+    public bool HideShaderOverlay { get; set; } // launcher only: sets REGPU_NO_OVERLAY at launch
     public bool FastMode { get; set; } = true; // launcher only: set on the game's environment at launch (Game.Launch)
     public int Language { get; set; } = 1;
 
     // What this launcher writes; every other key in the file is kept as it is. Upscaling is always off here.
-    static readonly string[] Known = ["profile", "resolution", "aspect", "fullscreen", "vsync", "max_fps", "smaa", "fast_mode", "upscaler", "language"];
+    static readonly string[] Known = ["profile", "resolution", "aspect", "fullscreen", "vsync", "max_fps", "msaa", "smaa", "anisotropy", "fast_mode", "upscaler", "upscale_quality", "sharpness", "enhance", "hide_shader_overlay", "language"];
 
     public static GameSettings Load()
     {
         var s = new GameSettings();
+        var fsr1 = false;
+        var quality = 1;
         foreach (var (k, v) in Read())
             switch (k)
             {
@@ -77,10 +86,21 @@ public sealed class GameSettings
                 case "fullscreen": s.Fullscreen = v == "1"; break;
                 case "vsync": s.Vsync = v == "1"; break;
                 case "max_fps": s.MaxFps = int.TryParse(v, out var f) ? f : 360; break;
+                case "msaa": s.Msaa = int.TryParse(v, out var ms) ? ms : 1; break;
+                case "anisotropy": s.Anisotropy = v != "0"; break;
+                case "upscaler": fsr1 = v == "fsr1"; break;
+                case "upscale_quality": quality = int.TryParse(v, out var q) ? Math.Clamp(q, 1, 4) : 1; break;
+                case "sharpness":
+                    s.Sharpening = double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var sh)
+                        ? (int)Math.Round(sh * 100) : 50;
+                    break;
+                case "enhance": s.Enhance = v == "1"; break;
+                case "hide_shader_overlay": s.HideShaderOverlay = v == "1"; break;
                 case "smaa": s.Smaa = int.TryParse(v, out var sm) ? Math.Clamp(sm, 0, 4) : 0; break;
                 case "fast_mode": s.FastMode = v != "0"; break;
                 case "language": s.Language = int.TryParse(v, out var l) && l > 0 ? l : 1; break;
             }
+        s.Upscale = fsr1 ? quality : 0;
         return s;
     }
 
@@ -91,7 +111,9 @@ public sealed class GameSettings
         var sb = new StringBuilder("# Forza Motorsport 4 (fm4) settings; the launcher edits this file.\n");
         sb.Append($"profile={(profile.Length > 0 ? profile : "Player")}\n");
         sb.Append($"resolution={Resolution}\naspect={Aspect}\nfullscreen={B(Fullscreen)}\nvsync={B(Vsync)}\n");
-        sb.Append($"max_fps={Math.Clamp(MaxFps, 30, 360)}\nsmaa={Math.Clamp(Smaa, 0, 4)}\nfast_mode={B(FastMode)}\nupscaler=off\nlanguage={Language}\n");
+        sb.Append($"max_fps={Math.Clamp(MaxFps, 30, 360)}\nmsaa={Msaa}\nsmaa={Math.Clamp(Smaa, 0, 4)}\nanisotropy={B(Anisotropy)}\nfast_mode={B(FastMode)}\nlanguage={Language}\n");
+        var sharp = (Math.Clamp(Sharpening, 0, 100) / 100.0).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        sb.Append($"upscaler={(Upscale > 0 ? "fsr1" : "off")}\nupscale_quality={Math.Clamp(Upscale, 1, 4)}\nsharpness={sharp}\nenhance={B(Enhance)}\nhide_shader_overlay={B(HideShaderOverlay)}\n");
         foreach (var (k, v) in keep) sb.Append($"{k}={v}\n");
         Directory.CreateDirectory(Paths.User);
         File.WriteAllText(Paths.SettingsFile, sb.ToString());
@@ -138,6 +160,9 @@ public static class Options
 
     public static readonly int[] Fps = [30, 60, 120, 144, 165, 240, 360];
     public static readonly (string Value, string Name)[] Aspects = [("auto", "Auto (match resolution)"), ("16:9", "16:9"), ("21:9", "21:9 (experimental)"), ("32:9", "32:9 (experimental)")];
+    public static readonly (int Value, string Name)[] Msaa = [(1, "Off"), (2, "2x MSAA"), (4, "4x MSAA")];
+    public static readonly (int Value, string Name)[] Upscale = [(0, "Off (native)"), (1, "FSR 1: Quality"), (2, "FSR 1: Balanced"), (3, "FSR 1: Performance"), (4, "FSR 1: Ultra performance")];
+    public static readonly (int Value, string Name)[] Sharpening = [(0, "Off"), (25, "Low"), (50, "Medium"), (75, "High"), (100, "Maximum")];
     public static readonly (int Value, string Name)[] Smaa = [(0, "Off"), (1, "Low"), (2, "Medium"), (3, "High"), (4, "Ultra")];
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -268,7 +293,10 @@ public static class Game
         psi.Environment["FM2_NO_LAUNCHER"] = "1"; // the settings come from settings.ini, saved by this launcher
         // As play-fm4.cmd: resolves up to 1024 pixels written back; fast mode, fences at record time.
         psi.Environment["REGPU_RESOLVE_WRITEBACK_MAX"] = "1024";
-        if (GameSettings.Load().FastMode) psi.Environment["REGPU_EARLY_FENCES"] = "1";
+        var settings = GameSettings.Load();
+        if (settings.FastMode) psi.Environment["REGPU_EARLY_FENCES"] = "1";
+        if (!settings.Anisotropy) psi.Environment["REGPU_NO_ANISO"] = "1";
+        if (settings.HideShaderOverlay) psi.Environment["REGPU_NO_OVERLAY"] = "1";
         Process.Start(psi);
     }
 

@@ -85,13 +85,41 @@
           <button data-full="1" data-tip="Fills the main display without changing its mode. A narrower aspect ratio is centred with black bars.">Fullscreen</button>
         </div>
       </div>
-      <label class="field" data-tip="SMAA 1x: smooths the edges in the finished picture, HUD included. Higher presets find more edges for a little more GPU time; it can soften fine textures slightly.">
-        <span>SMAA</span>
-        <select id="smaa"></select>
-      </label>
     </section>
 
     <div class="stack">
+    <section class="panel">
+      <div class="panel-head"><h2>Anti-aliasing &amp; image</h2></div>
+      <label class="field" data-tip="Multisample anti-aliasing: smooths the edges of objects as they are drawn, which SMAA alone can't do for thin detail. Costs GPU time and memory, a lot at 4K: try 2x first. Not yet tested on FM4.">
+        <span>MSAA (experimental)</span>
+        <select id="msaa"></select>
+      </label>
+      <label class="field" data-tip="SMAA 1x: smooths the hard edges in the finished picture, HUD included. Higher presets find more edges for a little more GPU time. It can't fix thin wires, foliage or specular sparkle.">
+        <span>SMAA</span>
+        <select id="smaa"></select>
+      </label>
+      <div class="toggle-row" data-tip="Keeps road and ground textures sharp when seen at a low angle, ahead of the car (16x). Costs little.">
+        <div><div class="toggle-title">Anisotropic filtering</div><div class="toggle-sub">16x</div></div>
+        <button class="switch" id="anisotropy" role="switch"></button>
+      </div>
+      <label class="field" data-tip="Renders the 3D scene smaller and upscales it with AMD FSR 1; the HUD stays at full size. Faster on a weak graphics card, softer picture. Not yet tested on FM4.">
+        <span>Upscaling (experimental)</span>
+        <select id="upscale"></select>
+      </label>
+      <label class="field" id="sharpeningField" data-tip="FSR 1's sharpening of the upscaled scene.">
+        <span>Sharpening (experimental)</span>
+        <select id="sharpening"></select>
+      </label>
+      <div class="toggle-row" data-tip="A local-contrast pass on the finished picture. Not yet tested on FM4.">
+        <div><div class="toggle-title">Enhanced lighting (experimental)</div><div class="toggle-sub">Local contrast</div></div>
+        <button class="switch" id="enhance" role="switch"></button>
+      </div>
+      <div class="toggle-row" data-tip="The box in the top left that shows shaders being compiled. Turning it off doesn't stop the compiling, only hides it.">
+        <div><div class="toggle-title">Hide shader compile box</div><div class="toggle-sub">Top left of the screen</div></div>
+        <button class="switch" id="hideShaderOverlay" role="switch"></button>
+      </div>
+    </section>
+
     <section class="panel">
       <div class="panel-head"><h2>Performance</h2></div>
       <label class="field" data-tip="The limit on the frames shown. FM4 paces itself to 60, so anything from 60 up plays the same. With VSync on, the display's refresh rate also limits it.">

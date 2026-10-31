@@ -179,12 +179,16 @@ function render() {
   fill($("maxFps"), [...o.fps.map((f) => ({ value: f, name: f + " fps" })), { value: "custom", name: "Custom…" }], custom ? "custom" : set.maxFps)
   $("customFpsField").hidden = !custom
   if (document.activeElement !== $("customFps")) $("customFps").value = set.maxFps
+  fill($("msaa"), o.msaa, set.msaa)
   fill($("smaa"), o.smaa, set.smaa)
+  fill($("upscale"), o.upscale, set.upscale)
+  fill($("sharpening"), o.sharpening, set.sharpening)
+  $("sharpeningField").hidden = !set.upscale
   fill($("language"), o.languages.map((l) => ({ value: l.id, name: l.name })), set.language)
   $("lang-note").textContent = o.missingLanguages.length
     ? `Your disc also has ${o.missingLanguages.join(", ")} text. Those can't be picked yet.` : ""
   for (const b of $("display").children) b.classList.toggle("on", (b.dataset.full === "1") === set.fullscreen)
-  for (const k of ["vsync", "fastMode"]) $(k).classList.toggle("on", !!set[k])
+  for (const k of ["vsync", "fastMode", "anisotropy", "enhance", "hideShaderOverlay"]) $(k).classList.toggle("on", !!set[k])
 
   const lang = o.languages.find((l) => l.id === set.language)
   const aspect = o.aspects.find((a) => a.value === set.aspect)
@@ -193,7 +197,9 @@ function render() {
   line("Profile", set.profile || "Player")
   line("Display", `${set.resolution.replace("x", " × ")}, ${set.fullscreen ? "fullscreen" : "windowed"}${aspect && set.aspect !== "auto" ? ", " + aspect.name : ""}`)
   line("Frame rate", `${set.maxFps} fps cap, VSync ${set.vsync ? "on" : "off"}`)
-  line("SMAA", (o.smaa.find((m) => m.value === set.smaa) || { name: "Off" }).name)
+  const named = (list, v) => (list.find((m) => m.value === v) || { name: "Off" }).name
+  line("Anti-aliasing", `MSAA ${named(o.msaa, set.msaa)}, SMAA ${named(o.smaa, set.smaa)}`)
+  if (set.upscale) line("Upscaling", named(o.upscale, set.upscale))
   line("Language", lang ? lang.name : "English")
   line("Fast mode", set.fastMode ? "on" : "off")
 
@@ -267,10 +273,13 @@ $("customFps").onchange = (e) => {
   e.target.value = f
   change({ maxFps: f })
 }
+$("msaa").onchange = (e) => change({ msaa: +e.target.value })
 $("smaa").onchange = (e) => change({ smaa: +e.target.value })
+$("upscale").onchange = (e) => change({ upscale: +e.target.value })
+$("sharpening").onchange = (e) => change({ sharpening: +e.target.value })
 $("language").onchange = (e) => change({ language: +e.target.value })
 $("display").onclick = (e) => { const b = e.target.closest("button"); if (b) change({ fullscreen: b.dataset.full === "1" }) }
-for (const k of ["vsync", "fastMode"]) $(k).onclick = () => change({ [k]: !state.settings[k] })
+for (const k of ["vsync", "fastMode", "anisotropy", "enhance", "hideShaderOverlay"]) $(k).onclick = () => change({ [k]: !state.settings[k] })
 
 // ---- actions
 
