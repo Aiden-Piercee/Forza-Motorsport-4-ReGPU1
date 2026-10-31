@@ -138,8 +138,8 @@ public sealed class Stfs : IDisposable
     }
 
     /// <summary>Installs a package as the game reads DLC: unpacked to dir\name, with name.title and name.license.
-    /// Returns the installed folder's name.</summary>
-    public static string Install(string package, string dir)
+    /// Returns the installed folder's name. <paramref name="mod"/> marks it as a mod (name.mod) for the launcher.</summary>
+    public static string Install(string package, string dir, bool mod)
     {
         using var s = new Stfs(package);
         if (s.TitleId != 0x4D530910) throw new InvalidDataException($"{Path.GetFileName(package)} isn't Forza Motorsport 4 content.");
@@ -151,6 +151,8 @@ public sealed class Stfs : IDisposable
         s.Extract(dest);
         File.WriteAllBytes(dest + ".title", Encoding.Unicode.GetBytes(s.DisplayName));
         File.WriteAllText(dest + ".license", $"{s.LicenseMask:X8}\r\n");
+        if (mod) File.WriteAllText(dest + ".mod", "");
+        else if (File.Exists(dest + ".mod")) File.Delete(dest + ".mod");
         return name;
     }
 }

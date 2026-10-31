@@ -4,6 +4,7 @@
 const $ = (id) => document.getElementById(id)
 let state = null
 let customFps = false // "Custom…" picked in the Max FPS list
+let update = null
 let nextId = 1
 const pending = new Map()
 
@@ -11,6 +12,7 @@ const pending = new Map()
 
 if (host) host.addEventListener("message", (e) => {
   const m = e.data
+  if (m.event === "progress") return onProgress(m.data)
   const p = pending.get(m.id)
   if (!p) return
   pending.delete(m.id)
@@ -126,7 +128,8 @@ $("tabs").onclick = (e) => {
   const b = e.target.closest("button")
   if (!b) return
   for (const t of $("tabs").children) t.classList.toggle("on", t === b)
-  for (const p of ["play", "profiles", "graphics", "settings", "about"]) $("page-" + p).hidden = p !== b.dataset.tab
+  for (const p of ["play", "profiles", "graphics", "settings", "updates", "about"]) $("page-" + p).hidden = p !== b.dataset.tab
+  $("tabs").dataset.shown = b.dataset.tab
   if (b.dataset.tab === "profiles") loadProfiles()
   else if (b.dataset.tab !== "play" && b.dataset.tab !== "graphics") refresh()
 }
@@ -134,8 +137,9 @@ $("tabs").onclick = (e) => {
 // The title opens the About page (no tab of its own).
 $("brand").onclick = () => {
   for (const t of $("tabs").children) t.classList.remove("on")
-  for (const p of ["play", "profiles", "graphics", "settings"]) $("page-" + p).hidden = true
+  for (const p of ["play", "profiles", "graphics", "settings", "updates"]) $("page-" + p).hidden = true
   $("page-about").hidden = false
+  $("tabs").dataset.shown = "about"
 }
 $("brand").onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") $("brand").onclick() }
 
@@ -170,7 +174,6 @@ function render() {
   chips.replaceChildren()
   const chip = (cls, text, tip) => { const c = el("span", "chip " + cls); c.append(el("span", "dot"), text); if (tip) c.dataset.tip = tip; chips.append(c) }
   chip(s.checks.game ? "ok" : "bad", s.checks.game ? "Game files" : "Game files missing", "The game built from your disc, in the install's game folder.")
-  chip(s.checks.update ? "ok" : "warn", s.checks.update ? "Title update" : "No title update", "The title update (needed for DLC), in Documents\\fm4\\update.")
   chip(s.checks.running ? "warn" : "ok", s.checks.running ? "Game running" : "Not running")
   // play and graphics pages
   fill($("resolution"), o.resolutions.map((r) => ({ value: r, name: r.replace("x", " × ") })), set.resolution)
@@ -188,7 +191,7 @@ function render() {
   $("lang-note").textContent = o.missingLanguages.length
     ? `Your disc also has ${o.missingLanguages.join(", ")} text. Those can't be picked yet.` : ""
   for (const b of $("display").children) b.classList.toggle("on", (b.dataset.full === "1") === set.fullscreen)
-  for (const k of ["vsync", "fastMode", "anisotropy", "enhance", "hideShaderOverlay"]) $(k).classList.toggle("on", !!set[k])
+  for (const k of ["vsync", "enhance", "fastMode", "anisotropy", "hideShaderOverlay"]) $(k).classList.toggle("on", !!set[k])
 
   const lang = o.languages.find((l) => l.id === set.language)
   const aspect = o.aspects.find((a) => a.value === set.aspect)
@@ -201,14 +204,13 @@ function render() {
   line("Anti-aliasing", `MSAA ${named(o.msaa, set.msaa)}, SMAA ${named(o.smaa, set.smaa)}`)
   if (set.upscale) line("Upscaling", named(o.upscale, set.upscale))
   line("Language", lang ? lang.name : "English")
-  line("Fast mode", set.fastMode ? "on" : "off")
 
   const cl = $("checklist")
   cl.replaceChildren()
   const item = (ok, text) => { const d = el("div", "check-item " + (ok ? "ok" : "bad")); d.append(el("span", "dot"), text); cl.append(d) }
   item(s.checks.exe, s.checks.exe ? "fm4.exe found" : "fm4.exe is missing from this install")
-  item(s.checks.game, s.checks.game ? "Game files ready" : "Game files missing: put the extracted disc in the game folder")
-  item(s.shaders.exists, s.shaders.exists ? `Shaders compiled (${s.shaders.shaders.toLocaleString()})` : "First start compiles shaders (a few minutes)")
+  item(s.checks.game, s.checks.game ? "Game files ready" : "Game files missing: run the installer again")
+  item(s.shaders.exists, s.shaders.exists ? `Shaders compiled (${s.shaders.shaders.toLocaleString()})` : "First start compiles shaders (about 3½ minutes)")
   if (s.dlc.length) item(true, `${s.dlc.filter((d) => d.enabled).length} of ${s.dlc.length} DLC packs on`)
   $("launch").disabled = !s.checks.exe || !s.checks.game || s.checks.running
   $("launch").textContent = s.checks.running ? "Running" : "Play"
@@ -225,11 +227,11 @@ function render() {
   $("shaders-rebuild").disabled = s.checks.running || !s.checks.exe
 
   $("dlc-summary").textContent = s.dlc.length
-    ? `${s.dlc.filter((d) => d.enabled).length} of ${s.dlc.length} car and track packs on.`
-    : "No car or track packs installed."
+    ? `${s.dlc.filter((d) => d.enabled).length} of ${s.dlc.length} car packs on.`
+    : "No car packs installed."
   const dl = $("dlc")
   dl.replaceChildren()
-  if (!s.dlc.length) dl.append(el("div", "empty", "No DLC installed. Add DLC to bring in the car and track packs."))
+  if (!s.dlc.length) dl.append(el("div", "empty", "No DLC installed. Add DLC to bring in the car packs."))
   for (const p of s.dlc) {
     const it = el("div", "item" + (p.enabled ? "" : " off"))
     const main = el("div", "main")
@@ -245,6 +247,51 @@ function render() {
   const f = $("folders")
   f.replaceChildren()
   for (const [k, v] of [["Install", s.paths.root], ["User data", s.paths.user]]) f.append(el("div", "k", k), el("div", "v", v))
+}
+
+function renderUpdate() {
+  const u = update
+  $("v-installed").textContent = (u && u.installed) || (state && state.version) || "-"
+  $("v-latest").textContent = (u && u.latest) || "-"
+  $("update-badge").hidden = !(u && u.available)
+  const us = $("update-state")
+  if (!u || !u.latest) { us.textContent = ""; us.className = "update-state" }
+  else if (u.available) { us.textContent = `Version ${u.latest} is available.`; us.className = "update-state new" }
+  else { us.textContent = "You're on the latest version."; us.className = "update-state ok" }
+  $("update-apply").disabled = !(u && u.available && u.hasPatch) || (state && state.checks.running)
+  $("update-apply").textContent = u && u.patchBytes ? `Download & install (${size(u.patchBytes)})` : "Download & install"
+  $("notes-title").textContent = u && u.name ? u.name : "Release notes"
+  const n = $("notes")
+  n.replaceChildren()
+  if (u && u.notes) n.append(...markdown(u.notes))
+  else if (u) n.append(el("div", "empty", "No notes for this release."))
+}
+
+// A small Markdown subset (what the release notes use): headings, bullet lists, **bold**, `code`, paragraphs.
+function markdown(text) {
+  const out = []
+  let list = null
+  const inline = (s, into) => {
+    for (const part of s.split(/(\*\*[^*]+\*\*|`[^`]+`)/)) {
+      if (part.startsWith("**") && part.endsWith("**")) into.append(el("b", "", part.slice(2, -2)))
+      else if (part.startsWith("`") && part.endsWith("`")) into.append(el("code", "", part.slice(1, -1)))
+      else if (part) into.append(part.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1"))
+    }
+    return into
+  }
+  for (const raw of text.replace(/\r/g, "").split("\n")) {
+    const line = raw.trim()
+    if (/^[-*] /.test(line)) {
+      if (!list) { list = el("ul"); out.push(list) }
+      list.append(inline(line.slice(2), el("li")))
+      continue
+    }
+    list = null
+    if (!line || line.startsWith("🤖")) continue
+    const h = line.match(/^#+\s*(.*)$/)
+    out.push(h ? inline(h[1], el("h3")) : inline(line, el("p")))
+  }
+  return out
 }
 
 // ---- settings changes
@@ -279,7 +326,7 @@ $("upscale").onchange = (e) => change({ upscale: +e.target.value })
 $("sharpening").onchange = (e) => change({ sharpening: +e.target.value })
 $("language").onchange = (e) => change({ language: +e.target.value })
 $("display").onclick = (e) => { const b = e.target.closest("button"); if (b) change({ fullscreen: b.dataset.full === "1" }) }
-for (const k of ["vsync", "fastMode", "anisotropy", "enhance", "hideShaderOverlay"]) $(k).onclick = () => change({ [k]: !state.settings[k] })
+for (const k of ["vsync", "enhance", "fastMode", "anisotropy", "hideShaderOverlay"]) $(k).onclick = () => change({ [k]: !state.settings[k] })
 
 // ---- actions
 
@@ -287,7 +334,7 @@ $("launch").onclick = () => guarded(async () => {
   const status = $("status")
   $("launch").disabled = true
   status.className = "status"
-  status.textContent = state.shaders.exists ? "Starting…" : "Starting: the first start compiles shaders behind the loading screen (a few minutes)."
+  status.textContent = state.shaders.exists ? "Starting…" : "Starting: the first start compiles shaders behind the loading screen (about 3½ minutes)."
   try {
     await call("launch", { settings: current() })
     status.className = "status done"
@@ -321,13 +368,53 @@ async function addPackages(cmd, what) {
 }
 $("dlc-add").onclick = () => guarded(() => addPackages("dlc.add", "package"))
 for (const b of document.querySelectorAll("[data-open]")) b.onclick = () => guarded(() => call("open", b.dataset.open))
-// Pick up changes made outside the page when coming back here.
+// Settings changed elsewhere (the game's own window, an edited settings.ini): picked up when coming back here.
 // Not while a dropdown is open or a change is still being saved: on Linux closing a dropdown's pop-up focuses the
 // window, and the settings fetched then would put the old choice back.
 window.addEventListener("focus", () => {
   if (saveTimer || ["SELECT", "INPUT"].includes(document.activeElement.tagName)) return
   guarded(async () => { state = await call("state"); render() })
 })
+
+async function checkUpdates(quiet) {
+  try {
+    update = await call("update.check")
+    renderUpdate()
+  } catch (e) {
+    if (!quiet) toast("Couldn't reach GitHub: " + e.message)
+    $("notes").replaceChildren(el("div", "empty", "Couldn't reach GitHub. Check your connection and try again."))
+  }
+}
+$("update-check").onclick = () => checkUpdates(false)
+$("update-page").onclick = () => guarded(() => call("url", (update && update.page) || "https://github.com/Aiden-Piercee/Forza-Motorsport-4-ReGPU1/releases"))
+$("update-apply").onclick = () => guarded(async () => {
+  if (!await confirmBox(`Install ${update.latest}?`, "The patch is downloaded from GitHub and installed over this install. Saves and settings are kept. The first start afterwards may rebuild the shader cache.", "Install")) return
+  $("update-apply").disabled = true
+  $("update-check").disabled = true
+  $("progress").classList.add("on")
+  $("update-status").className = "status"
+  try {
+    const r = await call("update.apply")
+    update = r.update
+    state = r.state
+    render()
+    renderUpdate()
+    $("update-status").className = "status done"
+    $("update-status").textContent = `Installed ${r.files} file${r.files === 1 ? "" : "s"}.`
+    if (r.launcherChanged && await confirmBox("Restart the launcher?", "The update includes a new launcher. Restart it now to use the new version.", "Restart")) await call("restart")
+  } catch (e) {
+    $("update-status").className = "status error"
+    $("update-status").textContent = e.message
+    renderUpdate()
+  } finally {
+    $("update-check").disabled = false
+    $("progress").classList.remove("on")
+  }
+})
+function onProgress(d) {
+  $("progress").querySelector(".bar").style.width = Math.round(d.p * 100) + "%"
+  $("update-status").textContent = d.text
+}
 
 // ---- profiles: each one's saves and backups (Profiles.cs)
 
@@ -433,13 +520,13 @@ $("prof-delete").onclick = async () => {
   refresh()
 }
 $("prof-backups-open").onclick = () => guarded(() => call("profiles.openBackups"))
-// ---- photos: their own window (PhotosWindow.cs, photos.html)
+// ---- photos: their own window (PhotosForm.cs, photos.html)
 
 $("photos-open").onclick = () => guarded(() => call("photos.open"))
 
 async function refresh() {
-  await guarded(async () => { state = await call("state"); render() })
+  await guarded(async () => { state = await call("state"); render(); renderUpdate() })
 }
 
-refresh()
+refresh().then(() => checkUpdates(true))
 setInterval(() => { if (!document.hidden && $("confirm").hidden && !["SELECT", "INPUT"].includes(document.activeElement.tagName)) refresh() }, 5000)

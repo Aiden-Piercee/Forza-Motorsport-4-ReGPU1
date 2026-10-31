@@ -29,7 +29,7 @@ internal static class Profiles
             var content = Path.Combine(dir.FullName, "content");
             var files = Directory.Exists(content) ? new DirectoryInfo(content).EnumerateFiles("*", SearchOption.AllDirectories).ToList() : [];
             DateTime? last = files.Count > 0 ? files.Max(f => f.LastWriteTime) : null;
-            int photos = files.Count(f => f.Directory?.Name == "photos" && f.Directory.Parent?.Name == "SavedPhotos");
+            int photos = files.Count(Photos.IsPhoto);
             list.Add(new Info(dir.Name, XuidOf(dir.Name), files.Sum(f => f.Length), last, photos,
                 string.Equals(FolderName(active), dir.Name, StringComparison.OrdinalIgnoreCase)));
         }

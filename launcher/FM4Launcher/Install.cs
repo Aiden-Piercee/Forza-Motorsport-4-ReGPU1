@@ -4,29 +4,27 @@ using System.Text;
 
 namespace FM4Launcher;
 
-/// <summary>Where things are: the install (build\tu\fm4.exe, game\) and the user folder (Documents\fm4).</summary>
+/// <summary>Where things are: the install (fm4.exe, game\) and the user folder (Documents\fm4).</summary>
 public static class Paths
 {
-    /// <summary>The install folder: FM4_ROOT, else the first folder up from the launcher that holds build\fm4\fm4.exe or
-    /// fm4.exe itself.</summary>
+    /// <summary>The install folder: the first folder up from the launcher that holds build\fm4\fm4.exe (a source
+    /// checkout) or fm4.exe itself (an install).</summary>
     public static readonly string Root = Env("FM4_ROOT") ?? FindRoot();
-    /// <summary>The game: FM4_EXE, else fm4.exe in the install folder, else build\fm4\fm4.exe (a build from source).</summary>
     public static string Exe => Env("FM4_EXE") ?? (File.Exists(Path.Combine(Root, "fm4.exe")) ? Path.Combine(Root, "fm4.exe") : Path.Combine(Root, "build", "fm4", "fm4.exe"));
-    /// <summary>Linux: the Proton prefix the game runs in.</summary>
-    public static readonly string CompatData = Env("FM4_COMPATDATA")
-        ?? Path.Combine(Env("FM4_LINUX_HOME") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".fm4-linux"), "compatdata");
-    /// <summary>The extracted disc: FM4_GAME_DIR, else game\ in the install folder.</summary>
+    /// <summary>Linux: the Proton prefix the game runs in (as linux/release/play.sh picks it).</summary>
+    public static readonly string CompatData = Environment.GetEnvironmentVariable("FM4_COMPATDATA") is { Length: > 0 } c ? c
+        : Path.Combine(Environment.GetEnvironmentVariable("FM4_LINUX_HOME") is { Length: > 0 } h ? h
+            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".fm4-linux"), "compatdata");
     public static string GameDir => Env("FM4_GAME_DIR") ?? Path.Combine(Root, "game");
     public static readonly string User = FindUser();
     public static string SettingsFile => Path.Combine(User, "settings.ini");
     public static string Dlc => Path.Combine(User, "dlc");
     public static string DlcDisabled => Path.Combine(User, "dlc-disabled");
-    public static string Update => Path.Combine(User, "update");
 
+    /// <summary>Documents\fm4 in the Documents folder Windows reports (it may be moved off C:), as fm4.exe picks it
+    /// (src/user_dir.cpp): if only the old %USERPROFILE%\Documents\fm4 exists, that one.</summary>
     static string? Env(string name) => Environment.GetEnvironmentVariable(name) is { Length: > 0 } v ? v : null;
 
-    /// <summary>FM4_USER_DIR, else Documents\fm4 in the Documents folder Windows reports (it may be moved off C:), as fm4.exe
-    /// picks it (src/user_dir.cpp): if only the old %USERPROFILE%\Documents\fm4 exists, that one.</summary>
     static string FindUser()
     {
         if (Env("FM4_USER_DIR") is { } custom) return Path.GetFullPath(custom);
@@ -56,20 +54,21 @@ public sealed class GameSettings
     public string Resolution { get; set; } = "1280x720";
     public string Aspect { get; set; } = "auto";
     public bool Fullscreen { get; set; }
-    public bool Vsync { get; set; }
-    public int MaxFps { get; set; } = 360;
+    public bool Vsync { get; set; } = true;
+    public int MaxFps { get; set; } = 60;
     public int Msaa { get; set; } = 1;
+    public bool Enhance { get; set; } // enhanced lighting post pass (experimental)
     public int Smaa { get; set; }
     public bool Anisotropy { get; set; } = true; // launcher only: off sets REGPU_NO_ANISO at launch (Game.Launch)
     // FSR 1 on the 3D scene: 0 off, else the game's upscale_quality (1 quality to 4 ultra performance).
     public int Upscale { get; set; }
     public int Sharpening { get; set; } = 50; // percent; settings.ini holds 0-1
-    public bool Enhance { get; set; }
     public bool HideShaderOverlay { get; set; } // launcher only: sets REGPU_NO_OVERLAY at launch
-    public bool FastMode { get; set; } = true; // launcher only: set on the game's environment at launch (Game.Launch)
+    public bool FastMode { get; set; } = true; // launcher only: set on the game's environment at launch
     public int Language { get; set; } = 1;
 
-    // What this launcher writes; every other key in the file is kept as it is. Upscaling is always off here.
+    // What fm4.exe reads (src/settings.cpp). FM2's later options (SMAA, anisotropy, render scale, vertex arena, the
+    // shader pop-up, music, wheel) have no counterpart in FM4's runtime yet, so they aren't offered.
     static readonly string[] Known = ["profile", "resolution", "aspect", "fullscreen", "vsync", "max_fps", "msaa", "smaa", "anisotropy", "fast_mode", "upscaler", "upscale_quality", "sharpness", "enhance", "hide_shader_overlay", "language"];
 
     public static GameSettings Load()
@@ -85,8 +84,10 @@ public sealed class GameSettings
                 case "aspect": s.Aspect = v; break;
                 case "fullscreen": s.Fullscreen = v == "1"; break;
                 case "vsync": s.Vsync = v == "1"; break;
-                case "max_fps": s.MaxFps = int.TryParse(v, out var f) ? f : 360; break;
-                case "msaa": s.Msaa = int.TryParse(v, out var ms) ? ms : 1; break;
+                case "max_fps": s.MaxFps = int.TryParse(v, out var f) ? f : 60; break;
+                case "msaa": s.Msaa = int.TryParse(v, out var m) ? m : 1; break;
+                case "enhance": s.Enhance = v == "1"; break;
+                case "smaa": s.Smaa = int.TryParse(v, out var sm) ? Math.Clamp(sm, 0, 4) : 0; break;
                 case "anisotropy": s.Anisotropy = v != "0"; break;
                 case "upscaler": fsr1 = v == "fsr1"; break;
                 case "upscale_quality": quality = int.TryParse(v, out var q) ? Math.Clamp(q, 1, 4) : 1; break;
@@ -94,9 +95,7 @@ public sealed class GameSettings
                     s.Sharpening = double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var sh)
                         ? (int)Math.Round(sh * 100) : 50;
                     break;
-                case "enhance": s.Enhance = v == "1"; break;
                 case "hide_shader_overlay": s.HideShaderOverlay = v == "1"; break;
-                case "smaa": s.Smaa = int.TryParse(v, out var sm) ? Math.Clamp(sm, 0, 4) : 0; break;
                 case "fast_mode": s.FastMode = v != "0"; break;
                 case "language": s.Language = int.TryParse(v, out var l) && l > 0 ? l : 1; break;
             }
@@ -111,9 +110,10 @@ public sealed class GameSettings
         var sb = new StringBuilder("# Forza Motorsport 4 (fm4) settings; the launcher edits this file.\n");
         sb.Append($"profile={(profile.Length > 0 ? profile : "Player")}\n");
         sb.Append($"resolution={Resolution}\naspect={Aspect}\nfullscreen={B(Fullscreen)}\nvsync={B(Vsync)}\n");
-        sb.Append($"max_fps={Math.Clamp(MaxFps, 30, 360)}\nmsaa={Msaa}\nsmaa={Math.Clamp(Smaa, 0, 4)}\nanisotropy={B(Anisotropy)}\nfast_mode={B(FastMode)}\nlanguage={Language}\n");
+        sb.Append($"max_fps={Math.Clamp(MaxFps, 30, 360)}\nmsaa={Msaa}\nsmaa={Math.Clamp(Smaa, 0, 4)}\nanisotropy={B(Anisotropy)}\nfast_mode={B(FastMode)}\nenhance={B(Enhance)}\nhide_shader_overlay={B(HideShaderOverlay)}\nlanguage={Language}\n");
         var sharp = (Math.Clamp(Sharpening, 0, 100) / 100.0).ToString(System.Globalization.CultureInfo.InvariantCulture);
-        sb.Append($"upscaler={(Upscale > 0 ? "fsr1" : "off")}\nupscale_quality={Math.Clamp(Upscale, 1, 4)}\nsharpness={sharp}\nenhance={B(Enhance)}\nhide_shader_overlay={B(HideShaderOverlay)}\n");
+        sb.Append($"upscaler={(Upscale > 0 ? "fsr1" : "off")}\nupscale_quality={Math.Clamp(Upscale, 1, 4)}\nsharpness={sharp}\n");
+
         foreach (var (k, v) in keep) sb.Append($"{k}={v}\n");
         Directory.CreateDirectory(Paths.User);
         File.WriteAllText(Paths.SettingsFile, sb.ToString());
@@ -141,12 +141,14 @@ public static class Options
 {
     public sealed record Language(int Id, string Code, string Name);
 
-    // XGetLanguage values, as FM2's string tables use them; not yet traced on FM4. The disc also has other tables
-    // (PL, CZ, HU and more), which have no language ID here.
+    // The console's language IDs (XGetLanguage) by the string table each should open; not traced in FM4 yet the way
+    // FM2's were. The disc also has CZ, NL and HU tables, which no language ID names, and GB and MX variants of
+    // English and Spanish.
     public static readonly Language[] Languages =
     [
         new(1, "EN", "English"), new(3, "DE", "Deutsch"), new(4, "FR", "Français"), new(5, "ES", "Español"),
-        new(6, "IT", "Italiano"), new(2, "JP", "日本語"), new(7, "KO", "한국어"), new(10, "CHS", "简体中文"), new(8, "CHT", "繁體中文"),
+        new(6, "IT", "Italiano"), new(9, "BR", "Português (Brasil)"), new(11, "PL", "Polski"), new(12, "RU", "Русский"),
+        new(2, "JP", "日本語"), new(7, "KO", "한국어"), new(8, "CHT", "繁體中文"),
     ];
 
     /// <summary>The languages whose string table is in this install's game\Media\StringTables.</summary>
@@ -161,9 +163,9 @@ public static class Options
     public static readonly int[] Fps = [30, 60, 120, 144, 165, 240, 360];
     public static readonly (string Value, string Name)[] Aspects = [("auto", "Auto (match resolution)"), ("16:9", "16:9"), ("21:9", "21:9 (experimental)"), ("32:9", "32:9 (experimental)")];
     public static readonly (int Value, string Name)[] Msaa = [(1, "Off"), (2, "2x MSAA"), (4, "4x MSAA")];
+    public static readonly (int Value, string Name)[] Smaa = [(0, "Off"), (1, "Low"), (2, "Medium"), (3, "High"), (4, "Ultra")];
     public static readonly (int Value, string Name)[] Upscale = [(0, "Off (native)"), (1, "FSR 1: Quality"), (2, "FSR 1: Balanced"), (3, "FSR 1: Performance"), (4, "FSR 1: Ultra performance")];
     public static readonly (int Value, string Name)[] Sharpening = [(0, "Off"), (25, "Low"), (50, "Medium"), (75, "High"), (100, "Maximum")];
-    public static readonly (int Value, string Name)[] Smaa = [(0, "Off"), (1, "Low"), (2, "Medium"), (3, "High"), (4, "Ultra")];
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     struct DEVMODE
@@ -220,7 +222,7 @@ public static class Options
     }
 }
 
-/// <summary>Starting the game, as play.cmd does: the title update and DLC next to the install copied in first.</summary>
+/// <summary>Starting the game, as play-fm4.cmd does: the DLC next to the install copied in first.</summary>
 public static class Game
 {
     public static bool Running => Platform.Linux ? RunningUnderWine() : Process.GetProcessesByName("fm4").Any(p =>
@@ -264,7 +266,7 @@ public static class Game
     static ProcessStartInfo LinuxStart(string log)
     {
         var proton = Proton() ?? throw new InvalidOperationException("No Proton found: install Proton Experimental in Steam (Library, search \"Proton Experimental\"), or set PROTON to its proton script.");
-        if (!File.Exists(Path.Combine(Paths.GameDir, "default.xex"))) throw new InvalidOperationException($"No game files at {Paths.GameDir}.");
+        if (!File.Exists(Path.Combine(Paths.GameDir, "default.xex"))) throw new InvalidOperationException("No game files yet: extract your disc into the game folder first.");
         Directory.CreateDirectory(Paths.CompatData);
         var psi = new ProcessStartInfo("sh") { WorkingDirectory = Paths.Root, UseShellExecute = false };
         foreach (var a in new[] { "-c", "exec \"$0\" run \"$1\" \"$2\" > \"$3\" 2>&1", proton, Paths.Exe, Paths.GameDir, log }) psi.ArgumentList.Add(a);
@@ -280,10 +282,9 @@ public static class Game
     public static void Launch()
     {
         if (!File.Exists(Paths.Exe)) throw new InvalidOperationException($"fm4.exe isn't at {Paths.Exe}.");
-        CopyMissing(Path.Combine(Paths.Root, "update"), Paths.Update);
         CopyMissing(Path.Combine(Paths.Root, "dlc"), Paths.Dlc, Paths.DlcDisabled);
         Directory.CreateDirectory(Path.Combine(Paths.Root, "out"));
-        var log = Path.Combine(Paths.Root, "out", "play.log");
+        var log = Path.Combine(Paths.Root, "out", "play-fm4.log");
         var psi = Platform.Linux ? LinuxStart(log) : new ProcessStartInfo("cmd.exe", $"/c \"\"{Paths.Exe}\" \"{Paths.GameDir}\" > \"{log}\" 2>&1\"")
         {
             WorkingDirectory = Paths.Root,
@@ -291,13 +292,21 @@ public static class Game
             CreateNoWindow = true,
         };
         psi.Environment["FM2_NO_LAUNCHER"] = "1"; // the settings come from settings.ini, saved by this launcher
-        // As play-fm4.cmd: resolves up to 1024 pixels written back; fast mode, fences at record time.
-        psi.Environment["REGPU_RESOLVE_WRITEBACK_MAX"] = "1024";
+        // As play-fm4.cmd: fences written when recorded, and resolves up to 1024 pixels written back to memory (the
+        // road surface and the photo mode tint read them).
         var settings = GameSettings.Load();
         if (settings.FastMode) psi.Environment["REGPU_EARLY_FENCES"] = "1";
         if (!settings.Anisotropy) psi.Environment["REGPU_NO_ANISO"] = "1";
         if (settings.HideShaderOverlay) psi.Environment["REGPU_NO_OVERLAY"] = "1";
-        Process.Start(psi);
+        psi.Environment["REGPU_RESOLVE_WRITEBACK_MAX"] = "1024";
+        var game = Process.Start(psi);
+        if (game is null || !Platform.Linux) return;
+        // Under Proton the game's stderr never reaches the log (only Proton's own lines do): add its fm4.log.
+        game.EnableRaisingEvents = true;
+        game.Exited += (_, _) =>
+        {
+            try { File.AppendAllText(log, File.ReadAllText(Path.Combine(Paths.Root, "fm4.log"))); } catch (IOException) { }
+        };
     }
 
     // robocopy /XC /XN /XO in install-content.cmd: what is already there is left alone. A DLC package the game has
@@ -362,7 +371,10 @@ public static class Dlc
 {
     public sealed record Pack(string Id, string Name, bool Enabled, long Bytes);
 
-    public static List<Pack> List()
+    // FM2's mods (marked by a .mod file) share this folder there; FM4 has none, so anything marked so is left out.
+    public static List<Pack> List() => ListAll(mods: false);
+
+    static List<Pack> ListAll(bool mods)
     {
         var packs = new List<Pack>();
         foreach (var (dir, enabled) in new[] { (Paths.Dlc, true), (Paths.DlcDisabled, false) })
@@ -370,7 +382,8 @@ public static class Dlc
             if (!Directory.Exists(dir)) continue;
             foreach (var entry in new DirectoryInfo(dir).EnumerateFileSystemInfos())
             {
-                if (entry.Extension is ".title" or ".license") continue;
+                if (entry.Extension is ".title" or ".license" or ".mod") continue;
+                if (File.Exists(Path.Combine(dir, entry.Name + ".mod")) != mods) continue;
                 var titleFile = Path.Combine(dir, entry.Name + ".title");
                 var name = File.Exists(titleFile) ? Encoding.Unicode.GetString(File.ReadAllBytes(titleFile)).TrimEnd('\0').Trim() : entry.Name;
                 long bytes = entry is FileInfo fi ? fi.Length
@@ -387,7 +400,7 @@ public static class Dlc
         if (Game.Running) throw new InvalidOperationException("Close the game first: DLC is read while it runs.");
         var (from, to) = enabled ? (Paths.DlcDisabled, Paths.Dlc) : (Paths.Dlc, Paths.DlcDisabled);
         Directory.CreateDirectory(to);
-        foreach (var name in new[] { id, id + ".title", id + ".license" })
+        foreach (var name in new[] { id, id + ".title", id + ".license", id + ".mod" })
         {
             var src = Path.Combine(from, name);
             var dst = Path.Combine(to, name);
@@ -396,7 +409,8 @@ public static class Dlc
         }
     }
 
-    /// <summary>Installs packages (as downloaded from Xbox Live): unpacked into the DLC folder the way the game reads them.</summary>
+    /// <summary>Installs packages (as downloaded from Xbox Live): unpacked into the DLC folder the way the game reads
+    /// them.</summary>
     public static (int Added, List<string> Errors) Add(IEnumerable<string> files)
     {
         if (Game.Running) throw new InvalidOperationException("Close the game first: DLC is read while it runs.");
@@ -407,7 +421,7 @@ public static class Dlc
         {
             try
             {
-                Stfs.Install(f, Paths.Dlc);
+                Stfs.Install(f, Paths.Dlc, false);
                 added++;
             }
             catch (Exception ex) { errors.Add($"{Path.GetFileName(f)}: {ex.Message}"); }

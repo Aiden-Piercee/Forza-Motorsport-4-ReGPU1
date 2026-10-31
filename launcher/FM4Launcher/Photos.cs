@@ -1,7 +1,8 @@
 namespace FM4Launcher;
 
-/// <summary>Photo Mode pictures: Documents\fm4\profiles\&lt;profile&gt;\content\&lt;user&gt;\SavedPhotos\photos\&lt;name&gt;
-/// (JPEGs without an extension). The page shows them from the launcher's host (Web.PhotoUrl).</summary>
+/// <summary>Photo Mode pictures: JPEGs anywhere in a profile's saves, Documents\fm4\profiles\&lt;profile&gt;\content. FM2
+/// kept them (without an extension) in SavedPhotos\photos; where FM4's save package puts them isn't pinned down yet,
+/// so they're found by their bytes. The page shows them from the launcher's host (Web.PhotoUrl).</summary>
 internal static class Photos
 {
     public static readonly string Root = Path.Combine(Paths.User, "profiles");
@@ -12,10 +13,11 @@ internal static class Photos
     {
         var list = new List<Photo>();
         if (!Directory.Exists(Root)) return list;
-        foreach (var dir in Directory.EnumerateDirectories(Root, "photos", SearchOption.AllDirectories))
+        foreach (var profileDir in new DirectoryInfo(Root).EnumerateDirectories())
         {
-            if (!string.Equals(Path.GetFileName(Path.GetDirectoryName(dir)), "SavedPhotos", StringComparison.OrdinalIgnoreCase)) continue;
-            foreach (var f in new DirectoryInfo(dir).EnumerateFiles())
+            var content = Path.Combine(profileDir.FullName, "content");
+            if (!Directory.Exists(content)) continue;
+            foreach (var f in new DirectoryInfo(content).EnumerateFiles("*", SearchOption.AllDirectories).Where(IsPhoto))
             {
                 var rel = Path.GetRelativePath(Root, f.FullName);
                 var profile = rel.Split(Path.DirectorySeparatorChar)[0];
@@ -23,6 +25,19 @@ internal static class Photos
             }
         }
         return list.OrderByDescending(p => p.Taken).ToList();
+    }
+
+    /// <summary>A JPEG (starts FF D8 FF), not a package's .title or .license.</summary>
+    public static bool IsPhoto(FileInfo f)
+    {
+        if (f.Length < 1024 || f.Extension is ".title" or ".license") return false;
+        try
+        {
+            using var s = f.OpenRead();
+            Span<byte> head = stackalloc byte[3];
+            return s.Read(head) == 3 && head[0] == 0xFF && head[1] == 0xD8 && head[2] == 0xFF;
+        }
+        catch { return false; }
     }
 
     /// <summary>The file for an id from List(), refusing anything outside the profiles folder.</summary>

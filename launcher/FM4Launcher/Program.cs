@@ -5,6 +5,20 @@ internal static class Program
     [STAThread]
     static int Main(string[] args)
     {
+        // --apply <patch.zip>: install a downloaded patch (as the Updates tab does) and report how it went
+        int apply = Array.IndexOf(args, "--apply");
+        if (apply >= 0 && apply + 1 < args.Length)
+        {
+            var log = Path.Combine(Path.GetTempPath(), "FM4Launcher-apply.log");
+            try
+            {
+                if (Game.Running) throw new InvalidOperationException("Close the game first.");
+                var r = Updater.Apply(Path.GetFullPath(args[apply + 1]), deleteZip: false);
+                File.WriteAllText(log, $"ok: {r.Files} files, launcher changed: {r.LauncherChanged}");
+                return 0;
+            }
+            catch (Exception ex) { File.WriteAllText(log, "error: " + ex.Message); return 1; }
+        }
         // --play: start the game with the saved settings, without the window (shortcuts, tests)
         if (args.Contains("--play"))
         {
@@ -13,6 +27,10 @@ internal static class Program
         }
         // one window: starting the launcher again brings the open one forward
         using var single = new Mutex(true, "FM4ReGPU.Launcher", out bool first);
+        // After an update the old launcher starts this one and only then closes: wait for it a moment.
+        if (!first)
+            try { first = single.WaitOne(TimeSpan.FromSeconds(5)); }
+            catch (AbandonedMutexException) { first = true; }
         if (!first)
         {
             if (OperatingSystem.IsWindows())
@@ -20,6 +38,7 @@ internal static class Program
                     if (p.Id != Environment.ProcessId && p.MainWindowHandle != IntPtr.Zero) SetForegroundWindow(p.MainWindowHandle);
             return 0;
         }
+        Updater.CleanUp();
         // WebKitGTK's DMA-BUF renderer fails on some Wayland setups (Gdk "Error 71 (Protocol error)", issue #16).
         // setenv, not Environment.SetEnvironmentVariable: .NET keeps its own copy that native code never sees.
         if (Platform.Linux && Environment.GetEnvironmentVariable("WEBKIT_DISABLE_DMABUF_RENDERER") == null)

@@ -105,7 +105,7 @@ function renderPhotos() {
     $("photo-title").textContent = p.name
     $("photo-meta").textContent = `${p.profile} · ${new Date(p.taken).toLocaleString()} · ${size(p.bytes)}`
   } else {
-    v.replaceChildren(el("div", "empty", "No photos yet. In a race, pause and pick Photo Mode, take a shot and save it."))
+    v.replaceChildren(el("div", "empty", "No photos yet. Pause a race or replay and pick Photo Mode, or take one in Autovista or your garage, then save it."))
     $("photo-title").textContent = "Photos"
     $("photo-meta").textContent = ""
   }
