@@ -73,7 +73,7 @@ LLVM (clang-cl), CMake, Ninja, Python 3.11 or newer as `py -3`, and Git Bash for
    facade XEX files directly inside it:
 
    ```
-   mklink /J game E:\Forza-4-compiling-stuff\extracted
+   mklink /J game <extracted disc folder>
    ```
 
 2. Apply the four XenonRecomp patches, in this order, and build the tools:
