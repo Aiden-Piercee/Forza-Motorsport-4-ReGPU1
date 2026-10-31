@@ -1,5 +1,7 @@
-// Reading members of the game's zip archives (stored or deflated).
+// Reading members of the game's zip archives (stored, deflated, or LZX: FM4's method 21).
 #include "zip.h"
+
+#include "lzx.h"
 
 #include <algorithm>
 #include <cstring>
@@ -249,6 +251,82 @@ void ForEachZipMember(const std::vector<uint8_t>& zip, const char* filter, const
         {
             data.reserve(usize);
             if (!Inflater(&zip[start], csize, data).Run() || data.size() != usize)
+                continue;
+        }
+        else if (method == 21)
+        {
+            if (!LzxDecompress(&zip[start], csize, usize, data))
+                continue;
+        }
+        else
+            continue;
+        fn(name, data);
+    }
+}
+
+void ForEachZipMemberInFile(const std::filesystem::path& path, const char* filter,
+    const std::function<void(const std::string&, const std::vector<uint8_t>&)>& fn)
+{
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in)
+        return;
+    const uint64_t size = uint64_t(in.tellg());
+    if (size < 22)
+        return;
+    // The end record and the central directory, then each wanted member by its local header.
+    const uint64_t tailSize = std::min<uint64_t>(size, 0x10000 + 22);
+    std::vector<uint8_t> tail(static_cast<size_t>(tailSize));
+    in.seekg(std::streamoff(size - tailSize));
+    in.read(reinterpret_cast<char*>(tail.data()), std::streamsize(tailSize));
+    size_t eocd = tail.size() - 22;
+    while (eocd > 0 && Le32(&tail[eocd]) != 0x06054B50)
+        eocd--;
+    if (Le32(&tail[eocd]) != 0x06054B50)
+        return;
+    const uint32_t entries = Le16(&tail[eocd + 10]), cdSize = Le32(&tail[eocd + 12]), cdOffset = Le32(&tail[eocd + 16]);
+    if (uint64_t(cdOffset) + cdSize > size)
+        return;
+    std::vector<uint8_t> cd(cdSize);
+    in.seekg(cdOffset);
+    in.read(reinterpret_cast<char*>(cd.data()), cdSize);
+    std::vector<uint8_t> raw, data;
+    size_t at = 0;
+    for (uint32_t e = 0; e < entries && at + 46 <= cd.size() && Le32(&cd[at]) == 0x02014B50; e++)
+    {
+        const uint16_t method = Le16(&cd[at + 10]);
+        const uint32_t csize = Le32(&cd[at + 20]), usize = Le32(&cd[at + 24]);
+        const uint16_t nameLen = Le16(&cd[at + 28]), extraLen = Le16(&cd[at + 30]), commentLen = Le16(&cd[at + 32]);
+        const uint32_t local = Le32(&cd[at + 42]);
+        if (at + 46 + nameLen > cd.size())
+            break;
+        std::string name(reinterpret_cast<const char*>(&cd[at + 46]), nameLen);
+        at += 46 + nameLen + extraLen + commentLen;
+        std::string lower = name;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](char c) { return char(tolower(c)); });
+        if (lower.find(filter) == std::string::npos || uint64_t(local) + 30 > size)
+            continue;
+        uint8_t header[30];
+        in.seekg(local);
+        if (!in.read(reinterpret_cast<char*>(header), 30))
+            continue;
+        const uint64_t start = uint64_t(local) + 30 + Le16(&header[26]) + Le16(&header[28]);
+        if (start + csize > size)
+            continue;
+        raw.resize(csize);
+        in.seekg(std::streamoff(start));
+        in.read(reinterpret_cast<char*>(raw.data()), csize);
+        data.clear();
+        if (method == 0)
+            data = raw;
+        else if (method == 8)
+        {
+            data.reserve(usize);
+            if (!Inflater(raw.data(), csize, data).Run() || data.size() != usize)
+                continue;
+        }
+        else if (method == 21)
+        {
+            if (!LzxDecompress(raw.data(), csize, usize, data))
                 continue;
         }
         else

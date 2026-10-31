@@ -90,7 +90,7 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/thirdparty/directx-headers/include/directx/d3d12.
 endif()
 add_subdirectory(thirdparty/ReGPU)
 
-add_executable(fm4 ${FM4_SOURCES} "${CMAKE_SOURCE_DIR}/src/fm2.rc")
+add_executable(fm4 ${FM4_SOURCES} "${CMAKE_SOURCE_DIR}/src/fm4.rc")
 target_include_directories(fm4 PRIVATE src "${FM4_GENERATED}"
     "${CMAKE_SOURCE_DIR}/${FM4_OUT_DIR}/ppc" thirdparty/XenonRecomp/thirdparty/simde)
 target_link_libraries(fm4 PRIVATE regpu)

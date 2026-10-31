@@ -15,7 +15,7 @@ public static class Web
 
     public static PhotinoWindow Create(string title, string page, int width, int height, int minWidth, int minHeight, PhotinoWindow? parent = null)
     {
-        var icon = Path.Combine(AppContext.BaseDirectory, Platform.Linux ? "wwwroot/icon.png" : "fm2.ico");
+        var icon = Path.Combine(AppContext.BaseDirectory, Platform.Linux ? "wwwroot/icon.png" : "fm4.ico");
         var w = new PhotinoWindow(parent)
             .SetTitle(title)
             .SetSize(width, height)

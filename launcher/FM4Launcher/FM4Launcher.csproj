@@ -11,7 +11,7 @@
     <AssemblyName>FM4Launcher</AssemblyName>
     <RootNamespace>FM4Launcher</RootNamespace>
     <Product>Forza Motorsport 4 ReGPU</Product>
-    <ApplicationIcon>..\..\assets\fm2.ico</ApplicationIcon>
+    <ApplicationIcon>..\..\assets\fm4.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
@@ -24,8 +24,8 @@
 
   <ItemGroup>
     <Content Include="wwwroot\**\*" CopyToOutputDirectory="PreserveNewest" />
-    <Content Include="..\..\assets\icon.png" Link="wwwroot\icon.png" CopyToOutputDirectory="PreserveNewest" />
-    <Content Include="..\..\assets\fm2.ico" Link="fm2.ico" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\assets\fm4-icon.png" Link="wwwroot\icon.png" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\assets\fm4.ico" Link="fm4.ico" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

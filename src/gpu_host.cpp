@@ -9,6 +9,8 @@
 
 #include "regpu/regpu.h"
 
+#include "boot_screen.h"
+#include "static_shaders.h"
 #include "kernel/runtime.h"
 #include "kernel/thread.h"
 #include "live_switch.h"
@@ -63,6 +65,9 @@ void GpuStart()
     host.logThreadStacks = [](const char* why) { LogAllHostThreadStacks(why); };
     host.currentStack = [](int maxFrames) { return CurrentHostStack(maxFrames); };
     host.slowFrame = [](double ms) { SpikeDump(ms); };
+    host.bootScreen = BootScreenCompose;
+    host.staticShaders = StaticShaders;
+    host.staticShadersSaved = StaticShadersSaved;
     // The road surface: the game renders its two-channel detail image (k_8_8, each mip level) and the
     // 32x512 strips it builds it from, then reads that memory back as textures in other formats (the
     // strips as DXT1), which ReGPU cannot map onto the rendered images. Without these in memory, every
