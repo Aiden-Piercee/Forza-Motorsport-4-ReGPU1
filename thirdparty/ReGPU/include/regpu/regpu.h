@@ -1,0 +1,165 @@
+#pragma once
+// ReGPU: the Xbox 360 GPU (Xenos) for XenonRecomp ports, on Direct3D 12.
+//
+// The game fills in Config and Host before calling Start, and implements nothing else of the GPU:
+// ReGPU provides the console's Vd* video exports (PPC_FUNC __imp__Vd...), runs the command processor
+// and the graphics interrupt, translates shaders, emulates EDRAM and resolves, and presents the frames.
+#include <cstdint>
+#include <filesystem>
+#include <string>
+#include <vector>
+
+struct PPCContext; // XenonRecomp (ppc_context.h)
+
+namespace regpu
+{
+// Display and quality settings. Read at start and, for most fields, again each frame.
+struct Config
+{
+    uint32_t width = 1280, height = 720; // output resolution
+    uint32_t aspectW = 0, aspectH = 0;   // forced aspect ratio (0 = from the resolution)
+    bool fullscreen = false;             // borderless fullscreen on the primary display
+    bool vsync = true;
+    uint32_t maxFps = 60;                // frame cap
+    bool enhance = false;                // enhanced lighting post pass (experimental)
+    uint32_t msaa = 1;                   // samples per pixel: 1 (off), 2, 4 or 8
+    uint32_t smaa = 0;                   // SMAA 1x on the frame as it is shown: 0 off, 1 low, 2 medium, 3 high, 4 ultra
+    // Upscaling: the 3D scene renders smaller and is upscaled before post-processing and the
+    // HUD, which stay at full resolution. Fsr3, Fsr4 and Dlss need REGPU_FSR3 / REGPU_DLSS builds.
+    // Fsr4 is AMD's ML upscaler: it needs a supporting AMD GPU (RDNA 2 or newer, see the FidelityFX
+    // SDK notes) and falls back to FSR 3 elsewhere.
+    enum class Upscaler : uint32_t { Off, Fsr1, Fsr3, Dlss, Fsr4 };
+    Upscaler upscaler = Upscaler::Off;
+    uint32_t quality = 1;   // 0 native (anti-aliasing only), 1 quality, 2 balanced, 3 performance, 4 ultra performance
+    float sharpness = 0.5f; // 0-1
+    std::filesystem::path userDir = "."; // shader and pipeline caches, dumps
+    std::wstring windowTitle = L"ReGPU";
+
+    // The scene's resolution as a fraction of the output (1 when upscaling is off).
+    float SceneScale() const;
+    // The size the game renders at: the resolution, narrowed or shortened to the forced aspect
+    // ratio (the rest of the screen is black bars).
+    void RenderSize(uint32_t& w, uint32_t& h) const;
+};
+
+// A shader found in the game's files or memory: its microcode as in guest memory (big endian).
+struct ScannedShader
+{
+    bool pixel;
+    std::vector<uint32_t> code;
+};
+
+// A resolve (an EDRAM copy to memory), as offered to Host::resolveWriteback.
+struct ResolveCopy
+{
+    uint32_t base;          // physical address of the image (its top-left; tiles land in one image)
+    uint32_t width, height; // the whole image, in game pixels
+    uint32_t format;        // the Xenos colour format it is stored as (6: 8888)
+    bool depth;             // a depth copy (written as the console stores D24FS8 in 32-bit words)
+    uint32_t samples;       // the EDRAM surface's MSAA: 1, 2 or 4
+    int32_t top, bottom;    // the rows this resolve covers (a tile of the image)
+};
+
+// Resolved images stay on the GPU; one the game reads on the CPU must also be written to memory.
+struct Writeback
+{
+    enum class Mode { None, Now, Deferred };
+    // Now: written before the game continues (a stall). Deferred: written when this frame's slot comes
+    // round again, a frame or two late, without a stall (for something read every frame).
+    Mode mode = Mode::None;
+    // Deferred only: the part of the image to write (game pixels); the default is all of it.
+    uint32_t x0 = 0, y0 = 0, x1 = ~0u, y1 = ~0u;
+};
+
+// What ReGPU needs from the game's runtime. Required unless marked optional.
+struct Host
+{
+    // The guest's 4 GB address space: guest address A is at base + A.
+    uint8_t* base = nullptr;
+    // Optional: the file mapping of the 512 MB physical memory, if the game maps it from one
+    // (D3D12 then reads vertex buffers in place instead of copying them).
+    void* physicalSection = nullptr;
+    // Guest memory: physical (GPU-visible) or virtual, at least `align` aligned. Returns the guest address.
+    uint32_t (*alloc)(bool physical, uint32_t size, uint32_t align) = nullptr;
+    // Runs body on a new thread that can call guest code (a host-created guest thread).
+    void (*createThread)(const char* name, void (*body)(PPCContext&)) = nullptr;
+    // The calling guest thread's processor control region (KPCR) guest address.
+    uint32_t (*currentPcr)() = nullptr;
+    // Calls guest code at address with ctx's registers (the graphics interrupt callback).
+    void (*guestCall)(PPCContext& ctx, uint32_t address) = nullptr;
+    // The guest's interrupt lock for one CPU: interrupt callbacks run holding it.
+    void (*interruptLockAcquire)(int cpu) = nullptr;
+    void (*interruptLockRelease)() = nullptr;
+
+    // Optional: guest thread CPU use since the last call (" t3:85% t7:40%"), for the perf log.
+    std::string (*cpuUsage)(double wallSeconds) = nullptr;
+    // Optional: every shader in the game's files, for compiling them all ahead of time on first boot.
+    std::vector<ScannedShader> (*staticShaders)() = nullptr;
+    // Optional: whether staticShaders' list is already saved (a fast call: no search).
+    bool (*staticShadersSaved)() = nullptr;
+    // Optional: a 1280x720 RGBA8 screen for the first-boot shader compile (title, progress done/total;
+    // total 0 while searching). False: ReGPU's plain progress overlay is shown instead.
+    bool (*bootScreen)(const wchar_t* title, uint32_t done, uint32_t total, std::vector<uint8_t>& rgba) = nullptr;
+    // Optional: the game's own fix to a shader, made to its translated HLSL before it compiles (a
+    // game-specific workaround: the translation stays generic). `hash` identifies the shader (the
+    // debug tools print it); patched copies the title makes of it reuse the result. Returns a tag of
+    // the game's choosing (0: none); draws using a tagged shader go to onDraw.
+    uint32_t (*rewriteShader)(uint64_t hash, std::string& hlsl, bool pixel) = nullptr;
+    // Optional: which resolves to write back to memory, and how. Without it, the 8888 colour resolves
+    // whose size is listed in REGPU_RESOLVE_WRITEBACK ("WxH,WxH") are written at once.
+    Writeback (*resolveWriteback)(const ResolveCopy& copy) = nullptr;
+    // Optional: a draw with a tagged shader (rewriteShader), before it is recorded. `c` is the vertex
+    // shader's constants (as the title set them); `user` is four float4 the rewritten shaders can read
+    // as vuser[0..3] (zero unless set here).
+    void (*onDraw)(uint64_t vs, uint64_t ps, uint32_t vsTag, uint32_t psTag, const float c[256][4], float user[4][4]) = nullptr;
+    // Optional: each frame the game finishes (VdSwap), on the renderer's thread.
+    void (*onSwap)(uint64_t frame) = nullptr;
+    // Optional: a character typed into the game window (WM_CHAR), e.g. for cheat codes.
+    void (*onChar)(wchar_t c) = nullptr;
+    // Optional diagnostics: log every host thread's stack (a wait that looks hung); the calling
+    // thread's stack as text (a crash); a frame that took `ms` (a spike profiler's dump).
+    void (*logThreadStacks)(const char* why) = nullptr;
+    std::string (*currentStack)(int maxFrames) = nullptr;
+    void (*slowFrame)(double ms) = nullptr;
+};
+
+Config& GetConfig();
+Host& GetHost();
+
+// Opens the window and the D3D12 device, and starts the command processor. Call once, after filling
+// in Config and Host, before the game calls VdInitializeRingBuffer.
+void Start();
+// The debug server's controller (REGPU_DEBUG=1; tools/regpuctl.py press/hold/stick/trigger): the game
+// merges it into player 1's pad where it reads XInput (XInputGetState / XamInputGetState). False when
+// nothing is held. Buttons use the XInput bits.
+struct DebugPad
+{
+    uint16_t buttons = 0;
+    uint8_t leftTrigger = 0, rightTrigger = 0;
+    int16_t lx = 0, ly = 0, rx = 0, ry = 0;
+    bool sticks = false, triggers = false; // replace the pad's sticks / triggers instead of adding to them
+};
+bool DebugPadState(DebugPad& pad);
+
+// The game draws its 3D view wider than 16:9 itself (a widescreen patch): ReGPU then leaves its
+// field of view alone instead of widening it (Hor+) at wide resolutions.
+void SetGameWidescreen(bool on);
+// Call when the game has stopped drawing (the window is closing): flushes the shader and pipeline caches.
+void SaveCaches();
+// True when no shader or pipeline compile is running and none finished in the last 2 s: for a
+// tool that steps through the game's screens to warm the caches, and waits between steps.
+bool CompileIdle();
+// Benchmark: frame times are recorded while on; the report (a text file) summarises them.
+void BenchmarkRecord(bool on);
+void BenchmarkWriteReport(const char* path);
+// Decodes mip 0 of a 2D texture held outside guest memory (a texture file's data after its header)
+// to RGBA8, row-major. `fetch` is the texture fetch constant (6 dwords, host order); false for a
+// format ReGPU can't decode or data shorter than the texture.
+bool DecodeTexture(const uint32_t fetch[6], const uint8_t* data, size_t size, uint32_t& width, uint32_t& height,
+    std::vector<uint8_t>& rgba);
+// Writes RGBA8 as a PNG (for a game's preview tools).
+bool WritePng(const std::filesystem::path& path, uint32_t width, uint32_t height, const std::vector<uint8_t>& rgba);
+// Logs the command processor's state (ring pointers, the wait it is in, interrupts, draws): for
+// the game's hang watchdog.
+void LogState();
+} // namespace regpu

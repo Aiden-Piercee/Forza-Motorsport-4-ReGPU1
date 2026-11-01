@@ -1,0 +1,91 @@
+cmake_minimum_required(VERSION 3.25)
+project(ReGPU CXX)
+
+# ReGPU: the Xbox 360 GPU for XenonRecomp ports (include/regpu/regpu.h). A static library the
+# game links; the game's own CMake sets the paths below (or add_subdirectory with them set).
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "ReGPU needs clang-cl, like XenonRecomp's output")
+endif()
+
+set(REGPU_XENONRECOMP "" CACHE PATH "XenonRecomp checkout (for XenonUtils/ppc_context.h)")
+set(REGPU_PPC_DIR "" CACHE PATH "The game's XenonRecomp output folder (its ppc_config.h)")
+set(REGPU_FFX "" CACHE PATH "AMD FidelityFX SDK's Kits/FidelityFX folder (FSR1 shader headers; FSR3 runtime with REGPU_FSR3)")
+option(REGPU_FSR3 "AMD FSR 3 upscaling (needs the FidelityFX SDK's signed DLLs)" OFF)
+option(REGPU_DLSS "NVIDIA DLSS (needs the DLSS SDK)" OFF)
+set(REGPU_DLSS_DIR "" CACHE PATH "NVIDIA DLSS SDK folder (with REGPU_DLSS)")
+set(REGPU_DIRECTX_HEADERS "" CACHE PATH
+    "Microsoft DirectX-Headers checkout, for Windows SDKs older than 10.0.26100 (no ID3D12Device13)")
+set(REGPU_D3DCOMPILER "C:/Program Files (x86)/Windows Kits/10/Redist/D3D/x64/d3dcompiler_47.dll" CACHE FILEPATH
+    "Redistributable d3dcompiler_47.dll, to ship beside the game executable (src/gpu/d3dcompiler.cpp)")
+
+if(NOT EXISTS "${REGPU_XENONRECOMP}/XenonUtils/ppc_context.h")
+    message(FATAL_ERROR "Set REGPU_XENONRECOMP to a XenonRecomp checkout")
+endif()
+if(NOT EXISTS "${REGPU_PPC_DIR}/ppc_config.h")
+    message(FATAL_ERROR "Set REGPU_PPC_DIR to the game's XenonRecomp output (with ppc_config.h)")
+endif()
+if(NOT EXISTS "${REGPU_FFX}/upscalers/fsr3/include/gpu/fsr1/ffx_fsr1.h")
+    message(FATAL_ERROR "Set REGPU_FFX to the FidelityFX SDK's Kits/FidelityFX folder (FSR1 shaders)")
+endif()
+
+file(GLOB_RECURSE REGPU_SOURCES CONFIGURE_DEPENDS src/*.cpp)
+if(NOT REGPU_FSR3)
+    list(REMOVE_ITEM REGPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/fsr3.cpp")
+endif()
+if(NOT REGPU_DLSS)
+    list(REMOVE_ITEM REGPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/dlss.cpp")
+endif()
+
+# The FSR1, depth copy, gamma and enhance compute shaders, compiled into a header at build time.
+set(REGPU_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/generated")
+file(MAKE_DIRECTORY "${REGPU_GENERATED}")
+add_custom_command(OUTPUT "${REGPU_GENERATED}/fsr1_cs.h"
+    COMMAND py -3 -I "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_hlsl.py" "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/fsr1.hlsl" "${REGPU_GENERATED}/fsr1_cs.h"
+            EasuMain,RcasMain,DepthCopyMain,GammaMain,EnhanceMain,ViewMain "${REGPU_FFX}/api/internal/gpu" "${REGPU_FFX}/upscalers/fsr3/include/gpu/fsr1"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/fsr1.hlsl" "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_hlsl.py")
+list(APPEND REGPU_SOURCES "${REGPU_GENERATED}/fsr1_cs.h")
+# SMAA 1x (Jimenez et al., MIT; thirdparty/smaa, kept in the repository): its three passes once per preset.
+set(REGPU_SMAA_ENTRIES "")
+foreach(preset Low Medium High Ultra)
+    string(TOUPPER ${preset} define)
+    foreach(pass Edges Weights Blend)
+        list(APPEND REGPU_SMAA_ENTRIES "Smaa${pass}${preset}:Smaa${pass}:SMAA_PRESET_${define}")
+    endforeach()
+endforeach()
+list(APPEND REGPU_SMAA_ENTRIES "SmaaView:SmaaView:SMAA_PRESET_LOW")
+string(REPLACE ";" "," REGPU_SMAA_ENTRIES "${REGPU_SMAA_ENTRIES}")
+add_custom_command(OUTPUT "${REGPU_GENERATED}/smaa_cs.h"
+    COMMAND py -3 -I "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_hlsl.py" "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/smaa_passes.hlsl" "${REGPU_GENERATED}/smaa_cs.h"
+            "${REGPU_SMAA_ENTRIES}" "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/smaa"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/smaa_passes.hlsl" "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/smaa/SMAA.hlsl" "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_hlsl.py")
+list(APPEND REGPU_SOURCES "${REGPU_GENERATED}/smaa_cs.h")
+
+add_library(regpu STATIC ${REGPU_SOURCES})
+target_include_directories(regpu PUBLIC include "${REGPU_PPC_DIR}" "${REGPU_XENONRECOMP}/XenonUtils" "${REGPU_XENONRECOMP}/thirdparty/simde")
+target_include_directories(regpu PRIVATE src "${REGPU_GENERATED}" thirdparty/smaa/Textures)
+if(REGPU_DIRECTX_HEADERS)
+    if(NOT EXISTS "${REGPU_DIRECTX_HEADERS}/include/directx/d3d12.h")
+        message(FATAL_ERROR "REGPU_DIRECTX_HEADERS has no include/directx/d3d12.h")
+    endif()
+    # Ahead of the Windows SDK, so its d3d12.h and the headers it pulls in win.
+    target_include_directories(regpu BEFORE PRIVATE "${REGPU_DIRECTX_HEADERS}/include/directx")
+endif()
+target_compile_definitions(regpu PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+target_compile_options(regpu PRIVATE -msse4.1 -fno-strict-aliasing -gline-tables-only)
+target_link_libraries(regpu PUBLIC d3d12 dxgi ws2_32 winmm synchronization onecore)
+if(REGPU_FSR3)
+    target_compile_definitions(regpu PRIVATE REGPU_FSR3=1)
+    target_include_directories(regpu PRIVATE "${REGPU_FFX}/api/include" "${REGPU_FFX}/upscalers/include")
+    target_link_libraries(regpu PUBLIC "${REGPU_FFX}/signedbin/amd_fidelityfx_loader_dx12.lib")
+endif()
+if(REGPU_DLSS)
+    target_compile_definitions(regpu PRIVATE REGPU_DLSS=1)
+    target_include_directories(regpu PRIVATE "${REGPU_DLSS_DIR}/include")
+    target_link_libraries(regpu PUBLIC "${REGPU_DLSS_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
+endif()
+
+# Build check only: ReGPU linked with nothing else (no unresolved symbols from a game).
+add_executable(regpu_linkcheck EXCLUDE_FROM_ALL tests/linkcheck.cpp)
+target_link_libraries(regpu_linkcheck PRIVATE regpu)
