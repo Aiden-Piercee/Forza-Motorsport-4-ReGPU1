@@ -12,6 +12,11 @@
 #include "log.h"
 #include "memory.h"
 
+namespace regpu
+{
+void RendererLogCrashContext(); // (ReGPU's internal renderer.h is not a public header)
+}
+
 namespace
 {
 void Describe(DWORD64 address, char* out, size_t size)
@@ -83,6 +88,7 @@ LONG WINAPI OnCrash(EXCEPTION_POINTERS* info)
         Describe(frame.AddrPC.Offset, where, sizeof(where));
         Log("CRASH:   #%d %s", i, where);
     }
+    regpu::RendererLogCrashContext();
     Log("CRASH: other threads:");
     LogGuestThreads();
     return EXCEPTION_EXECUTE_HANDLER;
