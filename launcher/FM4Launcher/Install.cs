@@ -73,7 +73,7 @@ public sealed class GameSettings
     // depth) and REGPU_PERF's timing lines in the log.
     public int OptimizeLevel { get; set; }
     public string DebugView { get; set; } = "off";
-    public bool PerfLog { get; set; }
+    public bool PerfLog { get; set; } = true; // on unless the settings file says otherwise
     // Launcher only: where the disc's files and the title update (the folder holding default.xexp) are; empty = the
     // defaults (Paths.GameDirDefault, Paths.TitleUpdateDirDefault).
     public string GameFolder { get; set; } = "";
@@ -330,6 +330,8 @@ public static class Game
         if (settings.DebugView == "motion") psi.Environment["REGPU_VIEW_MOTION"] = "1";
         if (settings.DebugView == "depth") psi.Environment["REGPU_VIEW_DEPTH"] = "1";
         if (settings.PerfLog) psi.Environment["REGPU_PERF"] = "1";
+        // The live debug server (127.0.0.1 only, tools\regpuctl.py in thirdparty\ReGPU): status, screenshots, live switches.
+        psi.Environment["REGPU_DEBUG"] = "1";
         if (settings.TitleUpdateFolder.Length > 0) psi.Environment["FM2_TITLE_UPDATE_DIR"] = settings.TitleUpdateFolder;
         // FSR 3 and FSR 4 do their own anti-aliasing: MSAA and SMAA go to the game off, the saved values stay.
         if (settings.Upscaler is "fsr3" or "fsr4")

@@ -15,6 +15,8 @@ set FM2_UPSCALER=off
 set FM2_UPSCALE_QUALITY=2
 rem Performance log: frame timing lines in out\play-fm4.log. Delete the line to turn it off.
 set REGPU_PERF=1
+rem Live debug server on 127.0.0.1:7341 (py -3 thirdparty\ReGPU\tools\regpuctl.py status | shot | switch NAME 0/1 ...). Delete the line to turn it off.
+set REGPU_DEBUG=1
 rem Shader optimiser (builds faster shaders in the background, used on the next start): remove "rem" to turn on; level 1-3.
 rem set REGPU_OPTIMIZE_SHADERS=1
 rem set REGPU_OPTIMIZE_LEVEL=2
