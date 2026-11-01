@@ -25,7 +25,7 @@ namespace
 constexpr uint32_t kChannels = 6, kFrameSamples = 256, kRate = 48000;
 constexpr uint32_t kRingFrames = 32;
 // Frames kept queued at the device: about 21 ms. Fewer risks underruns, more adds latency.
-constexpr uint32_t kTargetQueued = 4, kMaxQueued = 8;
+constexpr uint32_t kTargetQueued = 6, kMaxQueued = 10;
 
 std::atomic<uint32_t> g_callback{ 0 };
 // The callback gets the address of a word holding the client's argument, not the argument itself.
@@ -173,8 +173,9 @@ void AudioLoop(PPCContext& ctx)
         ctx.r3.u64 = g_callbackArg;
         g_statCallbacks++;
         GuestCall(ctx, cb);
-        // The device is about to run dry: one extra tick now.
-        if (g_output.ok && queued < int(kTargetQueued) / 2)
+        // The device is about to run dry: up to three extra ticks now.
+        static LiveSwitch noTopUp("FM2_NO_AUDIO_TOPUP");
+        for (int extra = 0; !noTopUp && extra < 3 && g_output.ok && g_output.queued.load() < int(kTargetQueued) / 2 + 1; extra++)
         {
             ctx.r3.u64 = g_callbackArg;
             g_statCallbacks++;

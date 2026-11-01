@@ -408,6 +408,9 @@ bool Step(uint32_t ctx)
 void DecoderLoop()
 {
     SetThreadDescription(GetCurrentThread(), L"xma decoder");
+    static LiveSwitch noBoost("FM2_NO_XMA_BOOST");
+    if (!noBoost)
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     auto next = Clock::now();
     for (;;)
     {
