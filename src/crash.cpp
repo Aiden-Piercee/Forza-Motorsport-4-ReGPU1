@@ -91,6 +91,7 @@ LONG WINAPI OnCrash(EXCEPTION_POINTERS* info)
     regpu::RendererLogCrashContext();
     Log("CRASH: other threads:");
     LogGuestThreads();
+    LogFlush();
     return EXCEPTION_EXECUTE_HANDLER;
 }
 }
@@ -288,4 +289,21 @@ std::string CurrentHostStack(int maxFrames)
         out += where;
     }
     return out;
+}
+
+// A stall (ReGPU calls this from its watchdog, every 250 ms while a frame is stuck): the stack of the thread that last
+// recorded a draw. Cheap and lock-free (HostStack walks unwind tables only); the all-thread dump is FM4_STALL_DUMP=1.
+std::string HostStack(void* threadHandle, int maxFrames);
+extern "C" void RegpuOnLongWait(uint64_t ms, uint32_t hostThreadId)
+{
+    if (hostThreadId)
+        if (HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, hostThreadId))
+        {
+            Log("stall sample (%llu ms): render thread %u: %s", (unsigned long long)ms, hostThreadId, HostStack(thread, 24).c_str());
+            CloseHandle(thread);
+        }
+    static const bool dump = getenv("FM4_STALL_DUMP") != nullptr;
+    static std::atomic<int> dumps{ 0 };
+    if (dump && dumps++ < 6)
+        LogGuestThreads();
 }
