@@ -120,6 +120,9 @@ void Load()
     if (const char* v = getenv("FM2_MSAA"))
         g_settings.msaa = uint32_t(atoi(v));
     g_settings.msaa = g_settings.msaa >= 8 ? 8 : g_settings.msaa >= 4 ? 4 : g_settings.msaa >= 2 ? 2 : 1;
+    // FSR 3 and 4 need single-sample colour, depth and motion; MSAA crashed FSR 4 at context creation.
+    if (g_settings.upscaler == Settings::Upscaler::Fsr3 || g_settings.upscaler == Settings::Upscaler::Fsr4)
+        g_settings.msaa = 1;
     g_settings.width = std::clamp<uint32_t>(g_settings.width, 640, 15360);
     g_settings.height = std::clamp<uint32_t>(g_settings.height, 360, 8640);
     g_settings.maxFps = std::clamp<uint32_t>(g_settings.maxFps ? g_settings.maxFps : 60, 30, 360);
