@@ -73,6 +73,21 @@
   <!-- GRAPHICS -->
   <main class="page grid3" id="page-graphics" hidden>
     <section class="panel">
+      <div class="panel-head"><h2>Upscaler</h2></div>
+      <label class="field" data-tip="Draws the 3D scene at a lower resolution and scales it up; the HUD stays full size. Faster on a weak graphics card, a little softer. FSR 1 is the simplest and works anywhere. FSR 3 and FSR 4 also use previous frames, so they look sharper but are newer. FSR 4 needs an AMD RDNA 4 card and falls back to FSR 3 on anything else. Not yet tested on FM4.">
+        <span>Upscaler (experimental)</span>
+        <select id="upscaler"></select>
+      </label>
+      <label class="field" id="upscaleField" data-tip="How much smaller the 3D scene is drawn: Quality about 1.5x, Balanced 1.7x, Performance 2x, Ultra performance 3x smaller on each side. Smaller is faster and softer.">
+        <span>Upscaler quality</span>
+        <select id="upscale"></select>
+      </label>
+      <label class="field" id="sharpeningField" data-tip="Sharpening of the upscaled scene.">
+        <span>Sharpening (experimental)</span>
+        <select id="sharpening"></select>
+      </label>
+    </section>
+    <section class="panel">
       <div class="panel-head"><h2>Display</h2></div>
       <label class="field" data-tip="The size the game renders at. Your display's own modes from 1280x720 up.">
         <span>Resolution</span>
@@ -105,18 +120,6 @@
         <div><div class="toggle-title">Anisotropic filtering</div><div class="toggle-sub">16x</div></div>
         <button class="switch" id="anisotropy" role="switch"></button>
       </div>
-      <label class="field" data-tip="Draws the 3D scene at a lower resolution and scales it up; the HUD stays full size. Faster on a weak graphics card, a little softer. FSR 1 is the simplest and works anywhere. FSR 3 and FSR 4 also use previous frames, so they look sharper but are newer. FSR 4 needs an AMD RDNA 4 card and falls back to FSR 3 on anything else. Not yet tested on FM4.">
-        <span>Upscaler (experimental)</span>
-        <select id="upscaler"></select>
-      </label>
-      <label class="field" id="upscaleField" data-tip="How much smaller the 3D scene is drawn: Quality about 1.5x, Balanced 1.7x, Performance 2x, Ultra performance 3x smaller on each side. Smaller is faster and softer.">
-        <span>Upscaler quality</span>
-        <select id="upscale"></select>
-      </label>
-      <label class="field" id="sharpeningField" data-tip="Sharpening of the upscaled scene.">
-        <span>Sharpening (experimental)</span>
-        <select id="sharpening"></select>
-      </label>
       <div class="toggle-row" data-tip="An extra local-contrast pass on the final picture. Experimental: it can look too strong on some tracks.">
         <div><div class="toggle-title">Enhanced lighting <span class="badge">beta</span></div><div class="toggle-sub">Extra contrast on the final frame</div></div>
         <button class="switch" id="enhance" role="switch"></button>
