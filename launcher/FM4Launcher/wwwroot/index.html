@@ -35,6 +35,18 @@
       <div class="hint" id="lang-note"></div>
     </section>
 
+    <section class="panel">
+      <div class="panel-head"><h2>Files</h2></div>
+      <div class="field" data-tip="The folder with your extracted game disc (it holds default.xex). Empty uses the game folder next to the launcher.">
+        <span>Game folder</span>
+        <div class="pathrow"><input id="gameFolder" readonly><button class="ghost" id="gameBrowse">Browse…</button><button class="ghost" id="gameReset" data-tip="Go back to the default folder.">Reset</button></div>
+      </div>
+      <div class="field" data-tip="The folder with the game's title update (it holds default.xexp). Empty uses Documents\fm4\update.">
+        <span>Title update</span>
+        <div class="pathrow"><input id="updateFolder" readonly><button class="ghost" id="updateBrowse">Browse…</button><button class="ghost" id="updateReset" data-tip="Go back to the default folder.">Reset</button></div>
+      </div>
+    </section>
+
     <section class="panel launch-panel">
       <div class="panel-head"><h2>Ready</h2></div>
       <div class="summary" id="summary"></div>
@@ -108,11 +120,11 @@
 
     <section class="panel">
       <div class="panel-head"><h2>Anti-aliasing &amp; image</h2></div>
-      <label class="field" data-tip="Multisample anti-aliasing: smooths the edges of objects as they are drawn. Each step costs GPU time: 4x is a good balance on most cards.">
+      <label class="field" id="msaaField" data-tip="Multisample anti-aliasing: smooths the edges of objects as they are drawn. Each step costs GPU time: 4x is a good balance on most cards.">
         <span>MSAA (experimental)</span>
         <select id="msaa"></select>
       </label>
-      <label class="field" data-tip="SMAA 1x: smooths the hard edges in the finished picture, HUD included. Higher presets find more edges for a little more GPU time. It can't fix thin wires, foliage or specular sparkle.">
+      <label class="field" id="smaaField" data-tip="SMAA 1x: smooths the hard edges in the finished picture, HUD included. Higher presets find more edges for a little more GPU time. It can't fix thin wires, foliage or specular sparkle.">
         <span>SMAA</span>
         <select id="smaa"></select>
       </label>

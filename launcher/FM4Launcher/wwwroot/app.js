@@ -185,6 +185,19 @@ function render() {
   fill($("msaa"), o.msaa, set.msaa)
   fill($("smaa"), o.smaa, set.smaa)
   fill($("upscaler"), o.upscalers, set.upscaler)
+  // FSR 3 and FSR 4 do their own anti-aliasing: MSAA and SMAA are greyed out while one is chosen.
+  const fsrAa = set.upscaler === "fsr3" || set.upscaler === "fsr4"
+  for (const k of ["msaa", "smaa"]) {
+    const f = $(k + "Field")
+    if (!f.dataset.tip0) f.dataset.tip0 = f.dataset.tip
+    $(k).disabled = fsrAa
+    f.classList.toggle("off", fsrAa)
+    f.dataset.tip = fsrAa ? "Off while FSR 3 or FSR 4 is on: they handle anti-aliasing themselves." : f.dataset.tip0
+  }
+  $("gameFolder").value = set.gameFolder
+  $("gameFolder").placeholder = s.paths.gameDefault + " (default)"
+  $("updateFolder").value = set.titleUpdateFolder
+  $("updateFolder").placeholder = s.paths.updateDefault + " (default)"
   fill($("upscale"), o.upscale, set.upscale)
   fill($("sharpening"), o.sharpening, set.sharpening)
   fill($("optimizeLevel"), o.optimizeLevels, set.optimizeLevel)
@@ -328,6 +341,10 @@ $("customFps").onchange = (e) => {
 }
 $("msaa").onchange = (e) => change({ msaa: +e.target.value })
 $("smaa").onchange = (e) => change({ smaa: +e.target.value })
+$("gameBrowse").onclick = () => guarded(async () => { state = await call("folder.browse", "game"); render() })
+$("updateBrowse").onclick = () => guarded(async () => { state = await call("folder.browse", "update"); render() })
+$("gameReset").onclick = () => change({ gameFolder: "" })
+$("updateReset").onclick = () => change({ titleUpdateFolder: "" })
 $("upscaler").onchange = (e) => change({ upscaler: e.target.value })
 $("upscale").onchange = (e) => change({ upscale: +e.target.value })
 $("optimizeLevel").onchange = (e) => change({ optimizeLevel: +e.target.value })

@@ -75,6 +75,22 @@ public sealed class Bridge
                     var (added, errors) = Dlc.Add(files);
                     return new { added, errors, state = State() };
                 }
+            case "folder.browse":
+                {
+                    // Game folder or Title update: pick a folder, keep it in settings.ini ("" from Reset = the default).
+                    var which = a?.GetValue<string>();
+                    if (which is not ("game" or "update")) throw new ArgumentException("Unknown folder.");
+                    var settings = GameSettings.Load();
+                    var current = which == "game" ? Paths.GameDir : Paths.TitleUpdateDirDefault;
+                    var picked = await _window.ShowOpenFolderAsync(which == "game" ? "Choose the game folder (the extracted disc, with default.xex)" : "Choose the title update folder (with default.xexp)",
+                        Directory.Exists(current) ? current : null, false);
+                    if (picked is { Length: > 0 })
+                    {
+                        if (which == "game") settings.GameFolder = picked[0]; else settings.TitleUpdateFolder = picked[0];
+                        settings.Save();
+                    }
+                    return State();
+                }
             case "photos.open":
                 PhotosWindow.Show(_window);
                 return null;
@@ -217,7 +233,7 @@ public sealed class Bridge
         {
             settings,
             version = Updater.InstalledVersion(),
-            paths = new { root = Paths.Root, user = Paths.User },
+            paths = new { root = Paths.Root, user = Paths.User, gameDefault = Paths.GameDirDefault, updateDefault = Paths.TitleUpdateDirDefault },
             checks = new
             {
                 exe = File.Exists(Paths.Exe),

@@ -74,6 +74,10 @@ h2 { margin: 0; font-size: 13px; letter-spacing: 1px; text-transform: uppercase;
 .hint { margin: -4px 0 12px; color: var(--muted); font-size: 12.5px; }
 
 /* fields */
+.pathrow { display: flex; gap: 6px; }
+.pathrow input { flex: 1; min-width: 0; text-overflow: ellipsis; }
+.pathrow button { white-space: nowrap; }
+select:disabled, .field.off { opacity: 0.5; }
 .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
 .field > span { color: var(--muted); font-size: 12.5px; }
 select, input, textarea {

@@ -15,7 +15,11 @@ public static class Paths
     public static readonly string CompatData = Environment.GetEnvironmentVariable("FM4_COMPATDATA") is { Length: > 0 } c ? c
         : Path.Combine(Environment.GetEnvironmentVariable("FM4_LINUX_HOME") is { Length: > 0 } h ? h
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".fm4-linux"), "compatdata");
-    public static string GameDir => Env("FM4_GAME_DIR") ?? Path.Combine(Root, "game");
+    public static string GameDirDefault => Path.Combine(Root, "game");
+    /// <summary>The disc's files: FM4_GAME_DIR, else the Game folder chosen in the launcher, else game next to the exe.</summary>
+    public static string GameDir => Env("FM4_GAME_DIR") ?? (GameSettings.Load().GameFolder is { Length: > 0 } g ? g : GameDirDefault);
+    /// <summary>Where fm4.exe looks for default.xexp when nothing is chosen (Documents\fm4\update, src/loader.cpp).</summary>
+    public static string TitleUpdateDirDefault => Path.Combine(User, "update");
     public static readonly string User = FindUser();
     public static string SettingsFile => Path.Combine(User, "settings.ini");
     public static string Dlc => Path.Combine(User, "dlc");
@@ -70,6 +74,10 @@ public sealed class GameSettings
     public int OptimizeLevel { get; set; }
     public string DebugView { get; set; } = "off";
     public bool PerfLog { get; set; }
+    // Launcher only: where the disc's files and the title update (the folder holding default.xexp) are; empty = the
+    // defaults (Paths.GameDirDefault, Paths.TitleUpdateDirDefault).
+    public string GameFolder { get; set; } = "";
+    public string TitleUpdateFolder { get; set; } = "";
     public int Sharpening { get; set; } = 50; // percent; settings.ini holds 0-1
     public bool HideShaderOverlay { get; set; } // launcher only: sets REGPU_NO_OVERLAY at launch
     public bool FastMode { get; set; } = true; // launcher only: set on the game's environment at launch
@@ -77,7 +85,7 @@ public sealed class GameSettings
 
     // What fm4.exe reads (src/settings.cpp). FM2's later options (SMAA, anisotropy, render scale, vertex arena, the
     // shader pop-up, music, wheel) have no counterpart in FM4's runtime yet, so they aren't offered.
-    static readonly string[] Known = ["profile", "resolution", "aspect", "fullscreen", "vsync", "max_fps", "msaa", "smaa", "anisotropy", "fast_mode", "upscaler", "upscale_quality", "sharpness", "optimize_level", "debug_view", "perf_log", "enhance", "hide_shader_overlay", "language"];
+    static readonly string[] Known = ["profile", "resolution", "aspect", "fullscreen", "vsync", "max_fps", "msaa", "smaa", "anisotropy", "fast_mode", "upscaler", "upscale_quality", "sharpness", "optimize_level", "debug_view", "perf_log", "game_folder", "title_update_folder", "enhance", "hide_shader_overlay", "language"];
 
     public static GameSettings Load()
     {
@@ -100,6 +108,8 @@ public sealed class GameSettings
                 case "optimize_level": s.OptimizeLevel = int.TryParse(v, out var ol) ? Math.Clamp(ol, 0, 3) : 0; break;
                 case "debug_view": s.DebugView = v is "motion" or "depth" ? v : "off"; break;
                 case "perf_log": s.PerfLog = v == "1"; break;
+                case "game_folder": s.GameFolder = v; break;
+                case "title_update_folder": s.TitleUpdateFolder = v; break;
                 case "sharpness":
                     s.Sharpening = double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var sh)
                         ? (int)Math.Round(sh * 100) : 50;
@@ -121,7 +131,7 @@ public sealed class GameSettings
         sb.Append($"max_fps={Math.Clamp(MaxFps, 30, 360)}\nmsaa={Msaa}\nsmaa={Math.Clamp(Smaa, 0, 4)}\nanisotropy={B(Anisotropy)}\nfast_mode={B(FastMode)}\nenhance={B(Enhance)}\nhide_shader_overlay={B(HideShaderOverlay)}\nlanguage={Language}\n");
         var sharp = (Math.Clamp(Sharpening, 0, 100) / 100.0).ToString(System.Globalization.CultureInfo.InvariantCulture);
         sb.Append($"upscaler={(Options.Upscalers.Any(u => u.Value == Upscaler) ? Upscaler : "off")}\nupscale_quality={Math.Clamp(Upscale, 1, 4)}\nsharpness={sharp}\n");
-        sb.Append($"optimize_level={Math.Clamp(OptimizeLevel, 0, 3)}\ndebug_view={(DebugView is "motion" or "depth" ? DebugView : "off")}\nperf_log={B(PerfLog)}\n");
+        sb.Append($"optimize_level={Math.Clamp(OptimizeLevel, 0, 3)}\ndebug_view={(DebugView is "motion" or "depth" ? DebugView : "off")}\nperf_log={B(PerfLog)}\ngame_folder={Clean(GameFolder)}\ntitle_update_folder={Clean(TitleUpdateFolder)}\n");
 
         foreach (var (k, v) in keep) sb.Append($"{k}={v}\n");
         Directory.CreateDirectory(Paths.User);
@@ -129,6 +139,7 @@ public sealed class GameSettings
     }
 
     static string B(bool b) => b ? "1" : "0";
+    static string Clean(string path) => new string(path.Where(c => !char.IsControl(c)).ToArray()).Trim();
 
     static List<KeyValuePair<string, string>> Read()
     {
@@ -319,6 +330,13 @@ public static class Game
         if (settings.DebugView == "motion") psi.Environment["REGPU_VIEW_MOTION"] = "1";
         if (settings.DebugView == "depth") psi.Environment["REGPU_VIEW_DEPTH"] = "1";
         if (settings.PerfLog) psi.Environment["REGPU_PERF"] = "1";
+        if (settings.TitleUpdateFolder.Length > 0) psi.Environment["FM2_TITLE_UPDATE_DIR"] = settings.TitleUpdateFolder;
+        // FSR 3 and FSR 4 do their own anti-aliasing: MSAA and SMAA go to the game off, the saved values stay.
+        if (settings.Upscaler is "fsr3" or "fsr4")
+        {
+            psi.Environment["FM2_MSAA"] = "1";
+            psi.Environment["REGPU_SMAA"] = "0";
+        }
         var game = Process.Start(psi);
         if (game is null || !Platform.Linux) return;
         // Under Proton the game's stderr never reaches the log (only Proton's own lines do): add its fm4.log.
