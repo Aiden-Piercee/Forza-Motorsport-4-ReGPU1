@@ -35,7 +35,19 @@ void Describe(DWORD64 address, char* out, size_t size)
             snprintf(out, size, "%s+%llX", symbol->Name, displacement);
     }
     else
-        snprintf(out, size, "%016llX", address);
+    {
+        // (Unsymbolised: name the module, e.g. a driver or FidelityFX DLL, or none if the address is not in one.)
+        HMODULE module = nullptr;
+        char path[MAX_PATH] = {};
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, LPCSTR(address), &module) &&
+            GetModuleFileNameA(module, path, MAX_PATH))
+        {
+            const char* file = strrchr(path, '\\');
+            snprintf(out, size, "%016llX (%s+%llX)", address, file ? file + 1 : path, address - DWORD64(module));
+        }
+        else
+            snprintf(out, size, "%016llX (no module)", address);
+    }
 }
 
 LONG WINAPI OnCrash(EXCEPTION_POINTERS* info)
@@ -49,7 +61,7 @@ LONG WINAPI OnCrash(EXCEPTION_POINTERS* info)
     {
         const uint64_t fault = record->ExceptionInformation[1];
         const uint64_t guest = fault - uint64_t(g_base);
-        Log("CRASH: %s host %016llX = guest %llX", record->ExceptionInformation[0] ? "write to" : "read from", fault, guest);
+        Log("CRASH: %s host %016llX = guest %llX", record->ExceptionInformation[0] == 8 ? "execute at" : record->ExceptionInformation[0] ? "write to" : "read from", fault, guest);
     }
     if (thread && thread->ctx)
         Log("CRASH: guest lr %08llX r1 %08X r3 %08X", thread->ctx->lr, thread->ctx->r1.u32, thread->ctx->r3.u32); // (ctr is a local of the recompiled code)
