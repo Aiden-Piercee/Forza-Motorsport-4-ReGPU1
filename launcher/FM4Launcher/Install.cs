@@ -60,8 +60,16 @@ public sealed class GameSettings
     public bool Enhance { get; set; } // enhanced lighting post pass (experimental)
     public int Smaa { get; set; }
     public bool Anisotropy { get; set; } = true; // launcher only: off sets REGPU_NO_ANISO at launch (Game.Launch)
-    // FSR 1 on the 3D scene: 0 off, else the game's upscale_quality (1 quality to 4 ultra performance).
-    public int Upscale { get; set; }
+    // The 3D scene's upscaler: off, fsr1, fsr3 or fsr4 (settings.ini "upscaler"), at Upscale = the game's
+    // upscale_quality (1 quality to 4 ultra performance).
+    public string Upscaler { get; set; } = "off";
+    public int Upscale { get; set; } = 1;
+    // Launcher only (environment at launch, Game.Launch): the background shader optimiser (0 off, else the fxc
+    // optimisation level 1-3), the upscaler's motion or depth input shown instead of the picture (off, motion,
+    // depth) and REGPU_PERF's timing lines in the log.
+    public int OptimizeLevel { get; set; }
+    public string DebugView { get; set; } = "off";
+    public bool PerfLog { get; set; }
     public int Sharpening { get; set; } = 50; // percent; settings.ini holds 0-1
     public bool HideShaderOverlay { get; set; } // launcher only: sets REGPU_NO_OVERLAY at launch
     public bool FastMode { get; set; } = true; // launcher only: set on the game's environment at launch
@@ -69,13 +77,11 @@ public sealed class GameSettings
 
     // What fm4.exe reads (src/settings.cpp). FM2's later options (SMAA, anisotropy, render scale, vertex arena, the
     // shader pop-up, music, wheel) have no counterpart in FM4's runtime yet, so they aren't offered.
-    static readonly string[] Known = ["profile", "resolution", "aspect", "fullscreen", "vsync", "max_fps", "msaa", "smaa", "anisotropy", "fast_mode", "upscaler", "upscale_quality", "sharpness", "enhance", "hide_shader_overlay", "language"];
+    static readonly string[] Known = ["profile", "resolution", "aspect", "fullscreen", "vsync", "max_fps", "msaa", "smaa", "anisotropy", "fast_mode", "upscaler", "upscale_quality", "sharpness", "optimize_level", "debug_view", "perf_log", "enhance", "hide_shader_overlay", "language"];
 
     public static GameSettings Load()
     {
         var s = new GameSettings();
-        var fsr1 = false;
-        var quality = 1;
         foreach (var (k, v) in Read())
             switch (k)
             {
@@ -89,8 +95,11 @@ public sealed class GameSettings
                 case "enhance": s.Enhance = v == "1"; break;
                 case "smaa": s.Smaa = int.TryParse(v, out var sm) ? Math.Clamp(sm, 0, 4) : 0; break;
                 case "anisotropy": s.Anisotropy = v != "0"; break;
-                case "upscaler": fsr1 = v == "fsr1"; break;
-                case "upscale_quality": quality = int.TryParse(v, out var q) ? Math.Clamp(q, 1, 4) : 1; break;
+                case "upscaler": s.Upscaler = Options.Upscalers.Any(u => u.Value == v) ? v : "off"; break;
+                case "upscale_quality": s.Upscale = int.TryParse(v, out var q) ? Math.Clamp(q, 1, 4) : 1; break;
+                case "optimize_level": s.OptimizeLevel = int.TryParse(v, out var ol) ? Math.Clamp(ol, 0, 3) : 0; break;
+                case "debug_view": s.DebugView = v is "motion" or "depth" ? v : "off"; break;
+                case "perf_log": s.PerfLog = v == "1"; break;
                 case "sharpness":
                     s.Sharpening = double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var sh)
                         ? (int)Math.Round(sh * 100) : 50;
@@ -99,7 +108,6 @@ public sealed class GameSettings
                 case "fast_mode": s.FastMode = v != "0"; break;
                 case "language": s.Language = int.TryParse(v, out var l) && l > 0 ? l : 1; break;
             }
-        s.Upscale = fsr1 ? quality : 0;
         return s;
     }
 
@@ -112,7 +120,8 @@ public sealed class GameSettings
         sb.Append($"resolution={Resolution}\naspect={Aspect}\nfullscreen={B(Fullscreen)}\nvsync={B(Vsync)}\n");
         sb.Append($"max_fps={Math.Clamp(MaxFps, 30, 360)}\nmsaa={Msaa}\nsmaa={Math.Clamp(Smaa, 0, 4)}\nanisotropy={B(Anisotropy)}\nfast_mode={B(FastMode)}\nenhance={B(Enhance)}\nhide_shader_overlay={B(HideShaderOverlay)}\nlanguage={Language}\n");
         var sharp = (Math.Clamp(Sharpening, 0, 100) / 100.0).ToString(System.Globalization.CultureInfo.InvariantCulture);
-        sb.Append($"upscaler={(Upscale > 0 ? "fsr1" : "off")}\nupscale_quality={Math.Clamp(Upscale, 1, 4)}\nsharpness={sharp}\n");
+        sb.Append($"upscaler={(Options.Upscalers.Any(u => u.Value == Upscaler) ? Upscaler : "off")}\nupscale_quality={Math.Clamp(Upscale, 1, 4)}\nsharpness={sharp}\n");
+        sb.Append($"optimize_level={Math.Clamp(OptimizeLevel, 0, 3)}\ndebug_view={(DebugView is "motion" or "depth" ? DebugView : "off")}\nperf_log={B(PerfLog)}\n");
 
         foreach (var (k, v) in keep) sb.Append($"{k}={v}\n");
         Directory.CreateDirectory(Paths.User);
@@ -164,7 +173,10 @@ public static class Options
     public static readonly (string Value, string Name)[] Aspects = [("auto", "Auto (match resolution)"), ("16:9", "16:9"), ("21:9", "21:9 (experimental)"), ("32:9", "32:9 (experimental)")];
     public static readonly (int Value, string Name)[] Msaa = [(1, "Off"), (2, "2x MSAA"), (4, "4x MSAA")];
     public static readonly (int Value, string Name)[] Smaa = [(0, "Off"), (1, "Low"), (2, "Medium"), (3, "High"), (4, "Ultra")];
-    public static readonly (int Value, string Name)[] Upscale = [(0, "Off (native)"), (1, "FSR 1: Quality"), (2, "FSR 1: Balanced"), (3, "FSR 1: Performance"), (4, "FSR 1: Ultra performance")];
+    public static readonly (string Value, string Name)[] Upscalers = [("off", "Off (native)"), ("fsr1", "FSR 1 (any graphics card)"), ("fsr3", "FSR 3 (any graphics card)"), ("fsr4", "FSR 4 (AMD RDNA 4, else FSR 3)")];
+    public static readonly (int Value, string Name)[] Upscale = [(1, "Quality"), (2, "Balanced"), (3, "Performance"), (4, "Ultra performance")];
+    public static readonly (int Value, string Name)[] OptimizeLevels = [(0, "Off (default)"), (1, "Level 1"), (2, "Level 2"), (3, "Level 3")];
+    public static readonly (string Value, string Name)[] DebugViews = [("off", "Off (normal picture)"), ("motion", "Motion vectors"), ("depth", "Depth")];
     public static readonly (int Value, string Name)[] Sharpening = [(0, "Off"), (25, "Low"), (50, "Medium"), (75, "High"), (100, "Maximum")];
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -299,6 +311,14 @@ public static class Game
         if (!settings.Anisotropy) psi.Environment["REGPU_NO_ANISO"] = "1";
         if (settings.HideShaderOverlay) psi.Environment["REGPU_NO_OVERLAY"] = "1";
         psi.Environment["REGPU_RESOLVE_WRITEBACK_MAX"] = "1024";
+        if (settings.OptimizeLevel > 0)
+        {
+            psi.Environment["REGPU_OPTIMIZE_SHADERS"] = "1";
+            psi.Environment["REGPU_OPTIMIZE_LEVEL"] = settings.OptimizeLevel.ToString();
+        }
+        if (settings.DebugView == "motion") psi.Environment["REGPU_VIEW_MOTION"] = "1";
+        if (settings.DebugView == "depth") psi.Environment["REGPU_VIEW_DEPTH"] = "1";
+        if (settings.PerfLog) psi.Environment["REGPU_PERF"] = "1";
         var game = Process.Start(psi);
         if (game is null || !Platform.Linux) return;
         // Under Proton the game's stderr never reaches the log (only Proton's own lines do): add its fm4.log.

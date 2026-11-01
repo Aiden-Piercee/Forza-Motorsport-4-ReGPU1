@@ -20,7 +20,7 @@ struct Settings
     uint32_t smaa = 0;                   // SMAA 1x on the frame as it is shown: 0 off, 1 low, 2 medium, 3 high, 4 ultra
     // Upscaling: the 3D scene renders smaller and is upscaled before post-processing and
     // the HUD, which stay at full resolution.
-    enum class Upscaler : uint32_t { Off, Fsr1, Fsr3, Dlss };
+    enum class Upscaler : uint32_t { Off, Fsr1, Fsr3, Dlss, Fsr4 }; // (Fsr4 last: the numbers match regpu::Config::Upscaler)
     Upscaler upscaler = Upscaler::Off;
     uint32_t quality = 1;   // 0 native (anti-aliasing only), 1 quality, 2 balanced, 3 performance, 4 ultra performance
     float sharpness = 0.5f; // 0-1

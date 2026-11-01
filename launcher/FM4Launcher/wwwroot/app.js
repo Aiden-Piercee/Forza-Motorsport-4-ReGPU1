@@ -184,14 +184,18 @@ function render() {
   if (document.activeElement !== $("customFps")) $("customFps").value = set.maxFps
   fill($("msaa"), o.msaa, set.msaa)
   fill($("smaa"), o.smaa, set.smaa)
+  fill($("upscaler"), o.upscalers, set.upscaler)
   fill($("upscale"), o.upscale, set.upscale)
   fill($("sharpening"), o.sharpening, set.sharpening)
-  $("sharpeningField").hidden = !set.upscale
+  fill($("optimizeLevel"), o.optimizeLevels, set.optimizeLevel)
+  fill($("debugView"), o.debugViews, set.debugView)
+  $("upscaleField").hidden = set.upscaler === "off"
+  $("sharpeningField").hidden = set.upscaler === "off"
   fill($("language"), o.languages.map((l) => ({ value: l.id, name: l.name })), set.language)
   $("lang-note").textContent = o.missingLanguages.length
     ? `Your disc also has ${o.missingLanguages.join(", ")} text. Those can't be picked yet.` : ""
   for (const b of $("display").children) b.classList.toggle("on", (b.dataset.full === "1") === set.fullscreen)
-  for (const k of ["vsync", "enhance", "fastMode", "anisotropy", "hideShaderOverlay"]) $(k).classList.toggle("on", !!set[k])
+  for (const k of ["vsync", "enhance", "fastMode", "anisotropy", "hideShaderOverlay", "perfLog"]) $(k).classList.toggle("on", !!set[k])
 
   const lang = o.languages.find((l) => l.id === set.language)
   const aspect = o.aspects.find((a) => a.value === set.aspect)
@@ -202,7 +206,9 @@ function render() {
   line("Frame rate", `${set.maxFps} fps cap, VSync ${set.vsync ? "on" : "off"}`)
   const named = (list, v) => (list.find((m) => m.value === v) || { name: "Off" }).name
   line("Anti-aliasing", `MSAA ${named(o.msaa, set.msaa)}, SMAA ${named(o.smaa, set.smaa)}`)
-  if (set.upscale) line("Upscaling", named(o.upscale, set.upscale))
+  if (set.upscaler !== "off") line("Upscaling", `${named(o.upscalers, set.upscaler)}, ${named(o.upscale, set.upscale)}`)
+  if (set.optimizeLevel || set.debugView !== "off" || set.perfLog)
+    line("Testing", [set.optimizeLevel ? "shader optimiser level " + set.optimizeLevel : "", set.debugView !== "off" ? set.debugView + " view" : "", set.perfLog ? "performance log" : ""].filter(Boolean).join(", "))
   line("Language", lang ? lang.name : "English")
 
   const cl = $("checklist")
@@ -322,11 +328,14 @@ $("customFps").onchange = (e) => {
 }
 $("msaa").onchange = (e) => change({ msaa: +e.target.value })
 $("smaa").onchange = (e) => change({ smaa: +e.target.value })
+$("upscaler").onchange = (e) => change({ upscaler: e.target.value })
 $("upscale").onchange = (e) => change({ upscale: +e.target.value })
+$("optimizeLevel").onchange = (e) => change({ optimizeLevel: +e.target.value })
+$("debugView").onchange = (e) => change({ debugView: e.target.value })
 $("sharpening").onchange = (e) => change({ sharpening: +e.target.value })
 $("language").onchange = (e) => change({ language: +e.target.value })
 $("display").onclick = (e) => { const b = e.target.closest("button"); if (b) change({ fullscreen: b.dataset.full === "1" }) }
-for (const k of ["vsync", "enhance", "fastMode", "anisotropy", "hideShaderOverlay"]) $(k).onclick = () => change({ [k]: !state.settings[k] })
+for (const k of ["vsync", "enhance", "fastMode", "anisotropy", "hideShaderOverlay", "perfLog"]) $(k).onclick = () => change({ [k]: !state.settings[k] })
 
 // ---- actions
 

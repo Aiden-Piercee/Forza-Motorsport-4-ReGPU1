@@ -105,11 +105,15 @@
         <div><div class="toggle-title">Anisotropic filtering</div><div class="toggle-sub">16x</div></div>
         <button class="switch" id="anisotropy" role="switch"></button>
       </div>
-      <label class="field" data-tip="Renders the 3D scene smaller and upscales it with AMD FSR 1; the HUD stays at full size. Faster on a weak graphics card, softer picture. Not yet tested on FM4.">
-        <span>Upscaling (experimental)</span>
+      <label class="field" data-tip="Draws the 3D scene at a lower resolution and scales it up; the HUD stays full size. Faster on a weak graphics card, a little softer. FSR 1 is the simplest and works anywhere. FSR 3 and FSR 4 also use previous frames, so they look sharper but are newer. FSR 4 needs an AMD RDNA 4 card and falls back to FSR 3 on anything else. Not yet tested on FM4.">
+        <span>Upscaler (experimental)</span>
+        <select id="upscaler"></select>
+      </label>
+      <label class="field" id="upscaleField" data-tip="How much smaller the 3D scene is drawn: Quality about 1.5x, Balanced 1.7x, Performance 2x, Ultra performance 3x smaller on each side. Smaller is faster and softer.">
+        <span>Upscaler quality</span>
         <select id="upscale"></select>
       </label>
-      <label class="field" id="sharpeningField" data-tip="FSR 1's sharpening of the upscaled scene.">
+      <label class="field" id="sharpeningField" data-tip="Sharpening of the upscaled scene.">
         <span>Sharpening (experimental)</span>
         <select id="sharpening"></select>
       </label>
@@ -126,6 +130,18 @@
     <div class="stack">
     <section class="panel">
       <div class="panel-head"><h2>Performance</h2></div>
+      <label class="field" data-tip="Builds a faster copy of each shader on a spare low-priority thread while you play, and uses it the next time the game starts. Off is the default and costs nothing. Higher levels take longer to build and may run faster on a weak graphics card. Each level keeps its own cache.">
+        <span>Shader optimiser (testing)</span>
+        <select id="optimizeLevel"></select>
+      </label>
+      <label class="field" data-tip="For testing the upscaler: shows what FSR 3 or FSR 4 is fed instead of the picture. Motion vectors are grey when still and red or green when moving; depth is the scene's depth buffer. Only does anything with FSR 3 or FSR 4 on.">
+        <span>Upscaler debug view (testing)</span>
+        <select id="debugView"></select>
+      </label>
+      <div class="toggle-row" data-tip="Writes frame timing lines (CPU and GPU time per part of the frame) to the game log, out\play-fm4.log. Useful for finding what holds a slow PC back; a little extra work per frame.">
+        <div><div class="toggle-title">Performance log <span class="badge">testing</span></div><div class="toggle-sub">Frame timings in out\play-fm4.log</div></div>
+        <button class="switch" id="perfLog" role="switch"></button>
+      </div>
       <label class="field" data-tip="The limit on the frames shown. FM4 paces itself to 60, so anything from 60 up plays the same. With VSync on, the display's refresh rate also limits it.">
         <span>Max FPS</span>
         <select id="maxFps"></select>

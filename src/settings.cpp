@@ -25,6 +25,8 @@ Settings::Upscaler ParseUpscaler(const std::string& v)
         return Settings::Upscaler::Fsr3;
     if (v == "dlss")
         return Settings::Upscaler::Dlss;
+    if (v == "fsr4")
+        return Settings::Upscaler::Fsr4;
     return Settings::Upscaler::Off;
 }
 
@@ -35,6 +37,7 @@ const char* UpscalerName(Settings::Upscaler u)
     case Settings::Upscaler::Fsr1: return "fsr1";
     case Settings::Upscaler::Fsr3: return "fsr3";
     case Settings::Upscaler::Dlss: return "dlss";
+    case Settings::Upscaler::Fsr4: return "fsr4";
     default: return "off";
     }
 }

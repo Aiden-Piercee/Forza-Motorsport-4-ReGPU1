@@ -231,7 +231,10 @@ public sealed class Bridge
                 fps = Options.Fps,
                 msaa = Options.Msaa.Select(x => new { value = x.Value, name = x.Name }),
                 smaa = Options.Smaa.Select(x => new { value = x.Value, name = x.Name }),
+                upscalers = Options.Upscalers.Select(x => new { value = x.Value, name = x.Name }),
                 upscale = Options.Upscale.Select(x => new { value = x.Value, name = x.Name }),
+                optimizeLevels = Options.OptimizeLevels.Select(x => new { value = x.Value, name = x.Name }),
+                debugViews = Options.DebugViews.Select(x => new { value = x.Value, name = x.Name }),
                 sharpening = Options.Sharpening.Select(x => new { value = x.Value, name = x.Name }),
                 languages = Options.InstalledLanguages().Select(l => new { id = l.Id, code = l.Code, name = l.Name }),
                 missingLanguages = Directory.Exists(stringTables)
